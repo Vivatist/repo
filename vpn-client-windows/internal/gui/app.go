@@ -19,16 +19,16 @@ type App struct {
 	cfg    *config.Config
 	client *vpnclient.Client
 
-	mainWindow    *walk.MainWindow
-	notifyIcon    *walk.NotifyIcon
-	serverEdit    *walk.LineEdit
-	pskEdit       *walk.LineEdit
-	emailEdit     *walk.LineEdit
-	passwordEdit  *walk.LineEdit
-	connectBtn    *walk.PushButton
-	statusLabel   *walk.Label
-	statsLabel    *walk.Label
-	autoStartCB   *walk.CheckBox
+	mainWindow   *walk.MainWindow
+	notifyIcon   *walk.NotifyIcon
+	serverEdit   *walk.LineEdit
+	pskEdit      *walk.LineEdit
+	emailEdit    *walk.LineEdit
+	passwordEdit *walk.LineEdit
+	connectBtn   *walk.PushButton
+	statusLabel  *walk.Label
+	statsLabel   *walk.Label
+	autoStartCB  *walk.CheckBox
 
 	// Иконки
 	iconDisconnected *walk.Icon
@@ -51,14 +51,8 @@ func NewApp() *App {
 
 // Run запускает GUI.
 func (a *App) Run(autoConnect bool) error {
-	// Создаём иконки из стандартных ресурсов
-	var err error
-	a.iconDisconnected, err = walk.NewIconFromResourceId(3) // стандартная иконка
-	if err != nil {
-		a.iconDisconnected, _ = walk.NewIconFromResourceIdWithSize(7, walk.Size{16, 16})
-	}
-	a.iconConnecting = a.iconDisconnected
-	a.iconConnected = a.iconDisconnected
+	// Создаём иконки-щиты
+	a.iconDisconnected, a.iconConnecting, a.iconConnected = makeShieldIcons()
 
 	// Создаём главное окно
 	if err := a.createMainWindow(); err != nil {
@@ -125,7 +119,21 @@ func (a *App) createMainWindow() error {
 					LineEdit{AssignTo: &a.serverEdit, CueBanner: "212.118.43.43:51820"},
 
 					Label{Text: "PSK:"},
-					LineEdit{AssignTo: &a.pskEdit, PasswordMode: true},
+					Composite{
+						Layout: HBox{MarginsZero: true, Spacing: 2},
+						Children: []Widget{
+							LineEdit{AssignTo: &a.pskEdit},
+							PushButton{
+								Text:    "📋",
+								MaxSize: Size{Width: 30},
+								OnClicked: func() {
+									if txt := a.pskEdit.Text(); txt != "" {
+										walk.Clipboard().SetText(txt)
+									}
+								},
+							},
+						},
+					},
 
 					Label{Text: "Email:"},
 					LineEdit{AssignTo: &a.emailEdit, CueBanner: "user@example.com"},

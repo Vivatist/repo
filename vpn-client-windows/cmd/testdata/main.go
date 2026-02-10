@@ -31,10 +31,10 @@ func buildICMPEchoRequest(srcIP, dstIP net.IP, id, seq uint16) []byte {
 	totalLen := uint16(20 + len(icmp))
 	binary.BigEndian.PutUint16(ip[2:4], totalLen)
 	binary.BigEndian.PutUint16(ip[4:6], id) // ID
-	ip[6] = 0x40                             // Don't fragment
+	ip[6] = 0x40                            // Don't fragment
 	ip[7] = 0
-	ip[8] = 64   // TTL
-	ip[9] = 1    // Protocol: ICMP
+	ip[8] = 64 // TTL
+	ip[9] = 1  // Protocol: ICMP
 	copy(ip[12:16], srcIP.To4())
 	copy(ip[16:20], dstIP.To4())
 	// IP header checksum

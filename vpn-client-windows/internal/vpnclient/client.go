@@ -54,14 +54,14 @@ type StatusCallback func(state ConnectionState, info string)
 
 // Client — VPN-клиент NovaVPN.
 type Client struct {
-	state     atomic.Int32
-	onStatus  StatusCallback
-	mu        sync.Mutex
-	conn      *net.UDPConn
-	tun       *tunnel.WinTUN
-	sessionID uint32
-	keys      *novacrypto.SessionKeys
-	sendSeq   atomic.Uint32
+	state      atomic.Int32
+	onStatus   StatusCallback
+	mu         sync.Mutex
+	conn       *net.UDPConn
+	tun        *tunnel.WinTUN
+	sessionID  uint32
+	keys       *novacrypto.SessionKeys
+	sendSeq    atomic.Uint32
 	assignedIP net.IP
 	dns1       net.IP
 	dns2       net.IP
