@@ -1,0 +1,16 @@
+# ═══════════════════════════════════════════
+# NovaVPN — Пользователи
+# ═══════════════════════════════════════════
+#
+# Управление пользователями через CLI:
+#   novavpn-server -adduser  -email user@example.com -password secret123
+#   novavpn-server -deluser  -email user@example.com
+#   novavpn-server -listusers
+#   novavpn-server -passwd   -email user@example.com -password newpass
+#   novavpn-server -disable  -email user@example.com
+#   novavpn-server -enable   -email user@example.com
+#
+# НЕ РЕДАКТИРУЙТЕ password_hash ВРУЧНУЮ!
+# Используйте CLI-команды выше.
+
+users: []

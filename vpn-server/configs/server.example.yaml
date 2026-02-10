@@ -1,0 +1,38 @@
+# ═══════════════════════════════════════════
+# NovaVPN Server — Пример конфигурации
+# ═══════════════════════════════════════════
+
+# Адрес и порт для прослушивания UDP
+listen_addr: "0.0.0.0"
+listen_port: 51820
+
+# VPN подсеть и IP сервера
+vpn_subnet: "10.8.0.0/24"
+server_vpn_ip: "10.8.0.1"
+
+# TUN-интерфейс
+tun_name: "nova0"
+mtu: 1400
+
+# DNS-серверы для клиентов
+dns:
+  - "1.1.1.1"
+  - "8.8.8.8"
+
+# Pre-Shared Key (сгенерируйте: novavpn-server -genkey)
+pre_shared_key: "ЗАМЕНИТЕ_НА_СГЕНЕРИРОВАННЫЙ_КЛЮЧ_64_СИМВОЛА_HEX"
+
+# Файл пользователей (email + пароль)
+users_file: "/etc/novavpn/users.yaml"
+
+# Лимиты
+max_clients: 256
+keepalive_interval: 25
+session_timeout: 120
+
+# NAT (masquerade) для выхода клиентов в интернет
+enable_nat: true
+external_interface: "eth0"
+
+# Уровень логирования: debug, info, warn, error
+log_level: "info"
