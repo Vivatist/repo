@@ -23,6 +23,15 @@ if not exist "wintun.dll" (
     pause
     exit /b 1
 )
+if not exist "..\assets\logo.ico" (
+    echo [INFO] logo.ico не найден, генерируем иконки из assets\...
+    go run ./cmd/icongen/
+    if errorlevel 1 (
+        echo [ОШИБКА] Генерация иконок не удалась. Запустите build.bat
+        pause
+        exit /b 1
+    )
+)
 
 :: Ищем Inno Setup
 set "ISCC="

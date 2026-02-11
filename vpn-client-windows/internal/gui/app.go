@@ -23,12 +23,12 @@ type App struct {
 	cfg       *config.Config
 	ipcClient *ipc.Client
 
-	mainWindow   *walk.MainWindow
-	notifyIcon   *walk.NotifyIcon
-	serverEdit   *walk.LineEdit
-	pskEdit      *walk.LineEdit
-	emailEdit    *walk.LineEdit
-	passwordEdit *walk.LineEdit
+	mainWindow         *walk.MainWindow
+	notifyIcon         *walk.NotifyIcon
+	serverEdit         *walk.LineEdit
+	pskEdit            *walk.LineEdit
+	emailEdit          *walk.LineEdit
+	passwordEdit       *walk.LineEdit
 	connectBtn         *walk.PushButton
 	statusLabel        *walk.Label
 	statsLabel         *walk.Label
@@ -62,6 +62,11 @@ func (a *App) Run(autoConnect bool) error {
 	// Создаём главное окно
 	if err := a.createMainWindow(); err != nil {
 		return err
+	}
+
+	// Устанавливаем иконку приложения (logo.svg)
+	if icon := loadAppIcon(); icon != nil {
+		a.mainWindow.SetIcon(icon)
 	}
 
 	// Создаём иконку в трее
@@ -384,8 +389,8 @@ func (a *App) pollStatusLoop() {
 						a.setFieldsEnabled(true)
 						a.statsLabel.SetText("")
 						a.notifyIcon.SetToolTip("NovaVPN — Сервис недоступен")
-					a.serviceStatusLabel.SetText("Сервис NovaVPN не запущен")
-					a.serviceStatusLabel.SetTextColor(walk.RGB(180, 0, 0))
+						a.serviceStatusLabel.SetText("Сервис NovaVPN не запущен")
+						a.serviceStatusLabel.SetTextColor(walk.RGB(180, 0, 0))
 						if a.iconDisconnected != nil {
 							a.notifyIcon.SetIcon(a.iconDisconnected)
 						}

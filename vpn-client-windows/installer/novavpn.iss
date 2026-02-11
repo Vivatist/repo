@@ -32,6 +32,8 @@ CloseApplications=force
 CloseApplicationsFilter=*.exe
 AppMutex=NovaVPN_AppMutex
 UninstallDisplayName={#MyAppName}
+UninstallDisplayIcon={app}\{#MyAppExeName}
+SetupIconFile=..\..\assets\logo.ico
 ; Архитектура
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
@@ -51,11 +53,12 @@ Name: "autostart"; Description: "Запускать NovaVPN при входе в
 Source: "..\NovaVPN.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\novavpn-service.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\wintun.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\assets\logo.ico"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
+Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\logo.ico"
 Name: "{group}\Удалить {#MyAppName}"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\logo.ico"; Tasks: desktopicon
 
 [Registry]
 ; Автозапуск (если выбрано)

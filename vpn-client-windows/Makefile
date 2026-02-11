@@ -1,8 +1,8 @@
-.PHONY: build clean deps service installer
+.PHONY: build clean deps service installer icongen
 
 # NovaVPN Client — Makefile (для сборки из PowerShell/cmd)
 
-build: deps manifest-gui manifest-service winres gui service
+build: deps icongen manifest-gui manifest-service winres-gui winres-service gui service
 	@echo "Готово: NovaVPN.exe + novavpn-service.exe"
 
 gui:
@@ -14,14 +14,20 @@ service:
 deps:
 	go mod tidy
 
+icongen:
+	go run ./cmd/icongen/
+
 manifest-gui:
 	@cd cmd/novavpn && rsrc -manifest NovaVPN.exe.manifest -o rsrc.syso 2>nul || true
 
 manifest-service:
 	@cd cmd/novavpn-service && rsrc -manifest novavpn-service.exe.manifest -o rsrc.syso 2>nul || true
 
-winres:
-	@go-winres make --in winres/winres.json --product-version 1.0.0.0 --file-version 1.0.0.0 2>nul || true
+winres-gui:
+	@go-winres make --in winres/gui.json --icon ../assets/logo.ico --out cmd/novavpn/winres --product-version 1.0.0.0 --file-version 1.0.0.0 2>nul || true
+
+winres-service:
+	@go-winres make --in winres/winres.json --out cmd/novavpn-service/winres --product-version 1.0.0.0 --file-version 1.0.0.0 2>nul || true
 
 installer: build
 	@if not exist dist mkdir dist
@@ -33,6 +39,8 @@ clean:
 	@del /Q novavpn-service.exe 2>nul || true
 	@del /Q cmd\novavpn\rsrc.syso 2>nul || true
 	@del /Q cmd\novavpn-service\rsrc.syso 2>nul || true
+	@del /Q cmd\novavpn\winres_windows_*.syso 2>nul || true
+	@del /Q cmd\novavpn-service\winres_windows_*.syso 2>nul || true
 	@del /Q dist\*.exe 2>nul || true
 
 install-tools:

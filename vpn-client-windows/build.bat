@@ -27,7 +27,7 @@ if errorlevel 1 (
     go install github.com/tc-hib/go-winres@latest
 )
 
-echo [1/6] Загружаем зависимости...
+echo [1/8] Загружаем зависимости...
 go mod tidy
 if errorlevel 1 (
     echo [ОШИБКА] go mod tidy не удалось
@@ -35,7 +35,15 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [2/6] Встраиваем манифест GUI...
+echo [2/8] Генерируем иконки из SVG (assets/)...
+go run ./cmd/icongen/
+if errorlevel 1 (
+    echo [ОШИБКА] Генерация иконок не удалась
+    pause
+    exit /b 1
+)
+
+echo [3/8] Встраиваем манифест GUI...
 cd cmd\novavpn
 rsrc -manifest NovaVPN.exe.manifest -o rsrc.syso 2>nul
 if errorlevel 1 (
@@ -43,7 +51,7 @@ if errorlevel 1 (
 )
 cd ..\..
 
-echo [3/6] Встраиваем манифест сервиса...
+echo [4/8] Встраиваем манифест сервиса...
 cd cmd\novavpn-service
 rsrc -manifest novavpn-service.exe.manifest -o rsrc.syso 2>nul
 if errorlevel 1 (
@@ -51,13 +59,19 @@ if errorlevel 1 (
 )
 cd ..\..
 
-echo [4/6] Генерируем ресурсы версии (go-winres)...
-go-winres make --in winres/winres.json --product-version 1.0.0.0 --file-version 1.0.0.0 2>nul
+echo [5/8] Ресурсы GUI (иконка + версия)...
+go-winres make --in winres\gui.json --icon ..\assets\logo.ico --out cmd\novavpn\winres --product-version 1.0.0.0 --file-version 1.0.0.0 2>nul
 if errorlevel 1 (
-    echo [WARN] go-winres не удалось, продолжаем без ресурсов версии
+    echo [WARN] go-winres не удалось для GUI, продолжаем без ресурсов
 )
 
-echo [5/6] Собираем NovaVPN.exe (GUI)...
+echo [6/8] Ресурсы сервиса (версия)...
+go-winres make --in winres\winres.json --out cmd\novavpn-service\winres --product-version 1.0.0.0 --file-version 1.0.0.0 2>nul
+if errorlevel 1 (
+    echo [WARN] go-winres не удалось для сервиса, продолжаем без ресурсов
+)
+
+echo [7/8] Собираем NovaVPN.exe (GUI)...
 go build -trimpath -ldflags="-w -H windowsgui" -o NovaVPN.exe ./cmd/novavpn/
 if errorlevel 1 (
     echo [ОШИБКА] Сборка GUI не удалась
@@ -65,7 +79,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [6/6] Собираем novavpn-service.exe (сервис)...
+echo [8/8] Собираем novavpn-service.exe (сервис)...
 go build -trimpath -ldflags="-w" -o novavpn-service.exe ./cmd/novavpn-service/
 if errorlevel 1 (
     echo [ОШИБКА] Сборка сервиса не удалась
