@@ -3,6 +3,7 @@ module github.com/novavpn/vpn-client-windows
 go 1.21
 
 require (
+	github.com/Microsoft/go-winio v0.6.2
 	github.com/lxn/walk v0.0.0-20210112085537-c389da54e794
 	golang.org/x/crypto v0.17.0
 	golang.org/x/sys v0.15.0

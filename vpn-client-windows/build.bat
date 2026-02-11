@@ -20,7 +20,7 @@ if errorlevel 1 (
     go install github.com/akavel/rsrc@latest
 )
 
-echo [1/3] Загружаем зависимости...
+echo [1/4] Загружаем зависимости...
 go mod tidy
 if errorlevel 1 (
     echo [ОШИБКА] go mod tidy не удалось
@@ -28,30 +28,40 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [2/3] Встраиваем манифест...
+echo [2/4] Встраиваем манифест...
 cd cmd\novavpn
 rsrc -manifest NovaVPN.exe.manifest -o rsrc.syso 2>nul
 if errorlevel 1 (
     echo [WARN] rsrc не удалось, продолжаем без манифеста
 )
-cd ..\..
-
-echo [3/3] Собираем NovaVPN.exe...
+cd ..\..\n
+echo [3/4] Собираем NovaVPN.exe (GUI)...
 go build -ldflags="-s -w -H windowsgui" -o NovaVPN.exe ./cmd/novavpn/
 if errorlevel 1 (
-    echo [ОШИБКА] Сборка не удалась
+    echo [ОШИБКА] Сборка GUI не удалась
+    pause
+    exit /b 1
+)
+
+echo [4/4] Собираем novavpn-service.exe (сервис)...
+go build -ldflags="-s -w" -o novavpn-service.exe ./cmd/novavpn-service/
+if errorlevel 1 (
+    echo [ОШИБКА] Сборка сервиса не удалась
     pause
     exit /b 1
 )
 
 echo.
 echo ═══════════════════════════════════════════
-echo   Готово! Файл: NovaVPN.exe
+echo   Готово! Файлы:
+echo     - NovaVPN.exe          (GUI, без админ прав)
+echo     - novavpn-service.exe  (Windows сервис)
 echo ═══════════════════════════════════════════
 echo.
-echo   ВАЖНО: Положите wintun.dll рядом с NovaVPN.exe
+echo   ВАЖНО: Положите wintun.dll рядом с novavpn-service.exe
 echo   Скачайте: https://www.wintun.net/
 echo.
-echo   Запуск: NovaVPN.exe (от имени администратора)
+echo   Запуск: NovaVPN.exe (НЕ требует прав администратора)
+echo   При первом подключении будет предложено установить сервис (UAC)
 echo.
 pause

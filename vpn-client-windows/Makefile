@@ -1,10 +1,15 @@
-.PHONY: build clean deps
+.PHONY: build clean deps service
 
 # NovaVPN Client — Makefile (для сборки из PowerShell/cmd)
 
-build: deps manifest
+build: deps manifest gui service
+	@echo "Готово: NovaVPN.exe + novavpn-service.exe"
+
+gui:
 	go build -ldflags="-s -w -H windowsgui" -o NovaVPN.exe ./cmd/novavpn/
-	@echo "Готово: NovaVPN.exe"
+
+service:
+	go build -ldflags="-s -w" -o novavpn-service.exe ./cmd/novavpn-service/
 
 deps:
 	go mod tidy
@@ -14,6 +19,7 @@ manifest:
 
 clean:
 	@del /Q NovaVPN.exe 2>nul || true
+	@del /Q novavpn-service.exe 2>nul || true
 	@del /Q cmd\novavpn\rsrc.syso 2>nul || true
 
 install-tools:

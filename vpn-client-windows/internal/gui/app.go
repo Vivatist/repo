@@ -1,9 +1,13 @@
 // Package gui — графический интерфейс клиента NovaVPN (Walk + системный трей).
+// GUI работает без прав администратора. Все привилегированные операции
+// (TUN, маршруты) выполняются через Windows-сервис NovaVPN по IPC.
 package gui
 
 import (
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/lxn/walk"
@@ -11,13 +15,15 @@ import (
 
 	"github.com/novavpn/vpn-client-windows/internal/autostart"
 	"github.com/novavpn/vpn-client-windows/internal/config"
-	"github.com/novavpn/vpn-client-windows/internal/vpnclient"
+	"github.com/novavpn/vpn-client-windows/internal/elevation"
+	"github.com/novavpn/vpn-client-windows/internal/ipc"
+	"github.com/novavpn/vpn-client-windows/internal/service"
 )
 
 // App — главное GUI-приложение.
 type App struct {
-	cfg    *config.Config
-	client *vpnclient.Client
+	cfg       *config.Config
+	ipcClient *ipc.Client
 
 	mainWindow   *walk.MainWindow
 	notifyIcon   *walk.NotifyIcon
@@ -25,28 +31,30 @@ type App struct {
 	pskEdit      *walk.LineEdit
 	emailEdit    *walk.LineEdit
 	passwordEdit *walk.LineEdit
-	connectBtn   *walk.PushButton
-	statusLabel  *walk.Label
-	statsLabel   *walk.Label
-	autoStartCB  *walk.CheckBox
+	connectBtn     *walk.PushButton
+	uninstallBtn   *walk.PushButton
+	statusLabel    *walk.Label
+	statsLabel     *walk.Label
+	autoStartCB    *walk.CheckBox
 
 	// Иконки
 	iconDisconnected *walk.Icon
 	iconConnecting   *walk.Icon
 	iconConnected    *walk.Icon
 
-	statsTimer *time.Ticker
-	stopStats  chan struct{}
+	// Поллинг статуса через IPC
+	stopPoll  chan struct{}
+	lastState int // предыдущее состояние для отслеживания изменений
 }
 
 // NewApp создаёт приложение.
 func NewApp() *App {
-	app := &App{
+	return &App{
 		cfg:       config.Load(),
-		stopStats: make(chan struct{}),
+		ipcClient: ipc.NewClient(),
+		stopPoll:  make(chan struct{}),
+		lastState: -1,
 	}
-	app.client = vpnclient.NewClient(app.onStateChanged)
-	return app
 }
 
 // Run запускает GUI.
@@ -66,6 +74,12 @@ func (a *App) Run(autoConnect bool) error {
 
 	// Загружаем настройки в форму
 	a.loadSettingsToForm()
+
+	// Показываем/скрываем кнопку удаления сервиса
+	a.updateUninstallButton()
+
+	// Запускаем поллинг статуса от сервиса
+	go a.pollStatusLoop()
 
 	// Автоподключение
 	if autoConnect && a.cfg.WasConnected && a.cfg.ServerAddr != "" {
@@ -87,9 +101,9 @@ func (a *App) createMainWindow() error {
 	err := MainWindow{
 		AssignTo: &a.mainWindow,
 		Title:    "NovaVPN",
-		MinSize:  Size{400, 380},
-		MaxSize:  Size{400, 380},
-		Size:     Size{400, 380},
+		MinSize:  Size{400, 420},
+		MaxSize:  Size{400, 420},
+		Size:     Size{400, 420},
 		Layout:   VBox{MarginsZero: false, Margins: Margins{10, 10, 10, 10}},
 		Children: []Widget{
 			// Заголовок
@@ -168,11 +182,21 @@ func (a *App) createMainWindow() error {
 				Font:      Font{PointSize: 11, Bold: true},
 				OnClicked: a.onConnectClicked,
 			},
+
+			// Кнопка удаления сервиса
+			PushButton{
+				AssignTo:  &a.uninstallBtn,
+				Text:      "Удалить сервис",
+				OnClicked: a.onUninstallClicked,
+			},
 		},
 	}.Create()
 	if err != nil {
 		return err
 	}
+
+	// Скрываем кнопку до проверки — после Create() SetVisible работает корректно
+	a.uninstallBtn.SetVisible(false)
 
 	// Подписка на событие закрытия окна (сворачиваем в трей вместо закрытия)
 	a.mainWindow.Closing().Attach(func(canceled *bool, reason walk.CloseReason) {
@@ -272,14 +296,19 @@ func (a *App) saveSettings() {
 
 // onConnectClicked — обработчик кнопки подключения.
 func (a *App) onConnectClicked() {
-	if a.client.GetState() == vpnclient.StateConnected {
+	if a.lastState == ipc.StateConnected {
 		go a.disconnect()
-	} else if a.client.GetState() == vpnclient.StateDisconnected {
+	} else if a.lastState == ipc.StateConnecting || a.lastState == ipc.StateDisconnecting {
+		// Игнорируем нажатие во время переходных состояний
+		return
+	} else {
+		// StateDisconnected, -1 (начальное), -2 (сервис недоступен) — всё ведёт к connect()
+		// connect() сам проверит доступность сервиса и предложит установку
 		go a.connect()
 	}
 }
 
-// connect подключается к VPN.
+// connect подключается к VPN через сервис.
 func (a *App) connect() {
 	a.saveSettings()
 
@@ -290,16 +319,39 @@ func (a *App) connect() {
 		return
 	}
 
-	params := vpnclient.ConnectParams{
+	// Проверяем, доступен ли сервис
+	if !a.ipcClient.IsServiceRunning() {
+		a.mainWindow.Synchronize(func() {
+			result := walk.MsgBox(a.mainWindow, "NovaVPN",
+				"Сервис NovaVPN не запущен.\n\nУстановить и запустить сервис?\n(Потребуется подтверждение UAC)",
+				walk.MsgBoxOKCancel|walk.MsgBoxIconQuestion)
+			if result == walk.DlgCmdOK {
+				go a.installAndStartService()
+			}
+		})
+		return
+	}
+
+	// Показываем "Подключение..." сразу
+	a.mainWindow.Synchronize(func() {
+		a.statusLabel.SetText("● Подключение...")
+		a.statusLabel.SetTextColor(walk.RGB(200, 150, 0))
+		a.connectBtn.SetText("Подключение...")
+		a.connectBtn.SetEnabled(false)
+		a.setFieldsEnabled(false)
+	})
+
+	params := ipc.ConnectParams{
 		ServerAddr: a.cfg.ServerAddr,
 		PSK:        a.cfg.PSK,
 		Email:      a.cfg.Email,
 		Password:   a.cfg.Password,
 	}
 
-	if err := a.client.Connect(params); err != nil {
+	if err := a.ipcClient.Connect(params); err != nil {
 		a.mainWindow.Synchronize(func() {
 			walk.MsgBox(a.mainWindow, "Ошибка подключения", err.Error(), walk.MsgBoxIconError)
+			a.updateUIForState(ipc.StateDisconnected, "")
 		})
 		return
 	}
@@ -309,20 +361,23 @@ func (a *App) connect() {
 	a.cfg.Save()
 }
 
-// disconnect отключается от VPN.
+// disconnect отключается от VPN через сервис.
 func (a *App) disconnect() {
-	a.client.Disconnect()
+	a.ipcClient.Disconnect()
 	a.cfg.WasConnected = false
 	a.cfg.Save()
 }
 
 // onExit — выход из приложения.
 func (a *App) onExit() {
-	// Если подключён — сохраняем состояние
-	if a.client.GetState() == vpnclient.StateConnected {
+	// Останавливаем поллинг
+	close(a.stopPoll)
+
+	// Если подключён — отключаем через сервис
+	if a.lastState == ipc.StateConnected {
 		a.cfg.WasConnected = true
 		a.cfg.Save()
-		a.client.Disconnect()
+		a.ipcClient.Disconnect()
 	}
 
 	a.notifyIcon.Dispose()
@@ -330,61 +385,114 @@ func (a *App) onExit() {
 	walk.App().Exit(0)
 }
 
-// onStateChanged — колбэк при смене состояния VPN.
-func (a *App) onStateChanged(state vpnclient.ConnectionState, info string) {
-	a.mainWindow.Synchronize(func() {
-		switch state {
-		case vpnclient.StateDisconnected:
-			a.statusLabel.SetText("● Отключён")
-			a.statusLabel.SetTextColor(walk.RGB(180, 0, 0))
-			a.connectBtn.SetText("Подключиться")
-			a.connectBtn.SetEnabled(true)
-			a.setFieldsEnabled(true)
-			a.notifyIcon.SetToolTip("NovaVPN — Отключён")
-			if a.iconDisconnected != nil {
-				a.notifyIcon.SetIcon(a.iconDisconnected)
-			}
-			a.stopStatsUpdate()
-			a.statsLabel.SetText("")
+// pollStatusLoop — цикл опроса статуса VPN через IPC.
+// Обновляет GUI на основе ответов от сервиса.
+func (a *App) pollStatusLoop() {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
 
-		case vpnclient.StateConnecting:
-			a.statusLabel.SetText("● Подключение...")
-			a.statusLabel.SetTextColor(walk.RGB(200, 150, 0))
-			a.connectBtn.SetText("Подключение...")
-			a.connectBtn.SetEnabled(false)
-			a.setFieldsEnabled(false)
-			a.notifyIcon.SetToolTip("NovaVPN — Подключение...")
-			if a.iconConnecting != nil {
-				a.notifyIcon.SetIcon(a.iconConnecting)
+	for {
+		select {
+		case <-a.stopPoll:
+			return
+		case <-ticker.C:
+			status, err := a.ipcClient.GetStatus()
+			if err != nil {
+				// Сервис недоступен
+				if a.lastState != -2 {
+					a.lastState = -2
+					a.mainWindow.Synchronize(func() {
+						a.statusLabel.SetText("● Сервис недоступен")
+						a.statusLabel.SetTextColor(walk.RGB(128, 128, 128))
+						a.connectBtn.SetText("Подключиться")
+						a.connectBtn.SetEnabled(true)
+						a.setFieldsEnabled(true)
+						a.statsLabel.SetText("")
+						a.notifyIcon.SetToolTip("NovaVPN — Сервис недоступен")
+						a.updateUninstallButton()
+						if a.iconDisconnected != nil {
+							a.notifyIcon.SetIcon(a.iconDisconnected)
+						}
+					})
+				}
+				continue
 			}
 
-		case vpnclient.StateConnected:
-			text := "● Подключён"
-			if info != "" {
-				text += " (" + info + ")"
+			// Обновляем UI если состояние изменилось
+			if status.State != a.lastState {
+				prevState := a.lastState
+				a.lastState = status.State
+				a.mainWindow.Synchronize(func() {
+					a.updateUIForState(status.State, status.AssignedIP)
+					a.updateUninstallButton()
+					// Уведомление при переходе в Connected
+					if status.State == ipc.StateConnected && prevState != ipc.StateConnected {
+						a.notifyIcon.ShowInfo("NovaVPN", "VPN подключён")
+					}
+				})
 			}
-			a.statusLabel.SetText(text)
-			a.statusLabel.SetTextColor(walk.RGB(0, 150, 0))
-			a.connectBtn.SetText("Отключиться")
-			a.connectBtn.SetEnabled(true)
-			a.setFieldsEnabled(false)
-			tooltip := "NovaVPN — Подключён"
-			if info != "" {
-				tooltip += "\n" + info
-			}
-			a.notifyIcon.SetToolTip(tooltip)
-			if a.iconConnected != nil {
-				a.notifyIcon.SetIcon(a.iconConnected)
-			}
-			a.notifyIcon.ShowInfo("NovaVPN", "VPN подключён")
-			a.startStatsUpdate()
 
-		case vpnclient.StateDisconnecting:
-			a.statusLabel.SetText("● Отключение...")
-			a.statusLabel.SetTextColor(walk.RGB(200, 150, 0))
-			a.connectBtn.SetEnabled(false)
+			// Обновляем статистику если подключены
+			if status.State == ipc.StateConnected {
+				a.mainWindow.Synchronize(func() {
+					a.statsLabel.SetText(fmt.Sprintf("↑ %s   ↓ %s",
+						formatBytes(status.BytesSent), formatBytes(status.BytesRecv)))
+				})
+			}
 		}
-	})
+	}
+}
+
+// updateUIForState обновляет все элементы GUI для заданного состояния.
+func (a *App) updateUIForState(state int, assignedIP string) {
+	switch state {
+	case ipc.StateDisconnected:
+		a.statusLabel.SetText("● Отключён")
+		a.statusLabel.SetTextColor(walk.RGB(180, 0, 0))
+		a.connectBtn.SetText("Подключиться")
+		a.connectBtn.SetEnabled(true)
+		a.setFieldsEnabled(true)
+		a.notifyIcon.SetToolTip("NovaVPN — Отключён")
+		if a.iconDisconnected != nil {
+			a.notifyIcon.SetIcon(a.iconDisconnected)
+		}
+		a.statsLabel.SetText("")
+
+	case ipc.StateConnecting:
+		a.statusLabel.SetText("● Подключение...")
+		a.statusLabel.SetTextColor(walk.RGB(200, 150, 0))
+		a.connectBtn.SetText("Подключение...")
+		a.connectBtn.SetEnabled(false)
+		a.setFieldsEnabled(false)
+		a.notifyIcon.SetToolTip("NovaVPN — Подключение...")
+		if a.iconConnecting != nil {
+			a.notifyIcon.SetIcon(a.iconConnecting)
+		}
+
+	case ipc.StateConnected:
+		text := "● Подключён"
+		if assignedIP != "" {
+			text += " (VPN IP: " + assignedIP + ")"
+		}
+		a.statusLabel.SetText(text)
+		a.statusLabel.SetTextColor(walk.RGB(0, 150, 0))
+		a.connectBtn.SetText("Отключиться")
+		a.connectBtn.SetEnabled(true)
+		a.setFieldsEnabled(false)
+		tooltip := "NovaVPN — Подключён"
+		if assignedIP != "" {
+			tooltip += "\nVPN IP: " + assignedIP
+		}
+		a.notifyIcon.SetToolTip(tooltip)
+		if a.iconConnected != nil {
+			a.notifyIcon.SetIcon(a.iconConnected)
+		}
+
+	case ipc.StateDisconnecting:
+		a.statusLabel.SetText("● Отключение...")
+		a.statusLabel.SetTextColor(walk.RGB(200, 150, 0))
+		a.connectBtn.SetEnabled(false)
+	}
 }
 
 // setFieldsEnabled включает/отключает поля формы.
@@ -395,35 +503,108 @@ func (a *App) setFieldsEnabled(enabled bool) {
 	a.passwordEdit.SetEnabled(enabled)
 }
 
-// startStatsUpdate запускает обновление статистики.
-func (a *App) startStatsUpdate() {
-	a.statsTimer = time.NewTicker(1 * time.Second)
-	go func() {
-		for {
-			select {
-			case <-a.stopStats:
-				return
-			case <-a.statsTimer.C:
-				sent := a.client.BytesSent.Load()
-				recv := a.client.BytesRecv.Load()
-				a.mainWindow.Synchronize(func() {
-					a.statsLabel.SetText(fmt.Sprintf("↑ %s   ↓ %s",
-						formatBytes(sent), formatBytes(recv)))
-				})
-			}
-		}
-	}()
+// updateUninstallButton показывает/скрывает кнопку удаления сервиса.
+// Видна только когда сервис установлен и VPN отключён.
+func (a *App) updateUninstallButton() {
+	installed := service.IsInstalled()
+	disconnected := a.lastState == ipc.StateDisconnected || a.lastState == -1 || a.lastState == -2
+	a.uninstallBtn.SetVisible(installed && disconnected)
 }
 
-// stopStatsUpdate останавливает обновление статистики.
-func (a *App) stopStatsUpdate() {
-	if a.statsTimer != nil {
-		a.statsTimer.Stop()
-		select {
-		case a.stopStats <- struct{}{}:
-		default:
+// onUninstallClicked — обработчик кнопки удаления сервиса.
+func (a *App) onUninstallClicked() {
+	result := walk.MsgBox(a.mainWindow, "NovaVPN",
+		"Удалить сервис NovaVPN?\n\nVPN-подключение не будет работать без сервиса.\nПотребуется подтверждение UAC.",
+		walk.MsgBoxOKCancel|walk.MsgBoxIconQuestion)
+	if result != walk.DlgCmdOK {
+		return
+	}
+	go a.uninstallService()
+}
+
+// uninstallService удаляет сервис с UAC elevation.
+func (a *App) uninstallService() {
+	exe, err := os.Executable()
+	if err != nil {
+		a.mainWindow.Synchronize(func() {
+			walk.MsgBox(a.mainWindow, "Ошибка", "Не удалось определить путь: "+err.Error(), walk.MsgBoxIconError)
+		})
+		return
+	}
+
+	serviceExe := filepath.Join(filepath.Dir(exe), "novavpn-service.exe")
+
+	log.Println("[GUI] Удаление сервиса с UAC...")
+
+	if err := elevation.RunElevated(serviceExe, "uninstall"); err != nil {
+		a.mainWindow.Synchronize(func() {
+			walk.MsgBox(a.mainWindow, "Ошибка",
+				"Не удалось удалить сервис.\nВозможно, вы отменили запрос UAC.",
+				walk.MsgBoxIconError)
+		})
+		return
+	}
+
+	log.Println("[GUI] Сервис удалён")
+	a.mainWindow.Synchronize(func() {
+		a.updateUninstallButton()
+		walk.MsgBox(a.mainWindow, "NovaVPN", "Сервис NovaVPN удалён.", walk.MsgBoxIconInformation)
+	})
+}
+
+// installAndStartService устанавливает и запускает сервис NovaVPN с UAC elevation.
+func (a *App) installAndStartService() {
+	exe, err := os.Executable()
+	if err != nil {
+		a.mainWindow.Synchronize(func() {
+			walk.MsgBox(a.mainWindow, "Ошибка", "Не удалось определить путь: "+err.Error(), walk.MsgBoxIconError)
+		})
+		return
+	}
+
+	serviceExe := filepath.Join(filepath.Dir(exe), "novavpn-service.exe")
+
+	// Проверяем наличие файла сервиса
+	if _, err := os.Stat(serviceExe); os.IsNotExist(err) {
+		a.mainWindow.Synchronize(func() {
+			walk.MsgBox(a.mainWindow, "Ошибка",
+				"Файл novavpn-service.exe не найден.\nУбедитесь, что он находится рядом с NovaVPN.exe",
+				walk.MsgBoxIconError)
+		})
+		return
+	}
+
+	log.Println("[GUI] Запуск установки сервиса с UAC...")
+
+	// Запускаем установку с UAC (одна команда: install + start)
+	if err := elevation.RunElevated(serviceExe, "install"); err != nil {
+		a.mainWindow.Synchronize(func() {
+			walk.MsgBox(a.mainWindow, "Ошибка",
+				"Не удалось установить сервис.\nВозможно, вы отменили запрос UAC.",
+				walk.MsgBoxIconError)
+		})
+		return
+	}
+
+	// Ждём пока сервис станет доступен
+	for i := 0; i < 20; i++ {
+		time.Sleep(500 * time.Millisecond)
+		if a.ipcClient.IsServiceRunning() {
+			log.Println("[GUI] Сервис установлен и запущен")
+			a.mainWindow.Synchronize(func() {
+				walk.MsgBox(a.mainWindow, "NovaVPN",
+					"Сервис NovaVPN установлен и запущен!\nТеперь вы можете подключиться.",
+					walk.MsgBoxIconInformation)
+			})
+			return
 		}
 	}
+
+	a.mainWindow.Synchronize(func() {
+		walk.MsgBox(a.mainWindow, "Ошибка",
+			"Сервис установлен, но не удалось дождаться его запуска.\nПопробуйте запустить вручную.",
+			walk.MsgBoxIconWarning)
+	})
 }
 
 // formatBytes форматирует байты в человекочитаемый формат.
