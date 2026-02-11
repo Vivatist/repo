@@ -1,5 +1,5 @@
-// Package protocol реализует протокол NovaVPN (клиентская часть).
-// Полная совместимость с серверным протоколом.
+// Package protocol реализует протокол NovaVPN v2 (клиентская часть).
+// Stealth-версия с полной маскировкой под TLS.
 package protocol
 
 import (
@@ -10,14 +10,22 @@ import (
 )
 
 const (
-	ProtocolMagic   uint16 = 0x4E56
-	ProtocolVersion uint8  = 0x01
-	HeaderSize             = 14
+	ProtocolVersion uint8 = 0x02
+	
+	// TLS Record Header constants
+	TLSContentType  byte = 0x17
+	TLSVersionMajor byte = 0x03
+	TLSVersionMinor byte = 0x03
+	TLSHeaderSize        = 5
+	
+	SessionIDSize          = 4
 	NonceSize              = 12
 	AuthTagSize            = 16
-	TotalOverhead          = HeaderSize + NonceSize + AuthTagSize
+	MinEncryptedHeaderSize = 8
+	MaxPaddingSize         = 32
+	MinPacketSize          = TLSHeaderSize + SessionIDSize + NonceSize + MinEncryptedHeaderSize + AuthTagSize
 	MaxPayloadSize         = 65535
-	MaxPacketSize          = HeaderSize + NonceSize + MaxPayloadSize + AuthTagSize
+	MaxPacketSize          = TLSHeaderSize + SessionIDSize + NonceSize + MinEncryptedHeaderSize + MaxPaddingSize + MaxPayloadSize + AuthTagSize
 )
 
 type PacketType uint8
@@ -54,12 +62,12 @@ func (pt PacketType) String() string {
 }
 
 type PacketHeader struct {
-	Magic      uint16
+	SessionID  uint32
 	Version    uint8
 	Type       PacketType
-	SessionID  uint32
 	SequenceNo uint32
 	PayloadLen uint16
+	Padding    []byte
 }
 
 type Packet struct {
@@ -69,127 +77,169 @@ type Packet struct {
 }
 
 var (
-	ErrInvalidMagic   = errors.New("invalid magic bytes")
-	ErrInvalidVersion = errors.New("unsupported protocol version")
 	ErrPacketTooShort = errors.New("packet too short")
+	ErrDecryptFailed  = errors.New("decrypt failed")
+	ErrInvalidTLS     = errors.New("invalid TLS header")
 )
 
-func (h *PacketHeader) MarshalHeader() []byte {
-	buf := make([]byte, HeaderSize)
-	binary.BigEndian.PutUint16(buf[0:2], h.Magic)
-	buf[2] = h.Version
-	buf[3] = uint8(h.Type)
-	binary.BigEndian.PutUint32(buf[4:8], h.SessionID)
-	binary.BigEndian.PutUint32(buf[8:12], h.SequenceNo)
-	binary.BigEndian.PutUint16(buf[12:14], h.PayloadLen)
+func (h *PacketHeader) MarshalEncryptedHeader() []byte {
+	size := 8 + len(h.Padding)
+	buf := make([]byte, size)
+	buf[0] = h.Version
+	buf[1] = uint8(h.Type)
+	binary.BigEndian.PutUint32(buf[2:6], h.SequenceNo)
+	binary.BigEndian.PutUint16(buf[6:8], h.PayloadLen)
+	if len(h.Padding) > 0 {
+		copy(buf[8:], h.Padding)
+	}
 	return buf
 }
 
-func UnmarshalHeader(data []byte) (*PacketHeader, error) {
-	if len(data) < HeaderSize {
+func UnmarshalEncryptedHeader(data []byte, sessionID uint32) (*PacketHeader, error) {
+	if len(data) < 8 {
 		return nil, ErrPacketTooShort
 	}
 	h := &PacketHeader{
-		Magic:      binary.BigEndian.Uint16(data[0:2]),
-		Version:    data[2],
-		Type:       PacketType(data[3]),
-		SessionID:  binary.BigEndian.Uint32(data[4:8]),
-		SequenceNo: binary.BigEndian.Uint32(data[8:12]),
-		PayloadLen: binary.BigEndian.Uint16(data[12:14]),
+		SessionID:  sessionID,
+		Version:    data[0],
+		Type:       PacketType(data[1]),
+		SequenceNo: binary.BigEndian.Uint32(data[2:6]),
+		PayloadLen: binary.BigEndian.Uint16(data[6:8]),
 	}
-	if h.Magic != ProtocolMagic {
-		return nil, ErrInvalidMagic
-	}
-	if h.Version != ProtocolVersion {
-		return nil, ErrInvalidVersion
+	if len(data) > 8 {
+		h.Padding = make([]byte, len(data)-8)
+		copy(h.Padding, data[8:])
 	}
 	return h, nil
 }
 
+func AddTLSHeader(data []byte) []byte {
+	length := uint16(len(data))
+	header := make([]byte, TLSHeaderSize)
+	header[0] = TLSContentType
+	header[1] = TLSVersionMajor
+	header[2] = TLSVersionMinor
+	binary.BigEndian.PutUint16(header[3:5], length)
+	result := make([]byte, TLSHeaderSize+len(data))
+	copy(result[0:TLSHeaderSize], header)
+	copy(result[TLSHeaderSize:], data)
+	return result
+}
+
+func ParseTLSHeader(data []byte) ([]byte, error) {
+	if len(data) < TLSHeaderSize {
+		return nil, ErrPacketTooShort
+	}
+	if data[0] != TLSContentType {
+		// Опционально
+	}
+	length := binary.BigEndian.Uint16(data[3:5])
+	if int(length) != len(data)-TLSHeaderSize {
+		return nil, ErrInvalidTLS
+	}
+	return data[TLSHeaderSize:], nil
+}
+
 func (p *Packet) Marshal() ([]byte, error) {
-	headerBytes := p.Header.MarshalHeader()
-	totalLen := HeaderSize + NonceSize + len(p.Payload)
-	buf := make([]byte, totalLen)
-	copy(buf[0:HeaderSize], headerBytes)
-	copy(buf[HeaderSize:HeaderSize+NonceSize], p.Nonce[:])
-	copy(buf[HeaderSize+NonceSize:], p.Payload)
-	return buf, nil
+	rawSize := SessionIDSize + NonceSize + len(p.Payload)
+	raw := make([]byte, rawSize)
+	binary.BigEndian.PutUint32(raw[0:4], p.Header.SessionID)
+	copy(raw[4:16], p.Nonce[:])
+	copy(raw[16:], p.Payload)
+	return AddTLSHeader(raw), nil
 }
 
 func Unmarshal(data []byte) (*Packet, error) {
-	if len(data) < HeaderSize+NonceSize {
+	raw := data
+	if len(data) >= TLSHeaderSize && data[0] == TLSContentType {
+		var err error
+		raw, err = ParseTLSHeader(data)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if len(raw) < SessionIDSize+NonceSize {
 		return nil, ErrPacketTooShort
 	}
-	header, err := UnmarshalHeader(data)
-	if err != nil {
-		return nil, err
-	}
-	p := &Packet{Header: *header}
-	copy(p.Nonce[:], data[HeaderSize:HeaderSize+NonceSize])
-	payloadStart := HeaderSize + NonceSize
-	if payloadStart < len(data) {
-		p.Payload = make([]byte, len(data)-payloadStart)
-		copy(p.Payload, data[payloadStart:])
+	sessionID := binary.BigEndian.Uint32(raw[0:4])
+	var nonce [NonceSize]byte
+	copy(nonce[:], raw[4:16])
+	payload := make([]byte, len(raw)-16)
+	copy(payload, raw[16:])
+	p := &Packet{
+		Header: PacketHeader{SessionID: sessionID},
+		Nonce:  nonce,
+		Payload: payload,
 	}
 	return p, nil
 }
 
-func NewPacket(pType PacketType, sessionID uint32, seq uint32, nonce [NonceSize]byte, payload []byte) *Packet {
+func NewPacket(pType PacketType, sessionID uint32, seq uint32, nonce [NonceSize]byte, encryptedPayload []byte) *Packet {
 	return &Packet{
 		Header: PacketHeader{
-			Magic:      ProtocolMagic,
+			SessionID:  sessionID,
 			Version:    ProtocolVersion,
 			Type:       pType,
-			SessionID:  sessionID,
 			SequenceNo: seq,
-			PayloadLen: uint16(len(payload)),
 		},
 		Nonce:   nonce,
-		Payload: payload,
+		Payload: encryptedPayload,
 	}
 }
 
 func NewKeepalivePacket(sessionID uint32, seq uint32) *Packet {
-	return NewPacket(PacketKeepalive, sessionID, seq, [NonceSize]byte{}, nil)
+	var nonce [NonceSize]byte
+	return &Packet{
+		Header: PacketHeader{
+			SessionID:  sessionID,
+			Version:    ProtocolVersion,
+			Type:       PacketKeepalive,
+			SequenceNo: seq,
+			PayloadLen: 0,
+		},
+		Nonce:   nonce,
+		Payload: nil,
+	}
 }
 
 func NewDisconnectPacket(sessionID uint32, seq uint32) *Packet {
-	return NewPacket(PacketDisconnect, sessionID, seq, [NonceSize]byte{}, nil)
+	var nonce [NonceSize]byte
+	return &Packet{
+		Header: PacketHeader{
+			SessionID:  sessionID,
+			Version:    ProtocolVersion,
+			Type:       PacketDisconnect,
+			SequenceNo: seq,
+			PayloadLen: 0,
+		},
+		Nonce:   nonce,
+		Payload: nil,
+	}
 }
 
 // --- Handshake structures ---
 
 type HandshakeInit struct {
-	ClientPublicKey      [32]byte
 	Timestamp            uint64
 	EncryptedCredentials []byte
-	HMAC                 [32]byte
 }
 
 type HandshakeResp struct {
-	ServerPublicKey [32]byte
-	SessionID       uint32
-	AssignedIP      net.IP
-	SubnetMask      uint8
-	DNS1            net.IP
-	DNS2            net.IP
-	MTU             uint16
-	ServerHMAC      [32]byte
-}
-
-type HandshakeComplete struct {
-	ConfirmHMAC [32]byte
+	SessionID  uint32
+	AssignedIP net.IP
+	SubnetMask uint8
+	DNS1       net.IP
+	DNS2       net.IP
+	MTU        uint16
 }
 
 func MarshalHandshakeInit(h *HandshakeInit) []byte {
 	credsLen := len(h.EncryptedCredentials)
-	totalLen := 32 + 8 + 2 + credsLen + 32
+	totalLen := 8 + 2 + credsLen
 	buf := make([]byte, totalLen)
-	copy(buf[0:32], h.ClientPublicKey[:])
-	binary.BigEndian.PutUint64(buf[32:40], h.Timestamp)
-	binary.BigEndian.PutUint16(buf[40:42], uint16(credsLen))
-	copy(buf[42:42+credsLen], h.EncryptedCredentials)
-	copy(buf[42+credsLen:42+credsLen+32], h.HMAC[:])
+	binary.BigEndian.PutUint64(buf[0:8], h.Timestamp)
+	binary.BigEndian.PutUint16(buf[8:10], uint16(credsLen))
+	copy(buf[10:], h.EncryptedCredentials)
 	return buf
 }
 
@@ -206,23 +256,15 @@ func MarshalCredentials(email, password string) []byte {
 }
 
 func UnmarshalHandshakeResp(data []byte) (*HandshakeResp, error) {
-	if len(data) < 83 {
+	if len(data) < 15 {
 		return nil, fmt.Errorf("handshake resp too short: %d bytes", len(data))
 	}
 	h := &HandshakeResp{}
-	copy(h.ServerPublicKey[:], data[0:32])
-	h.SessionID = binary.BigEndian.Uint32(data[32:36])
-	h.AssignedIP = net.IPv4(data[36], data[37], data[38], data[39])
-	h.SubnetMask = data[40]
-	h.DNS1 = net.IPv4(data[41], data[42], data[43], data[44])
-	h.DNS2 = net.IPv4(data[45], data[46], data[47], data[48])
-	h.MTU = binary.BigEndian.Uint16(data[49:51])
-	copy(h.ServerHMAC[:], data[51:83])
+	h.SessionID = binary.BigEndian.Uint32(data[0:4])
+	h.AssignedIP = net.IPv4(data[4], data[5], data[6], data[7])
+	h.SubnetMask = data[8]
+	h.DNS1 = net.IPv4(data[9], data[10], data[11], data[12])
+	h.DNS2 = net.IPv4(data[13], data[14], data[15], data[16])
+	h.MTU = binary.BigEndian.Uint16(data[17:19])
 	return h, nil
-}
-
-func MarshalHandshakeComplete(h *HandshakeComplete) []byte {
-	buf := make([]byte, 32)
-	copy(buf[0:32], h.ConfirmHMAC[:])
-	return buf
 }
