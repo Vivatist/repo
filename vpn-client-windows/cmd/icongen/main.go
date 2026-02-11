@@ -172,10 +172,10 @@ func writeICO(path string, sizes []int, fill color.RGBA, withCheck bool) error {
 			w, h = 0, 0 // 0 означает 256 в формате ICO
 		}
 		out.Write([]byte{w, h, 0, 0})
-		binary.Write(&out, binary.LittleEndian, uint16(1))              // planes
-		binary.Write(&out, binary.LittleEndian, uint16(32))             // bpp
-		binary.Write(&out, binary.LittleEndian, uint32(len(pngs[i])))  // data size
-		binary.Write(&out, binary.LittleEndian, offset)                 // offset
+		binary.Write(&out, binary.LittleEndian, uint16(1))            // planes
+		binary.Write(&out, binary.LittleEndian, uint16(32))           // bpp
+		binary.Write(&out, binary.LittleEndian, uint32(len(pngs[i]))) // data size
+		binary.Write(&out, binary.LittleEndian, offset)               // offset
 		offset += uint32(len(pngs[i]))
 	}
 	for _, p := range pngs {
@@ -218,9 +218,9 @@ func main() {
 
 	// Цвета из SVG-файлов assets/
 	grey := color.RGBA{0x91, 0x91, 0x91, 255}   // 1.svg  — отключён
-	yellow := color.RGBA{0xFF, 0xBB, 0x00, 255}  // 2.svg  — подключение
-	green := color.RGBA{0x1A, 0x96, 0x17, 255}   // 3.svg  — подключён
-	logoC := color.RGBA{0x00, 0x80, 0x02, 255}   // logo.svg
+	yellow := color.RGBA{0xFF, 0xBB, 0x00, 255} // 2.svg  — подключение
+	green := color.RGBA{0x1A, 0x96, 0x17, 255}  // 3.svg  — подключён
+	logoC := color.RGBA{0x00, 0x80, 0x02, 255}  // logo.svg
 
 	// Иконки трея: PNG 64×64
 	fmt.Print("  Иконки трея (PNG 64×64)... ")

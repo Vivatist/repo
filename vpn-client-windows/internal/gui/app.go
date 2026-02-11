@@ -105,10 +105,6 @@ func (a *App) createMainWindow() error {
 		Size:     Size{400, 420},
 		Layout:   VBox{MarginsZero: false, Margins: Margins{10, 10, 10, 10}},
 		Children: []Widget{
-			// Заголовок
-			Label{Text: "NovaVPN Client", Font: Font{Bold: true, PointSize: 14}},
-			VSpacer{Size: 5},
-
 			// Статус
 			Label{
 				AssignTo:  &a.statusLabel,
