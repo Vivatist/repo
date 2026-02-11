@@ -6,8 +6,13 @@ package gui
 import (
 	"fmt"
 	"log"
+	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/lxn/walk"
@@ -32,7 +37,10 @@ type App struct {
 	connectBtn         *walk.PushButton
 	statusLabel        *walk.Label
 	statsLabel         *walk.Label
+	pingLabel          *walk.Label
 	serviceStatusLabel *walk.Label
+
+	passwordVisible bool // текущее состояние видимости пароля
 
 	// Иконки
 	iconDisconnected *walk.Icon
@@ -80,6 +88,9 @@ func (a *App) Run(autoConnect bool) error {
 	// Запускаем поллинг статуса от сервиса
 	go a.pollStatusLoop()
 
+	// Запускаем периодический пинг сервера
+	go a.pingLoop()
+
 	// Автоподключение
 	if autoConnect && a.cfg.WasConnected && a.cfg.ServerAddr != "" {
 		log.Println("[GUI] Автоподключение...")
@@ -108,7 +119,7 @@ func (a *App) createMainWindow() error {
 			// Статус
 			Label{
 				AssignTo:  &a.statusLabel,
-				Text:      "● Отключён",
+				Text:      "Отключён",
 				Font:      Font{PointSize: 10},
 				TextColor: walk.RGB(180, 0, 0),
 			},
@@ -148,10 +159,38 @@ func (a *App) createMainWindow() error {
 					LineEdit{AssignTo: &a.emailEdit, CueBanner: "user@example.com"},
 
 					Label{Text: "Пароль:"},
-					LineEdit{AssignTo: &a.passwordEdit, PasswordMode: true},
+					Composite{
+						Layout: HBox{MarginsZero: true, Spacing: 2},
+						Children: []Widget{
+							LineEdit{AssignTo: &a.passwordEdit, PasswordMode: true},
+							PushButton{
+								Text:      "👁",
+								MaxSize:   Size{Width: 30},
+								OnClicked: a.togglePasswordVisibility,
+							},
+						},
+					},
 				},
 			},
-			VSpacer{Size: 5},
+			//VSpacer{Size: 3},
+
+			// Статус сервиса
+			Label{
+				AssignTo: &a.serviceStatusLabel,
+				Text:     "",
+				Font:     Font{PointSize: 8},
+			},
+
+			// VSpacer{Size: 1},
+
+			// Пинг сервера
+			Label{
+				AssignTo: &a.pingLabel,
+				Text:     "",
+				Font:     Font{PointSize: 8},
+			},
+
+			// VSpacer{Size: 3},
 
 			// Кнопка подключения
 			PushButton{
@@ -160,14 +199,6 @@ func (a *App) createMainWindow() error {
 				MinSize:   Size{0, 40},
 				Font:      Font{PointSize: 11, Bold: true},
 				OnClicked: a.onConnectClicked,
-			},
-
-			// Индикатор статуса сервиса
-			Label{
-				AssignTo:  &a.serviceStatusLabel,
-				Text:      "",
-				Font:      Font{PointSize: 8},
-				TextColor: walk.RGB(128, 128, 128),
 			},
 		},
 	}.Create()
@@ -310,7 +341,7 @@ func (a *App) connect() {
 
 	// Показываем "Подключение..." сразу
 	a.mainWindow.Synchronize(func() {
-		a.statusLabel.SetText("● Подключение...")
+		a.statusLabel.SetText("Подключение...")
 		a.statusLabel.SetTextColor(walk.RGB(200, 150, 0))
 		a.connectBtn.SetText("Подключение...")
 		a.connectBtn.SetEnabled(false)
@@ -378,7 +409,7 @@ func (a *App) pollStatusLoop() {
 				if a.lastState != -2 {
 					a.lastState = -2
 					a.mainWindow.Synchronize(func() {
-						a.statusLabel.SetText("● Сервис недоступен")
+						a.statusLabel.SetText("Сервис недоступен")
 						a.statusLabel.SetTextColor(walk.RGB(128, 128, 128))
 						a.connectBtn.SetText("Подключиться")
 						a.connectBtn.SetEnabled(true)
@@ -386,7 +417,6 @@ func (a *App) pollStatusLoop() {
 						a.statsLabel.SetText("")
 						a.notifyIcon.SetToolTip("NovaVPN — Сервис недоступен")
 						a.serviceStatusLabel.SetText("Сервис NovaVPN не запущен")
-						a.serviceStatusLabel.SetTextColor(walk.RGB(180, 0, 0))
 						if a.iconDisconnected != nil {
 							a.notifyIcon.SetIcon(a.iconDisconnected)
 						}
@@ -401,7 +431,6 @@ func (a *App) pollStatusLoop() {
 				a.mainWindow.Synchronize(func() {
 					a.updateUIForState(status.State, status.AssignedIP)
 					a.serviceStatusLabel.SetText("Сервис NovaVPN запущен")
-					a.serviceStatusLabel.SetTextColor(walk.RGB(0, 128, 0))
 				})
 			}
 
@@ -420,7 +449,7 @@ func (a *App) pollStatusLoop() {
 func (a *App) updateUIForState(state int, assignedIP string) {
 	switch state {
 	case ipc.StateDisconnected:
-		a.statusLabel.SetText("● Отключён")
+		a.statusLabel.SetText("Отключён")
 		a.statusLabel.SetTextColor(walk.RGB(180, 0, 0))
 		a.connectBtn.SetText("Подключиться")
 		a.connectBtn.SetEnabled(true)
@@ -432,7 +461,7 @@ func (a *App) updateUIForState(state int, assignedIP string) {
 		a.statsLabel.SetText("")
 
 	case ipc.StateConnecting:
-		a.statusLabel.SetText("● Подключение...")
+		a.statusLabel.SetText("Подключение...")
 		a.statusLabel.SetTextColor(walk.RGB(200, 150, 0))
 		a.connectBtn.SetText("Подключение...")
 		a.connectBtn.SetEnabled(false)
@@ -443,7 +472,7 @@ func (a *App) updateUIForState(state int, assignedIP string) {
 		}
 
 	case ipc.StateConnected:
-		text := "● Подключён"
+		text := "Подключён"
 		if assignedIP != "" {
 			text += " (VPN IP: " + assignedIP + ")"
 		}
@@ -462,10 +491,22 @@ func (a *App) updateUIForState(state int, assignedIP string) {
 		}
 
 	case ipc.StateDisconnecting:
-		a.statusLabel.SetText("● Отключение...")
+		a.statusLabel.SetText("Отключение...")
 		a.statusLabel.SetTextColor(walk.RGB(200, 150, 0))
 		a.connectBtn.SetEnabled(false)
 	}
+}
+
+// togglePasswordVisibility переключает видимость пароля.
+// Walk не перерисовывает содержимое при SetPasswordMode, поэтому
+// сохраняем/восстанавливаем текст и позицию курсора вручную.
+func (a *App) togglePasswordVisibility() {
+	a.passwordVisible = !a.passwordVisible
+	txt := a.passwordEdit.Text()
+	a.passwordEdit.SetPasswordMode(!a.passwordVisible)
+	a.passwordEdit.SetText(txt)
+	// Курсор в конец
+	a.passwordEdit.SetTextSelection(len(txt), len(txt))
 }
 
 // setFieldsEnabled включает/отключает поля формы.
@@ -529,6 +570,79 @@ func (a *App) installAndStartService() {
 			"Сервис установлен, но не удалось дождаться его запуска.\nПопробуйте запустить вручную.",
 			walk.MsgBoxIconWarning)
 	})
+}
+
+// pingLoop — периодический ICMP-пинг сервера раз в 10 секунд.
+func (a *App) pingLoop() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	// Регулярка для извлечения RTT из вывода ping (английская локаль, chcp 437)
+	reTime := regexp.MustCompile(`time[=<](\d+)\s*ms`)
+
+	doPing := func() {
+		addr := a.serverEdit.Text()
+		if addr == "" {
+			a.mainWindow.Synchronize(func() {
+				a.pingLabel.SetText("")
+			})
+			return
+		}
+		// Извлекаем хост (без порта)
+		host := addr
+		if strings.Contains(addr, ":") {
+			h, _, _ := net.SplitHostPort(addr)
+			if h != "" {
+				host = h
+			}
+		}
+
+		// ICMP ping через cmd с принудительной английской кодовой страницей
+		cmd := exec.Command("cmd", "/C", "chcp 437 >nul & ping -n 1 -w 5000 "+host)
+		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			a.mainWindow.Synchronize(func() {
+				a.pingLabel.SetText("Пинг " + host + ": недоступен")
+			})
+			return
+		}
+
+		m := reTime.FindSubmatch(out)
+		if m == nil {
+			a.mainWindow.Synchronize(func() {
+				a.pingLabel.SetText("Пинг " + host + ": недоступен")
+			})
+			return
+		}
+
+		msStr := string(m[1])
+		var ms int
+		fmt.Sscanf(msStr, "%d", &ms)
+		a.mainWindow.Synchronize(func() {
+			switch {
+			case ms < 100:
+				// зелёный — хороший пинг
+			case ms < 300:
+				// жёлтый — средний пинг
+			default:
+				// красный — плохой пинг
+			}
+			a.pingLabel.SetText(fmt.Sprintf("Пинг %s: %s мс", host, msStr))
+		})
+	}
+
+	// Первый пинг сразу
+	doPing()
+
+	for {
+		select {
+		case <-a.stopPoll:
+			return
+		case <-ticker.C:
+			doPing()
+		}
+	}
 }
 
 // formatBytes форматирует байты в человекочитаемый формат.
