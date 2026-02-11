@@ -20,7 +20,14 @@ if errorlevel 1 (
     go install github.com/akavel/rsrc@latest
 )
 
-echo [1/4] Загружаем зависимости...
+:: Проверяем go-winres для встраивания ресурсов версии
+where go-winres >nul 2>&1
+if errorlevel 1 (
+    echo [INFO] Устанавливаем go-winres для встраивания информации о версии...
+    go install github.com/tc-hib/go-winres@latest
+)
+
+echo [1/6] Загружаем зависимости...
 go mod tidy
 if errorlevel 1 (
     echo [ОШИБКА] go mod tidy не удалось
@@ -28,23 +35,38 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [2/4] Встраиваем манифест...
+echo [2/6] Встраиваем манифест GUI...
 cd cmd\novavpn
 rsrc -manifest NovaVPN.exe.manifest -o rsrc.syso 2>nul
 if errorlevel 1 (
-    echo [WARN] rsrc не удалось, продолжаем без манифеста
+    echo [WARN] rsrc не удалось для GUI, продолжаем без манифеста
 )
-cd ..\..\n
-echo [3/4] Собираем NovaVPN.exe (GUI)...
-go build -ldflags="-s -w -H windowsgui" -o NovaVPN.exe ./cmd/novavpn/
+cd ..\..
+
+echo [3/6] Встраиваем манифест сервиса...
+cd cmd\novavpn-service
+rsrc -manifest novavpn-service.exe.manifest -o rsrc.syso 2>nul
+if errorlevel 1 (
+    echo [WARN] rsrc не удалось для сервиса, продолжаем без манифеста
+)
+cd ..\..
+
+echo [4/6] Генерируем ресурсы версии (go-winres)...
+go-winres make --in winres/winres.json --product-version 1.0.0.0 --file-version 1.0.0.0 2>nul
+if errorlevel 1 (
+    echo [WARN] go-winres не удалось, продолжаем без ресурсов версии
+)
+
+echo [5/6] Собираем NovaVPN.exe (GUI)...
+go build -trimpath -ldflags="-w -H windowsgui" -o NovaVPN.exe ./cmd/novavpn/
 if errorlevel 1 (
     echo [ОШИБКА] Сборка GUI не удалась
     pause
     exit /b 1
 )
 
-echo [4/4] Собираем novavpn-service.exe (сервис)...
-go build -ldflags="-s -w" -o novavpn-service.exe ./cmd/novavpn-service/
+echo [6/6] Собираем novavpn-service.exe (сервис)...
+go build -trimpath -ldflags="-w" -o novavpn-service.exe ./cmd/novavpn-service/
 if errorlevel 1 (
     echo [ОШИБКА] Сборка сервиса не удалась
     pause
@@ -63,5 +85,9 @@ echo   Скачайте: https://www.wintun.net/
 echo.
 echo   Запуск: NovaVPN.exe (НЕ требует прав администратора)
 echo   При первом подключении будет предложено установить сервис (UAC)
+echo.
+echo   ПРИМЕЧАНИЕ: Если Windows Defender блокирует файлы, скачанные
+echo   из интернета, щёлкните правой кнопкой по ZIP-архиву в Проводнике,
+echo   выберите "Свойства" и нажмите "Разблокировать" перед распаковкой.
 echo.
 pause
