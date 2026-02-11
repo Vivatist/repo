@@ -18,7 +18,7 @@ if not exist "novavpn-service.exe" (
 )
 if not exist "wintun.dll" (
     echo [ОШИБКА] wintun.dll не найден.
-    echo   Скопируйте wintun.dll (amd64) в корень проекта.
+    echo   Скопируйте wintun.dll ^(amd64^) в корень проекта.
     echo   Скачать: https://www.wintun.net/
     pause
     exit /b 1

@@ -47,6 +47,10 @@ type App struct {
 	iconConnecting   *walk.Icon
 	iconConnected    *walk.Icon
 
+	// Действия в контекстном меню трея
+	trayConnectAction    *walk.Action
+	trayDisconnectAction *walk.Action
+
 	// Поллинг статуса через IPC
 	stopPoll  chan struct{}
 	lastState int // предыдущее состояние для отслеживания изменений
@@ -230,29 +234,30 @@ func (a *App) createTrayIcon() error {
 		a.notifyIcon.SetIcon(a.iconDisconnected)
 	}
 
-	// Двойной клик — показать окно
+	// Одинарный клик — переключение VPN (подключить/отключить)
 	a.notifyIcon.MouseUp().Attach(func(x, y int, button walk.MouseButton) {
 		if button == walk.LeftButton {
-			a.showWindow()
+			a.onConnectClicked()
 		}
 	})
 
 	// Контекстное меню (ContextMenu() уже создано при инициализации NotifyIcon)
 	menu := a.notifyIcon.ContextMenu()
 
-	connectAction := walk.NewAction()
-	connectAction.SetText("Подключить")
-	connectAction.Triggered().Attach(func() {
+	a.trayConnectAction = walk.NewAction()
+	a.trayConnectAction.SetText("Подключить")
+	a.trayConnectAction.Triggered().Attach(func() {
 		go a.connect()
 	})
-	menu.Actions().Add(connectAction)
+	menu.Actions().Add(a.trayConnectAction)
 
-	disconnectAction := walk.NewAction()
-	disconnectAction.SetText("Отключить")
-	disconnectAction.Triggered().Attach(func() {
+	a.trayDisconnectAction = walk.NewAction()
+	a.trayDisconnectAction.SetText("Отключить")
+	a.trayDisconnectAction.SetVisible(false) // изначально скрыта
+	a.trayDisconnectAction.Triggered().Attach(func() {
 		go a.disconnect()
 	})
-	menu.Actions().Add(disconnectAction)
+	menu.Actions().Add(a.trayDisconnectAction)
 
 	separator := walk.NewSeparatorAction()
 	menu.Actions().Add(separator)
@@ -420,6 +425,8 @@ func (a *App) pollStatusLoop() {
 						if a.iconDisconnected != nil {
 							a.notifyIcon.SetIcon(a.iconDisconnected)
 						}
+						a.trayConnectAction.SetVisible(true)
+						a.trayDisconnectAction.SetVisible(false)
 					})
 				}
 				continue
@@ -459,6 +466,8 @@ func (a *App) updateUIForState(state int, assignedIP string) {
 			a.notifyIcon.SetIcon(a.iconDisconnected)
 		}
 		a.statsLabel.SetText("")
+		a.trayConnectAction.SetVisible(true)
+		a.trayDisconnectAction.SetVisible(false)
 
 	case ipc.StateConnecting:
 		a.statusLabel.SetText("Подключение...")
@@ -470,6 +479,8 @@ func (a *App) updateUIForState(state int, assignedIP string) {
 		if a.iconConnecting != nil {
 			a.notifyIcon.SetIcon(a.iconConnecting)
 		}
+		a.trayConnectAction.SetVisible(false)
+		a.trayDisconnectAction.SetVisible(false)
 
 	case ipc.StateConnected:
 		text := "Подключён"
@@ -489,11 +500,15 @@ func (a *App) updateUIForState(state int, assignedIP string) {
 		if a.iconConnected != nil {
 			a.notifyIcon.SetIcon(a.iconConnected)
 		}
+		a.trayConnectAction.SetVisible(false)
+		a.trayDisconnectAction.SetVisible(true)
 
 	case ipc.StateDisconnecting:
 		a.statusLabel.SetText("Отключение...")
 		a.statusLabel.SetTextColor(walk.RGB(200, 150, 0))
 		a.connectBtn.SetEnabled(false)
+		a.trayConnectAction.SetVisible(false)
+		a.trayDisconnectAction.SetVisible(false)
 	}
 }
 

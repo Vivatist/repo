@@ -1,5 +1,14 @@
 {
-  "RT_GROUP_ICON": {},
+  "RT_GROUP_ICON": {
+    "APP": {
+      "0000": "../../assets/logo.ico"
+    }
+  },
+  "RT_MANIFEST": {
+    "#1": {
+      "0000": "../cmd/novavpn/NovaVPN.exe.manifest"
+    }
+  },
   "RT_VERSION": {
     "#1": {
       "0000": {
