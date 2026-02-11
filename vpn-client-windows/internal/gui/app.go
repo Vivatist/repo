@@ -13,11 +13,9 @@ import (
 	"github.com/lxn/walk"
 	. "github.com/lxn/walk/declarative"
 
-	"github.com/novavpn/vpn-client-windows/internal/autostart"
 	"github.com/novavpn/vpn-client-windows/internal/config"
 	"github.com/novavpn/vpn-client-windows/internal/elevation"
 	"github.com/novavpn/vpn-client-windows/internal/ipc"
-	"github.com/novavpn/vpn-client-windows/internal/service"
 )
 
 // App — главное GUI-приложение.
@@ -31,11 +29,10 @@ type App struct {
 	pskEdit      *walk.LineEdit
 	emailEdit    *walk.LineEdit
 	passwordEdit *walk.LineEdit
-	connectBtn   *walk.PushButton
-	uninstallBtn *walk.PushButton
-	statusLabel  *walk.Label
-	statsLabel   *walk.Label
-	autoStartCB  *walk.CheckBox
+	connectBtn         *walk.PushButton
+	statusLabel        *walk.Label
+	statsLabel         *walk.Label
+	serviceStatusLabel *walk.Label
 
 	// Иконки
 	iconDisconnected *walk.Icon
@@ -74,9 +71,6 @@ func (a *App) Run(autoConnect bool) error {
 
 	// Загружаем настройки в форму
 	a.loadSettingsToForm()
-
-	// Показываем/скрываем кнопку удаления сервиса
-	a.updateUninstallButton()
 
 	// Запускаем поллинг статуса от сервиса
 	go a.pollStatusLoop()
@@ -158,22 +152,6 @@ func (a *App) createMainWindow() error {
 			},
 			VSpacer{Size: 5},
 
-			// Автозапуск
-			CheckBox{
-				AssignTo: &a.autoStartCB,
-				Text:     "Запускать при старте Windows",
-				OnCheckedChanged: func() {
-					a.cfg.AutoStart = a.autoStartCB.Checked()
-					if a.cfg.AutoStart {
-						autostart.Enable()
-					} else {
-						autostart.Disable()
-					}
-					a.saveSettings()
-				},
-			},
-			VSpacer{Size: 5},
-
 			// Кнопка подключения
 			PushButton{
 				AssignTo:  &a.connectBtn,
@@ -183,20 +161,18 @@ func (a *App) createMainWindow() error {
 				OnClicked: a.onConnectClicked,
 			},
 
-			// Кнопка удаления сервиса
-			PushButton{
-				AssignTo:  &a.uninstallBtn,
-				Text:      "Удалить сервис",
-				OnClicked: a.onUninstallClicked,
+			// Индикатор статуса сервиса
+			Label{
+				AssignTo:  &a.serviceStatusLabel,
+				Text:      "",
+				Font:      Font{PointSize: 8},
+				TextColor: walk.RGB(128, 128, 128),
 			},
 		},
 	}.Create()
 	if err != nil {
 		return err
 	}
-
-	// Скрываем кнопку до проверки — после Create() SetVisible работает корректно
-	a.uninstallBtn.SetVisible(false)
 
 	// Подписка на событие закрытия окна (сворачиваем в трей вместо закрытия)
 	a.mainWindow.Closing().Attach(func(canceled *bool, reason walk.CloseReason) {
@@ -280,7 +256,6 @@ func (a *App) loadSettingsToForm() {
 	a.pskEdit.SetText(a.cfg.PSK)
 	a.emailEdit.SetText(a.cfg.Email)
 	a.passwordEdit.SetText(a.cfg.Password)
-	a.autoStartCB.SetChecked(a.cfg.AutoStart)
 }
 
 // saveSettings сохраняет текущие настройки из формы.
@@ -409,7 +384,8 @@ func (a *App) pollStatusLoop() {
 						a.setFieldsEnabled(true)
 						a.statsLabel.SetText("")
 						a.notifyIcon.SetToolTip("NovaVPN — Сервис недоступен")
-						a.updateUninstallButton()
+					a.serviceStatusLabel.SetText("Сервис NovaVPN не запущен")
+					a.serviceStatusLabel.SetTextColor(walk.RGB(180, 0, 0))
 						if a.iconDisconnected != nil {
 							a.notifyIcon.SetIcon(a.iconDisconnected)
 						}
@@ -420,15 +396,11 @@ func (a *App) pollStatusLoop() {
 
 			// Обновляем UI если состояние изменилось
 			if status.State != a.lastState {
-				prevState := a.lastState
 				a.lastState = status.State
 				a.mainWindow.Synchronize(func() {
 					a.updateUIForState(status.State, status.AssignedIP)
-					a.updateUninstallButton()
-					// Уведомление при переходе в Connected
-					if status.State == ipc.StateConnected && prevState != ipc.StateConnected {
-						a.notifyIcon.ShowInfo("NovaVPN", "VPN подключён")
-					}
+					a.serviceStatusLabel.SetText("Сервис NovaVPN запущен")
+					a.serviceStatusLabel.SetTextColor(walk.RGB(0, 128, 0))
 				})
 			}
 
@@ -501,55 +473,6 @@ func (a *App) setFieldsEnabled(enabled bool) {
 	a.pskEdit.SetEnabled(enabled)
 	a.emailEdit.SetEnabled(enabled)
 	a.passwordEdit.SetEnabled(enabled)
-}
-
-// updateUninstallButton показывает/скрывает кнопку удаления сервиса.
-// Видна только когда сервис установлен и VPN отключён.
-func (a *App) updateUninstallButton() {
-	installed := service.IsInstalled()
-	disconnected := a.lastState == ipc.StateDisconnected || a.lastState == -1 || a.lastState == -2
-	a.uninstallBtn.SetVisible(installed && disconnected)
-}
-
-// onUninstallClicked — обработчик кнопки удаления сервиса.
-func (a *App) onUninstallClicked() {
-	result := walk.MsgBox(a.mainWindow, "NovaVPN",
-		"Удалить сервис NovaVPN?\n\nVPN-подключение не будет работать без сервиса.\nПотребуется подтверждение UAC.",
-		walk.MsgBoxOKCancel|walk.MsgBoxIconQuestion)
-	if result != walk.DlgCmdOK {
-		return
-	}
-	go a.uninstallService()
-}
-
-// uninstallService удаляет сервис с UAC elevation.
-func (a *App) uninstallService() {
-	exe, err := os.Executable()
-	if err != nil {
-		a.mainWindow.Synchronize(func() {
-			walk.MsgBox(a.mainWindow, "Ошибка", "Не удалось определить путь: "+err.Error(), walk.MsgBoxIconError)
-		})
-		return
-	}
-
-	serviceExe := filepath.Join(filepath.Dir(exe), "novavpn-service.exe")
-
-	log.Println("[GUI] Удаление сервиса с UAC...")
-
-	if err := elevation.RunElevated(serviceExe, "uninstall"); err != nil {
-		a.mainWindow.Synchronize(func() {
-			walk.MsgBox(a.mainWindow, "Ошибка",
-				"Не удалось удалить сервис.\nВозможно, вы отменили запрос UAC.",
-				walk.MsgBoxIconError)
-		})
-		return
-	}
-
-	log.Println("[GUI] Сервис удалён")
-	a.mainWindow.Synchronize(func() {
-		a.updateUninstallButton()
-		walk.MsgBox(a.mainWindow, "NovaVPN", "Сервис NovaVPN удалён.", walk.MsgBoxIconInformation)
-	})
 }
 
 // installAndStartService устанавливает и запускает сервис NovaVPN с UAC elevation.
