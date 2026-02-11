@@ -141,3 +141,74 @@ func ZeroKey(key *[KeySize]byte) {
 		key[i] = 0
 	}
 }
+
+// GenerateRandomPadding генерирует случайный padding 0-32 байта.
+func GenerateRandomPadding() ([]byte, error) {
+	var sizeByte [1]byte
+	if _, err := rand.Read(sizeByte[:]); err != nil {
+		return nil, fmt.Errorf("padding size gen error: %w", err)
+	}
+	size := int(sizeByte[0]) % 33
+	if size == 0 {
+		return nil, nil
+	}
+	padding := make([]byte, size)
+	if _, err := rand.Read(padding); err != nil {
+		return nil, fmt.Errorf("padding gen error: %w", err)
+	}
+	return padding, nil
+}
+
+// DeriveKeyFromPassword выводит ключ из пароля (упрощённая схема).
+func DeriveKeyFromPassword(password string, psk [KeySize]byte, sessionID uint32) ([KeySize]byte, error) {
+	var key [KeySize]byte
+	salt := make([]byte, KeySize+4)
+	copy(salt[0:KeySize], psk[:])
+	salt[KeySize] = byte(sessionID >> 24)
+	salt[KeySize+1] = byte(sessionID >> 16)
+	salt[KeySize+2] = byte(sessionID >> 8)
+	salt[KeySize+3] = byte(sessionID)
+	saltHash := sha256.Sum256(salt)
+	derived := hkdf.New(sha256.New, []byte(password), saltHash[:], []byte("novavpn-session-v2"))
+	if _, err := io.ReadFull(derived, key[:]); err != nil {
+		return key, fmt.Errorf("key derivation error: %w", err)
+	}
+	return key, nil
+}
+
+// EncryptPacketV2 шифрует пакет v2 с padding.
+func EncryptPacketV2(key [KeySize]byte, header []byte, payload []byte, padding []byte) ([NonceSize]byte, []byte, error) {
+var nonce [NonceSize]byte
+plaintextSize := len(header) + len(padding) + len(payload)
+plaintext := make([]byte, plaintextSize)
+offset := 0
+copy(plaintext[offset:], header)
+offset += len(header)
+if len(padding) > 0 {
+copy(plaintext[offset:], padding)
+offset += len(padding)
+}
+copy(plaintext[offset:], payload)
+if _, err := rand.Read(nonce[:]); err != nil {
+return nonce, nil, fmt.Errorf("nonce gen error: %w", err)
+}
+aead, err := chacha20poly1305.New(key[:])
+if err != nil {
+return nonce, nil, fmt.Errorf("AEAD error: %w", err)
+}
+ciphertext := aead.Seal(nil, nonce[:], plaintext, nil)
+return nonce, ciphertext, nil
+}
+
+// DecryptPacketV2 расшифровывает пакет v2.
+func DecryptPacketV2(key [KeySize]byte, nonce [NonceSize]byte, ciphertext []byte) ([]byte, error) {
+aead, err := chacha20poly1305.New(key[:])
+if err != nil {
+return nil, fmt.Errorf("AEAD error: %w", err)
+}
+plaintext, err := aead.Open(nil, nonce[:], ciphertext, nil)
+if err != nil {
+return nil, fmt.Errorf("decrypt error: %w", err)
+}
+return plaintext, nil
+}
