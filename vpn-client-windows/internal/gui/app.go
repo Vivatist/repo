@@ -31,11 +31,11 @@ type App struct {
 	pskEdit      *walk.LineEdit
 	emailEdit    *walk.LineEdit
 	passwordEdit *walk.LineEdit
-	connectBtn     *walk.PushButton
-	uninstallBtn   *walk.PushButton
-	statusLabel    *walk.Label
-	statsLabel     *walk.Label
-	autoStartCB    *walk.CheckBox
+	connectBtn   *walk.PushButton
+	uninstallBtn *walk.PushButton
+	statusLabel  *walk.Label
+	statsLabel   *walk.Label
+	autoStartCB  *walk.CheckBox
 
 	// Иконки
 	iconDisconnected *walk.Icon

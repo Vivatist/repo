@@ -32,8 +32,8 @@ type shellExecuteInfo struct {
 }
 
 var (
-	shell32          = windows.NewLazySystemDLL("shell32.dll")
-	shellExecuteExW  = shell32.NewProc("ShellExecuteExW")
+	shell32         = windows.NewLazySystemDLL("shell32.dll")
+	shellExecuteExW = shell32.NewProc("ShellExecuteExW")
 )
 
 // RunElevated запускает exe с аргументами от имени администратора (с UAC-запросом).
