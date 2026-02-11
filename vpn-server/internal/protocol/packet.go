@@ -16,30 +16,29 @@ import (
 )
 
 const (
-	// SessionIDSize — размер SessionID (единственное поле в открытом виде)
-	SessionIDSize = 4
+	// ProtocolMagic — магические байты протокола NovaVPN ("NV")
+	ProtocolMagic uint16 = 0x4E56
 
-	// EncryptedHeaderSize — размер зашифрованной части заголовка
-	// version(1) + type(1) + seq(4) + payloadLen(2) + padding(0-32) = variable
-	EncryptedHeaderSize = 8 // минимальный размер без padding
+	// ProtocolVersion — текущая версия протокола
+	ProtocolVersion uint8 = 0x01
 
-	// NonceSize — размер nonce
+	// HeaderSize — размер заголовка пакета (без nonce и payload)
+	HeaderSize = 14 // magic(2) + version(1) + type(1) + sessionID(4) + seq(4) + payloadLen(2)
+
+	// NonceSize — размер nonce для ChaCha20-Poly1305
 	NonceSize = 12
 
 	// AuthTagSize — размер authentication tag
 	AuthTagSize = 16
 
-	// MinPacketSize — минимальный размер пакета
-	MinPacketSize = SessionIDSize + NonceSize + EncryptedHeaderSize + AuthTagSize
+	// TotalOverhead — общий overhead протокола
+	TotalOverhead = HeaderSize + NonceSize + AuthTagSize
 
 	// MaxPayloadSize — максимальный размер полезной нагрузки
 	MaxPayloadSize = 65535
 
 	// MaxPacketSize — максимальный размер пакета
-	MaxPacketSize = SessionIDSize + NonceSize + EncryptedHeaderSize + 32 + MaxPayloadSize + AuthTagSize
-
-	// MaxPaddingSize — максимальный размер padding для маскировки
-	MaxPaddingSize = 32
+	MaxPacketSize = HeaderSize + NonceSize + MaxPayloadSize + AuthTagSize
 )
 
 // PacketType определяет тип пакета протокола.
@@ -91,14 +90,13 @@ func (pt PacketType) String() string {
 }
 
 // PacketHeader представляет заголовок пакета протокола.
-// Теперь только SessionID передаётся открыто, остальное шифруется.
 type PacketHeader struct {
-	SessionID  uint32     // открытое поле для роутинга
-	Version    uint8      // зашифровано
-	Type       PacketType // зашифровано
-	SequenceNo uint32     // зашифровано
-	PayloadLen uint16     // зашифровано (длина plaintext)
-	Padding    []byte     // случайный padding 0-32 байта
+	Magic      uint16
+	Version    uint8
+	Type       PacketType
+	SessionID  uint32
+	SequenceNo uint32
+	PayloadLen uint16
 }
 
 // Packet представляет полный пакет протокола.
@@ -110,46 +108,47 @@ type Packet struct {
 
 // Ошибки протокола.
 var (
+	ErrInvalidMagic    = errors.New("неверные магические байты")
+	ErrInvalidVersion  = errors.New("неподдерживаемая версия протокола")
 	ErrPacketTooShort  = errors.New("пакет слишком короткий")
 	ErrPacketTooLarge  = errors.New("пакет слишком большой")
 	ErrInvalidChecksum = errors.New("неверная контрольная сумма")
 	ErrInvalidType     = errors.New("неизвестный тип пакета")
-	ErrDecryptFailed   = errors.New("ошибка расшифровки")
 )
 
-// MarshalHeader сериализует заголовок пакета в байты (для шифрования).
-// Формат: version(1) + type(1) + seq(4) + payloadLen(2) + padding(variable)
+// MarshalHeader сериализует заголовок пакета в байты.
 func (h *PacketHeader) MarshalHeader() []byte {
-	headerSize := 1 + 1 + 4 + 2 + len(h.Padding)
-	buf := make([]byte, headerSize)
-	buf[0] = h.Version
-	buf[1] = uint8(h.Type)
-	binary.BigEndian.PutUint32(buf[2:6], h.SequenceNo)
-	binary.BigEndian.PutUint16(buf[6:8], h.PayloadLen)
-	if len(h.Padding) > 0 {
-		copy(buf[8:], h.Padding)
-	}
+	buf := make([]byte, HeaderSize)
+	binary.BigEndian.PutUint16(buf[0:2], h.Magic)
+	buf[2] = h.Version
+	buf[3] = uint8(h.Type)
+	binary.BigEndian.PutUint32(buf[4:8], h.SessionID)
+	binary.BigEndian.PutUint32(buf[8:12], h.SequenceNo)
+	binary.BigEndian.PutUint16(buf[12:14], h.PayloadLen)
 	return buf
 }
 
-// UnmarshalHeader десериализует заголовок из байтов (после расшифровки).
-func UnmarshalHeader(data []byte, sessionID uint32) (*PacketHeader, error) {
-	if len(data) < 8 {
+// UnmarshalHeader десериализует заголовок из байтов.
+func UnmarshalHeader(data []byte) (*PacketHeader, error) {
+	if len(data) < HeaderSize {
 		return nil, ErrPacketTooShort
 	}
 
 	h := &PacketHeader{
-		SessionID:  sessionID,
-		Version:    data[0],
-		Type:       PacketType(data[1]),
-		SequenceNo: binary.BigEndian.Uint32(data[2:6]),
-		PayloadLen: binary.BigEndian.Uint16(data[6:8]),
+		Magic:      binary.BigEndian.Uint16(data[0:2]),
+		Version:    data[2],
+		Type:       PacketType(data[3]),
+		SessionID:  binary.BigEndian.Uint32(data[4:8]),
+		SequenceNo: binary.BigEndian.Uint32(data[8:12]),
+		PayloadLen: binary.BigEndian.Uint16(data[12:14]),
 	}
 
-	// Padding — всё что после первых 8 байт
-	if len(data) > 8 {
-		h.Padding = make([]byte, len(data)-8)
-		copy(h.Padding, data[8:])
+	if h.Magic != ProtocolMagic {
+		return nil, ErrInvalidMagic
+	}
+
+	if h.Version != ProtocolVersion {
+		return nil, ErrInvalidVersion
 	}
 
 	return h, nil

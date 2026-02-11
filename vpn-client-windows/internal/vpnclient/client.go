@@ -3,9 +3,11 @@ package vpnclient
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"log"
+	"math/big"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -550,11 +552,24 @@ func (c *Client) tunReadLoop() {
 	}
 }
 
-// keepaliveLoop — отправка keepalive-пакетов каждые 25 секунд.
+// keepaliveLoop — отправка keepalive-пакетов с рандомизированными интервалами.
+// Интервал: 20-35 секунд (для уменьшения DPI fingerprinting)
 func (c *Client) keepaliveLoop() {
 	defer c.wg.Done()
 
-	ticker := time.NewTicker(25 * time.Second)
+	// Функция генерации случайного интервала keepalive
+	randomKeepaliveInterval := func() time.Duration {
+		minInterval := 20 * time.Second
+		maxInterval := 35 * time.Second
+		
+		// Генерируем случайное значение от 0 до 15 секунд
+		randomSec, _ := rand.Int(rand.Reader, big.NewInt(16)) // 0-15
+		interval := minInterval + time.Duration(randomSec.Int64())*time.Second
+		
+		return interval
+	}
+
+	ticker := time.NewTicker(randomKeepaliveInterval())
 	defer ticker.Stop()
 
 	for {
@@ -568,6 +583,8 @@ func (c *Client) keepaliveLoop() {
 					c.conn.Write(data)
 				}
 			}
+			// Сбрасываем тикер с новым случайным интервалом
+			ticker.Reset(randomKeepaliveInterval())
 		}
 	}
 }

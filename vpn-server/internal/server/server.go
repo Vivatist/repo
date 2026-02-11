@@ -2,9 +2,11 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"log"
+	"math/big"
 	"net"
 	"strconv"
 	"strings"
@@ -670,7 +672,23 @@ func (s *VPNServer) maintenanceLoop() {
 	statsTicker := time.NewTicker(60 * time.Second)
 	defer statsTicker.Stop()
 
-	keepaliveTicker := time.NewTicker(time.Duration(s.cfg.KeepaliveInterval) * time.Second)
+	// Рандомизированный keepalive для уменьшения DPI fingerprinting
+	// Интервал: базовый ± 7 секунд (например, 25±7 = 18-32 сек)
+	randomKeepaliveInterval := func() time.Duration {
+		baseInterval := time.Duration(s.cfg.KeepaliveInterval) * time.Second
+		
+		// Генерируем случайное отклонение от -7 до +7 секунд
+		randomOffset, _ := rand.Int(rand.Reader, big.NewInt(15)) // 0-14
+		offset := time.Duration(randomOffset.Int64()-7) * time.Second // -7 to +7
+		
+		interval := baseInterval + offset
+		if interval < 10*time.Second {
+			interval = 10 * time.Second // минимум 10 секунд
+		}
+		return interval
+	}
+
+	keepaliveTicker := time.NewTicker(randomKeepaliveInterval())
 	defer keepaliveTicker.Stop()
 
 	for {
@@ -689,6 +707,8 @@ func (s *VPNServer) maintenanceLoop() {
 
 		case <-keepaliveTicker.C:
 			s.sendKeepalives()
+			// Сбрасываем тикер с новым случайным интервалом
+			keepaliveTicker.Reset(randomKeepaliveInterval())
 		}
 	}
 }
