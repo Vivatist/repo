@@ -116,10 +116,10 @@ func (a *App) createMainWindow() error {
 	err := MainWindow{
 		AssignTo: &a.mainWindow,
 		Title:    "NovaVPN",
-		MinSize:  Size{400, 380},
-		MaxSize:  Size{400, 380},
-		Size:     Size{400, 380},
-		Layout:   VBox{MarginsZero: false, Margins: Margins{10, 10, 10, 10}},
+		MinSize:  Size{Width: 400, Height: 380},
+		MaxSize:  Size{Width: 400, Height: 380},
+		Size:     Size{Width: 400, Height: 380},
+		Layout:   VBox{MarginsZero: false, Margins: Margins{Left: 10, Top: 10, Right: 10, Bottom: 10}},
 		Children: []Widget{
 			// Статус
 			Label{
@@ -184,7 +184,7 @@ func (a *App) createMainWindow() error {
 			PushButton{
 				AssignTo:  &a.connectBtn,
 				Text:      "Подключиться",
-				MinSize:   Size{0, 40},
+				MinSize:   Size{Width: 0, Height: 40},
 				Font:      Font{PointSize: 11, Bold: true},
 				OnClicked: a.onConnectClicked,
 			},
