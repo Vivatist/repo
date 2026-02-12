@@ -1,5 +1,7 @@
 //go:build windows
 
+//go:build windows
+
 // Package config определяет интерфейс для работы с конфигурацией.
 package config
 

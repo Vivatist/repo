@@ -1,5 +1,7 @@
 //go:build windows
 
+//go:build windows
+
 // Package crypto определяет интерфейсы для криптографических операций.
 package crypto
 

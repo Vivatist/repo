@@ -1,5 +1,7 @@
 //go:build windows
 
+//go:build windows
+
 // Package network определяет интерфейсы для работы с сетевыми устройствами.
 package network
 
