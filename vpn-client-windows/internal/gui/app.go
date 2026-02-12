@@ -31,7 +31,6 @@ type App struct {
 	mainWindow         *walk.MainWindow
 	notifyIcon         *walk.NotifyIcon
 	serverEdit         *walk.LineEdit
-	pskEdit            *walk.LineEdit
 	emailEdit          *walk.LineEdit
 	passwordEdit       *walk.LineEdit
 	connectBtn         *walk.PushButton
@@ -115,9 +114,9 @@ func (a *App) createMainWindow() error {
 	err := MainWindow{
 		AssignTo: &a.mainWindow,
 		Title:    "NovaVPN",
-		MinSize:  Size{400, 420},
-		MaxSize:  Size{400, 420},
-		Size:     Size{400, 420},
+		MinSize:  Size{400, 380},
+		MaxSize:  Size{400, 380},
+		Size:     Size{400, 380},
 		Layout:   VBox{MarginsZero: false, Margins: Margins{10, 10, 10, 10}},
 		Children: []Widget{
 			// Статус
@@ -141,23 +140,6 @@ func (a *App) createMainWindow() error {
 				Children: []Widget{
 					Label{Text: "Сервер:"},
 					LineEdit{AssignTo: &a.serverEdit, CueBanner: "212.118.43.43:51820"},
-
-					Label{Text: "PSK:"},
-					Composite{
-						Layout: HBox{MarginsZero: true, Spacing: 2},
-						Children: []Widget{
-							LineEdit{AssignTo: &a.pskEdit},
-							PushButton{
-								Text:    "📋",
-								MaxSize: Size{Width: 30},
-								OnClicked: func() {
-									if txt := a.pskEdit.Text(); txt != "" {
-										walk.Clipboard().SetText(txt)
-									}
-								},
-							},
-						},
-					},
 
 					Label{Text: "Email:"},
 					LineEdit{AssignTo: &a.emailEdit, CueBanner: "user@example.com"},
@@ -290,7 +272,6 @@ func (a *App) showWindow() {
 // loadSettingsToForm заполняет форму сохранёнными настройками.
 func (a *App) loadSettingsToForm() {
 	a.serverEdit.SetText(a.cfg.ServerAddr)
-	a.pskEdit.SetText(a.cfg.PSK)
 	a.emailEdit.SetText(a.cfg.Email)
 	a.passwordEdit.SetText(a.cfg.Password)
 }
@@ -298,7 +279,6 @@ func (a *App) loadSettingsToForm() {
 // saveSettings сохраняет текущие настройки из формы.
 func (a *App) saveSettings() {
 	a.cfg.ServerAddr = a.serverEdit.Text()
-	a.cfg.PSK = a.pskEdit.Text()
 	a.cfg.Email = a.emailEdit.Text()
 	a.cfg.Password = a.passwordEdit.Text()
 	if err := a.cfg.Save(); err != nil {
@@ -324,7 +304,7 @@ func (a *App) onConnectClicked() {
 func (a *App) connect() {
 	a.saveSettings()
 
-	if a.cfg.ServerAddr == "" || a.cfg.PSK == "" || a.cfg.Email == "" || a.cfg.Password == "" {
+	if a.cfg.ServerAddr == "" || a.cfg.Email == "" || a.cfg.Password == "" {
 		a.mainWindow.Synchronize(func() {
 			walk.MsgBox(a.mainWindow, "NovaVPN", "Заполните все поля", walk.MsgBoxIconWarning)
 		})
@@ -441,6 +421,16 @@ func (a *App) pollStatusLoop() {
 				})
 			}
 
+			// Сохраняем PSK полученный при bootstrap-подключении
+			if status.ReceivedPSK != "" && a.cfg.PSK != status.ReceivedPSK {
+				a.cfg.PSK = status.ReceivedPSK
+				if err := a.cfg.Save(); err != nil {
+					log.Printf("[GUI] Ошибка сохранения PSK: %v", err)
+				} else {
+					log.Printf("[GUI] PSK сохранён (bootstrap)")
+				}
+			}
+
 			// Обновляем статистику если подключены
 			if status.State == ipc.StateConnected {
 				a.mainWindow.Synchronize(func() {
@@ -527,7 +517,6 @@ func (a *App) togglePasswordVisibility() {
 // setFieldsEnabled включает/отключает поля формы.
 func (a *App) setFieldsEnabled(enabled bool) {
 	a.serverEdit.SetEnabled(enabled)
-	a.pskEdit.SetEnabled(enabled)
 	a.emailEdit.SetEnabled(enabled)
 	a.passwordEdit.SetEnabled(enabled)
 }

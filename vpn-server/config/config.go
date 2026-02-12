@@ -58,7 +58,7 @@ type ServerConfig struct {
 func DefaultConfig() *ServerConfig {
 	return &ServerConfig{
 		ListenAddr:        "0.0.0.0",
-		ListenPort:        51820,
+		ListenPort:        443,
 		VPNSubnet:         "10.8.0.0/24",
 		ServerVPNIP:       "10.8.0.1",
 		TunName:           "nova0",

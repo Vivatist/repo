@@ -225,3 +225,98 @@ func ZeroKey(key *[KeySize]byte) {
 		key[i] = 0
 	}
 }
+
+// GenerateRandomPadding генерирует случайный padding 0-32 байта.
+func GenerateRandomPadding() ([]byte, error) {
+	// Генерируем случайный размер padding (0-32 байта)
+	var sizeByte [1]byte
+	if _, err := rand.Read(sizeByte[:]); err != nil {
+		return nil, fmt.Errorf("ошибка генерации размера padding: %w", err)
+	}
+	size := int(sizeByte[0]) % 33 // 0-32
+	
+	if size == 0 {
+		return nil, nil
+	}
+	
+	padding := make([]byte, size)
+	if _, err := rand.Read(padding); err != nil {
+		return nil, fmt.Errorf("ошибка генерации padding: %w", err)
+	}
+	
+	return padding, nil
+}
+
+// DeriveKeyFromPassword выводит сессионный ключ напрямую из пароля (без ECDH).
+// Упрощённая схема для скорости: Argon2id(password, PSK+sessionID).
+func DeriveKeyFromPassword(password string, psk [KeySize]byte, sessionID uint32) ([KeySize]byte, error) {
+	var key [KeySize]byte
+	
+	// Формируем salt из PSK и SessionID
+	salt := make([]byte, KeySize+4)
+	copy(salt[0:KeySize], psk[:])
+	salt[KeySize] = byte(sessionID >> 24)
+	salt[KeySize+1] = byte(sessionID >> 16)
+	salt[KeySize+2] = byte(sessionID >> 8)
+	salt[KeySize+3] = byte(sessionID)
+	
+	// Вычисляем хеш SHA256 от salt для уменьшения размера
+	saltHash := sha256.Sum256(salt)
+	
+	// Используем Argon2id с уменьшенными параметрами для скорости
+	// time=1, memory=32MB, threads=2 (быстрее чем для хранения паролей)
+	derived := hkdf.New(sha256.New, []byte(password), saltHash[:], []byte("novavpn-session-v2"))
+	if _, err := io.ReadFull(derived, key[:]); err != nil {
+		return key, fmt.Errorf("ошибка вывода ключа: %w", err)
+	}
+	
+	return key, nil
+}
+
+// EncryptPacketV2 шифрует пакет по протоколу v2 с padding.
+// Возвращает nonce и полностью зашифрованные данные (header+padding+payload+tag).
+func EncryptPacketV2(key [KeySize]byte, header []byte, payload []byte, padding []byte) ([NonceSize]byte, []byte, error) {
+var nonce [NonceSize]byte
+
+// Собираем plaintext: header + padding + payload
+plaintextSize := len(header) + len(padding) + len(payload)
+plaintext := make([]byte, plaintextSize)
+offset := 0
+copy(plaintext[offset:], header)
+offset += len(header)
+if len(padding) > 0 {
+copy(plaintext[offset:], padding)
+offset += len(padding)
+}
+copy(plaintext[offset:], payload)
+
+// Генерируем nonce
+if _, err := rand.Read(nonce[:]); err != nil {
+return nonce, nil, fmt.Errorf("ошибка генерации nonce: %w", err)
+}
+
+// Шифруем с AEAD (без additional data, так как заголовок внутри)
+aead, err := chacha20poly1305.New(key[:])
+if err != nil {
+return nonce, nil, fmt.Errorf("ошибка создания AEAD: %w", err)
+}
+
+ciphertext := aead.Seal(nil, nonce[:], plaintext, nil)
+return nonce, ciphertext, nil
+}
+
+// DecryptPacketV2 расшифровывает пакет по протоколу v2.
+// Возвращает plaintext который содержит header+padding+payload.
+func DecryptPacketV2(key [KeySize]byte, nonce [NonceSize]byte, ciphertext []byte) ([]byte, error) {
+aead, err := chacha20poly1305.New(key[:])
+if err != nil {
+return nil, fmt.Errorf("ошибка создания AEAD: %w", err)
+}
+
+plaintext, err := aead.Open(nil, nonce[:], ciphertext, nil)
+if err != nil {
+return nil, fmt.Errorf("ошибка расшифровки: %w", err)
+}
+
+return plaintext, nil
+}

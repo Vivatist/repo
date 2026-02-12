@@ -4,7 +4,7 @@
 
 # Адрес и порт для прослушивания UDP
 listen_addr: "0.0.0.0"
-listen_port: 51820
+listen_port: 443  # HTTPS порт для маскировки под TLS/QUIC трафик
 
 # VPN подсеть и IP сервера
 vpn_subnet: "10.8.0.0/24"

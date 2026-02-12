@@ -26,9 +26,11 @@ const ServiceDescription = "Управляет VPN-подключениями No
 
 // novaVPNService — реализация интерфейса svc.Handler.
 type novaVPNService struct {
-	client    *vpnclient.Client
-	ipcServer *ipc.Server
-	mu        sync.Mutex
+	client      *vpnclient.Client
+	ipcServer   *ipc.Server
+	mu          sync.Mutex
+	pskMu       sync.Mutex // отдельный мьютекс для PSK (избегаем deadlock)
+	receivedPSK string     // PSK полученный при bootstrap-подключении
 }
 
 // Execute — основной цикл Windows-сервиса.
@@ -44,6 +46,11 @@ func (s *novaVPNService) Execute(args []string, r <-chan svc.ChangeRequest, chan
 	// Создаём VPN-клиент
 	s.client = vpnclient.NewClient(func(state vpnclient.ConnectionState, info string) {
 		log.Printf("[SERVICE] Состояние VPN: %s (%s)", state, info)
+	}, func(pskHex string) {
+		s.pskMu.Lock()
+		s.receivedPSK = pskHex
+		s.pskMu.Unlock()
+		log.Printf("[SERVICE] Получен PSK от сервера (bootstrap)")
 	})
 
 	// Запускаем IPC-сервер
@@ -106,10 +113,15 @@ func (s *novaVPNService) handleDisconnect() {
 
 // handleStatus — обработчик IPC-запроса статуса.
 func (s *novaVPNService) handleStatus() ipc.StatusInfo {
+	s.pskMu.Lock()
+	psk := s.receivedPSK
+	s.pskMu.Unlock()
+
 	state := s.client.GetState()
 	status := ipc.StatusInfo{
 		State:       int(state),
 		StateText:   state.String(),
+		ReceivedPSK: psk,
 		BytesSent:   s.client.BytesSent.Load(),
 		BytesRecv:   s.client.BytesRecv.Load(),
 		PacketsSent: s.client.PacketsSent.Load(),

@@ -2,9 +2,11 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"log"
+	"math/big"
 	"net"
 	"strconv"
 	"strings"
@@ -291,9 +293,18 @@ func (s *VPNServer) handleHandshakeInit(pkt *protocol.Packet, remoteAddr *net.UD
 	binary.BigEndian.PutUint64(hmacData[32:40], hsInit.Timestamp)
 	copy(hmacData[40:], hsInit.EncryptedCredentials)
 
+	// Пробуем настоящий PSK, затем нулевой (bootstrap-режим)
+	isBootstrap := false
+	activePSK := s.psk
 	if !novacrypto.VerifyHMAC(s.psk, hmacData, hsInit.HMAC) {
-		log.Printf("[HANDSHAKE] Неверный HMAC от %s — клиент не знает PSK", remoteAddr)
-		return
+		var zeroPSK [novacrypto.KeySize]byte
+		if !novacrypto.VerifyHMAC(zeroPSK, hmacData, hsInit.HMAC) {
+			log.Printf("[HANDSHAKE] Неверный HMAC от %s — клиент не знает PSK", remoteAddr)
+			return
+		}
+		isBootstrap = true
+		activePSK = zeroPSK
+		log.Printf("[HANDSHAKE] Bootstrap-режим для %s (клиент без PSK)", remoteAddr)
 	}
 
 	// Расшифровываем credentials (email + пароль)
@@ -306,7 +317,7 @@ func (s *VPNServer) handleHandshakeInit(pkt *protocol.Packet, remoteAddr *net.UD
 	copy(credsNonce[:], hsInit.EncryptedCredentials[:12])
 	credsCiphertext := hsInit.EncryptedCredentials[12:]
 
-	credsPlaintext, err := novacrypto.Decrypt(s.psk, credsNonce, credsCiphertext, nil)
+	credsPlaintext, err := novacrypto.Decrypt(activePSK, credsNonce, credsCiphertext, nil)
 	if err != nil {
 		log.Printf("[HANDSHAKE] Ошибка расшифровки credentials от %s: %v", remoteAddr, err)
 		return
@@ -362,8 +373,8 @@ func (s *VPNServer) handleHandshakeInit(pkt *protocol.Packet, remoteAddr *net.UD
 		return
 	}
 
-	// Выводим сессионные ключи
-	sessionKeys, err := novacrypto.DeriveSessionKeys(sharedSecret, s.psk, true)
+	// Выводим сессионные ключи (при bootstrap используем нулевой PSK)
+	sessionKeys, err := novacrypto.DeriveSessionKeys(sharedSecret, activePSK, true)
 	if err != nil {
 		log.Printf("[HANDSHAKE] Ошибка вывода ключей: %v", err)
 		s.sessions.RemoveSession(session)
@@ -401,6 +412,12 @@ func (s *VPNServer) handleHandshakeInit(pkt *protocol.Packet, remoteAddr *net.UD
 		DNS1:            dns1,
 		DNS2:            dns2,
 		MTU:             uint16(s.cfg.MTU),
+	}
+
+	// При bootstrap-режиме передаём настоящий PSK клиенту
+	if isBootstrap {
+		hsResp.PSK = s.psk[:]
+		log.Printf("[HANDSHAKE] Передаём PSK клиенту в bootstrap-режиме")
 	}
 
 	// Подписываем ответ
@@ -502,8 +519,8 @@ func (s *VPNServer) handleDataPacket(pkt *protocol.Packet, remoteAddr *net.UDPAd
 	}
 
 	// Расшифровываем
-	additionalData := pkt.Header.MarshalHeader()
-	plaintext, err := novacrypto.Decrypt(session.Keys.RecvKey, pkt.Nonce, pkt.Payload, additionalData)
+	// В v2 протоколе AAD не используется для data-пакетов (всё зашифровано)
+	plaintext, err := novacrypto.Decrypt(session.Keys.RecvKey, pkt.Nonce, pkt.Payload, nil)
 	if err != nil {
 		if s.cfg.LogLevel == "debug" {
 			log.Printf("[DATA] Ошибка расшифровки от сессии #%d: %v", session.ID, err)
@@ -614,19 +631,17 @@ func (s *VPNServer) tunReadLoop() {
 func (s *VPNServer) sendToClient(session *Session, plaintext []byte) {
 	seq := session.NextSendSeq()
 
-	// Формируем заголовок для additional data
+	// Формируем заголовок пакета
 	header := protocol.PacketHeader{
-		Magic:      protocol.ProtocolMagic,
 		Version:    protocol.ProtocolVersion,
 		Type:       protocol.PacketData,
 		SessionID:  session.ID,
 		SequenceNo: seq,
 		PayloadLen: uint16(len(plaintext)),
 	}
-	additionalData := header.MarshalHeader()
 
-	// Шифруем
-	nonce, ciphertext, err := novacrypto.Encrypt(session.Keys.SendKey, plaintext, additionalData)
+	// В v2 протоколе AAD не используется для data-пакетов
+	nonce, ciphertext, err := novacrypto.Encrypt(session.Keys.SendKey, plaintext, nil)
 	if err != nil {
 		if s.cfg.LogLevel == "debug" {
 			log.Printf("[SEND] Ошибка шифрования для сессии #%d: %v", session.ID, err)
@@ -670,7 +685,23 @@ func (s *VPNServer) maintenanceLoop() {
 	statsTicker := time.NewTicker(60 * time.Second)
 	defer statsTicker.Stop()
 
-	keepaliveTicker := time.NewTicker(time.Duration(s.cfg.KeepaliveInterval) * time.Second)
+	// Рандомизированный keepalive для уменьшения DPI fingerprinting
+	// Интервал: базовый ± 7 секунд (например, 25±7 = 18-32 сек)
+	randomKeepaliveInterval := func() time.Duration {
+		baseInterval := time.Duration(s.cfg.KeepaliveInterval) * time.Second
+
+		// Генерируем случайное отклонение от -7 до +7 секунд
+		randomOffset, _ := rand.Int(rand.Reader, big.NewInt(15))      // 0-14
+		offset := time.Duration(randomOffset.Int64()-7) * time.Second // -7 to +7
+
+		interval := baseInterval + offset
+		if interval < 10*time.Second {
+			interval = 10 * time.Second // минимум 10 секунд
+		}
+		return interval
+	}
+
+	keepaliveTicker := time.NewTicker(randomKeepaliveInterval())
 	defer keepaliveTicker.Stop()
 
 	for {
@@ -689,6 +720,8 @@ func (s *VPNServer) maintenanceLoop() {
 
 		case <-keepaliveTicker.C:
 			s.sendKeepalives()
+			// Сбрасываем тикер с новым случайным интервалом
+			keepaliveTicker.Reset(randomKeepaliveInterval())
 		}
 	}
 }
