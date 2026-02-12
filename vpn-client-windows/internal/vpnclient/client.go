@@ -1,3 +1,5 @@
+//go:build windows
+
 // Package vpnclient реализует VPN-подключение по протоколу NovaVPN.
 package vpnclient
 

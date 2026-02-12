@@ -1,18 +1,13 @@
 // Package protocol реализует собственный VPN-протокол NovaVPN v2 (stealth).
 //
 // Формат пакета v2 (с маскировкой под TLS):
-// ┌────────────────────────┬───────────┬───────┬─────────────────────────────────────┐
-// │   TLS Record Header    │ SessionID │ Nonce │    ChaCha20-Poly1305 Encrypted      │
-// │  0x17 0x03 0x03 + len  │    4B     │  12B  │   (Header+Padding+Payload+Tag)      │
-// └────────────────────────┴───────────┴───────┴─────────────────────────────────────┘
+// ┌────────────────────────┬───────────┬──────┬───────┬───────────────────────────┐
+// │   TLS Record Header    │ SessionID │ Type │ Nonce │  ChaCha20-Poly1305 AEAD   │
+// │  0x17 0x03 0x03 + len  │    4B     │  1B  │  12B  │  (Payload + AuthTag 16B)  │
+// └────────────────────────┴───────────┴──────┴───────┴───────────────────────────┘
 //
-// Encrypted part contains:
-// ┌─────────┬──────┬─────┬────────────┬─────────┬─────────┬─────────┐
-// │ Version │ Type │ Seq │ PayloadLen │ Padding │ Payload │ AuthTag │
-// │   1B    │  1B  │ 4B  │     2B     │  0-32B  │   var   │   16B   │
-// └─────────┴──────┴─────┴────────────┴─────────┴─────────┴─────────┘
-//
-// Только SessionID передаётся открыто для роутинга. Всё остальное зашифровано.
+// SessionID и Type передаются открыто для маршрутизации.
+// Payload зашифрован ChaCha20-Poly1305.
 // TLS Record Header имитирует TLS 1.2 Application Data для обхода DPI.
 package protocol
 
@@ -41,21 +36,8 @@ const (
 	// AuthTagSize — размер authentication tag
 	AuthTagSize = 16
 
-	// MinEncryptedHeaderSize — минимальный размер зашифрованного заголовка
-	// version(1) + type(1) + seq(4) + payloadLen(2) = 8 байт
-	MinEncryptedHeaderSize = 8
-
-	// MaxPaddingSize — максимальный размер padding для маскировки
-	MaxPaddingSize = 32
-
-	// MinPacketSize — минимальный размер пакета
-	MinPacketSize = TLSHeaderSize + SessionIDSize + NonceSize + MinEncryptedHeaderSize + AuthTagSize
-
 	// MaxPayloadSize — максимальный размер полезной нагрузки
 	MaxPayloadSize = 65535
-
-	// MaxPacketSize — максимальный размер пакета
-	MaxPacketSize = TLSHeaderSize + SessionIDSize + NonceSize + MinEncryptedHeaderSize + MaxPaddingSize + MaxPayloadSize + AuthTagSize
 
 	// PacketTypeSize — размер поля типа пакета (открытое, для маршрутизации)
 	PacketTypeSize = 1
@@ -116,14 +98,13 @@ func (pt PacketType) String() string {
 }
 
 // PacketHeader представляет заголовок пакета протокола v2.
-// В v2 только SessionID передаётся открыто, остальное шифруется.
+// SessionID и Type передаются открыто для маршрутизации.
 type PacketHeader struct {
 	SessionID  uint32     // открыто для роутинга
-	Version    uint8      // зашифровано
-	Type       PacketType // зашифровано
-	SequenceNo uint32     // зашифровано
-	PayloadLen uint16     // зашифровано (длина plaintext без padding)
-	Padding    []byte     // случайный padding 0-32 байта
+	Type       PacketType // открыто для маршрутизации
+	Version    uint8      // версия протокола (метаданные)
+	SequenceNo uint32     // порядковый номер (метаданные)
+	PayloadLen uint16     // длина plaintext (метаданные)
 }
 
 // Packet представляет полный пакет протокола.
@@ -142,44 +123,6 @@ var (
 	ErrDecryptFailed   = errors.New("ошибка расшифровки")
 	ErrInvalidTLS      = errors.New("неверный TLS заголовок")
 )
-
-// MarshalEncryptedHeader сериализует зашифрованную часть заголовка.
-// Формат: version(1) + type(1) + seq(4) + payloadLen(2) + padding(0-32B)
-func (h *PacketHeader) MarshalEncryptedHeader() []byte {
-	size := 8 + len(h.Padding)
-	buf := make([]byte, size)
-	buf[0] = h.Version
-	buf[1] = uint8(h.Type)
-	binary.BigEndian.PutUint32(buf[2:6], h.SequenceNo)
-	binary.BigEndian.PutUint16(buf[6:8], h.PayloadLen)
-	if len(h.Padding) > 0 {
-		copy(buf[8:], h.Padding)
-	}
-	return buf
-}
-
-// UnmarshalEncryptedHeader десериализует зашифрованную часть заголовка.
-func UnmarshalEncryptedHeader(data []byte, sessionID uint32) (*PacketHeader, error) {
-	if len(data) < 8 {
-		return nil, ErrPacketTooShort
-	}
-
-	h := &PacketHeader{
-		SessionID:  sessionID,
-		Version:    data[0],
-		Type:       PacketType(data[1]),
-		SequenceNo: binary.BigEndian.Uint32(data[2:6]),
-		PayloadLen: binary.BigEndian.Uint16(data[6:8]),
-	}
-
-	// Padding — всё что после первых 8 байт
-	if len(data) > 8 {
-		h.Padding = make([]byte, len(data)-8)
-		copy(h.Padding, data[8:])
-	}
-
-	return h, nil
-}
 
 // AddTLSHeader добавляет TLS Record Header к данным.
 // Имитирует TLS 1.2 Application Data для обхода DPI.

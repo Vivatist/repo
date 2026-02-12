@@ -1,0 +1,12 @@
+{
+    "gopls": {
+        "build.env": {
+            "GOOS": "linux",
+            "GOARCH": "amd64"
+        }
+    },
+    "go.toolsEnvVars": {
+        "GOOS": "linux",
+        "GOARCH": "amd64"
+    }
+}

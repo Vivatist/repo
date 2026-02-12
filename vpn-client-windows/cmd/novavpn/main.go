@@ -1,3 +1,5 @@
+//go:build windows
+
 // NovaVPN Client для Windows
 // Точка входа приложения
 package main

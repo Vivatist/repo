@@ -1,3 +1,5 @@
+//go:build windows
+
 // novavpn-service — Windows-сервис NovaVPN.
 //
 // Использование:

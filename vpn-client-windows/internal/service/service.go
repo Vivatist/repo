@@ -1,3 +1,5 @@
+//go:build windows
+
 // Package service реализует Windows-сервис NovaVPN.
 // Сервис работает с SYSTEM-привилегиями, управляет TUN-адаптером,
 // маршрутами и VPN-подключением. GUI общается с сервисом через IPC (Named Pipe).

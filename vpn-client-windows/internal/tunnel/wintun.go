@@ -1,3 +1,5 @@
+//go:build windows
+
 // Package tunnel реализует WinTUN-адаптер для Windows.
 package tunnel
 

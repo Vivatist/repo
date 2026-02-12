@@ -1,3 +1,5 @@
+//go:build windows
+
 // Package autostart — управление автозапуском через реестр Windows.
 package autostart
 

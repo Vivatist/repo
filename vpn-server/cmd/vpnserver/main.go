@@ -21,7 +21,7 @@ import (
 
 	"github.com/novavpn/vpn-server/config"
 	"github.com/novavpn/vpn-server/internal/auth"
-	novacrypto "github.com/novavpn/vpn-server/internal/crypto"
+	"github.com/novavpn/vpn-server/internal/protocol"
 	"github.com/novavpn/vpn-server/internal/server"
 	"gopkg.in/yaml.v3"
 )
@@ -106,7 +106,7 @@ func main() {
 
 // generatePSK генерирует новый Pre-Shared Key.
 func generatePSK() {
-	psk, err := novacrypto.GeneratePSK()
+	psk, err := protocol.GeneratePSK()
 	if err != nil {
 		log.Fatalf("Ошибка генерации PSK: %v", err)
 	}
@@ -263,7 +263,7 @@ func manageUsers(action string) {
 
 // generateConfig генерирует конфигурационный файл по умолчанию.
 func generateConfig() {
-	psk, err := novacrypto.GeneratePSK()
+	psk, err := protocol.GeneratePSK()
 	if err != nil {
 		log.Fatalf("Ошибка генерации PSK: %v", err)
 	}
@@ -332,7 +332,8 @@ func runServer() {
 			os.Exit(0)
 
 		case syscall.SIGHUP:
-			log.Println("Получен SIGHUP, перезагрузка конфигурации не реализована")
+			log.Println("[SIGHUP] Перезагрузка списка пользователей...")
+			srv.ReloadUsers()
 		}
 	}
 }
