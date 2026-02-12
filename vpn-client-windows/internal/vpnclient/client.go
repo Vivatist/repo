@@ -453,8 +453,8 @@ func (c *Client) handleData(pkt *protocol.Packet) {
 		return
 	}
 
-	additionalData := pkt.Header.MarshalHeader()
-	plaintext, err := novacrypto.Decrypt(c.keys.RecvKey, pkt.Nonce, pkt.Payload, additionalData)
+	// В v2 протоколе AAD не используется для data-пакетов
+	plaintext, err := novacrypto.Decrypt(c.keys.RecvKey, pkt.Nonce, pkt.Payload, nil)
 	if err != nil {
 		log.Printf("[DATA] Ошибка расшифровки: %v (payloadLen=%d, headerPayloadLen=%d)",
 			err, len(pkt.Payload), pkt.Header.PayloadLen)
@@ -509,16 +509,15 @@ func (c *Client) tunReadLoop() {
 		// Шифруем и отправляем
 		seq := c.sendSeq.Add(1)
 		header := protocol.PacketHeader{
-			Magic:      protocol.ProtocolMagic,
 			Version:    protocol.ProtocolVersion,
 			Type:       protocol.PacketData,
 			SessionID:  c.sessionID,
 			SequenceNo: seq,
 			PayloadLen: uint16(len(packet)),
 		}
-		additionalData := header.MarshalHeader()
 
-		nonce, ciphertext, err := novacrypto.Encrypt(c.keys.SendKey, packet, additionalData)
+		// В v2 протоколе AAD не используется для data-пакетов
+		nonce, ciphertext, err := novacrypto.Encrypt(c.keys.SendKey, packet, nil)
 		if err != nil {
 			continue
 		}
@@ -560,7 +559,7 @@ func (c *Client) keepaliveLoop() {
 	// Функция генерации случайного интервала keepalive
 	randomKeepaliveInterval := func() time.Duration {
 		minInterval := 20 * time.Second
-		maxInterval := 35 * time.Second
+		_ = 35 * time.Second // maxInterval для документации
 		
 		// Генерируем случайное значение от 0 до 15 секунд
 		randomSec, _ := rand.Int(rand.Reader, big.NewInt(16)) // 0-15

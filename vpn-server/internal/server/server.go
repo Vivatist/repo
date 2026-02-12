@@ -504,8 +504,8 @@ func (s *VPNServer) handleDataPacket(pkt *protocol.Packet, remoteAddr *net.UDPAd
 	}
 
 	// Расшифровываем
-	additionalData := pkt.Header.MarshalHeader()
-	plaintext, err := novacrypto.Decrypt(session.Keys.RecvKey, pkt.Nonce, pkt.Payload, additionalData)
+	// В v2 протоколе AAD не используется для data-пакетов (всё зашифровано)
+	plaintext, err := novacrypto.Decrypt(session.Keys.RecvKey, pkt.Nonce, pkt.Payload, nil)
 	if err != nil {
 		if s.cfg.LogLevel == "debug" {
 			log.Printf("[DATA] Ошибка расшифровки от сессии #%d: %v", session.ID, err)
@@ -616,19 +616,17 @@ func (s *VPNServer) tunReadLoop() {
 func (s *VPNServer) sendToClient(session *Session, plaintext []byte) {
 	seq := session.NextSendSeq()
 
-	// Формируем заголовок для additional data
+	// Формируем заголовок пакета
 	header := protocol.PacketHeader{
-		Magic:      protocol.ProtocolMagic,
 		Version:    protocol.ProtocolVersion,
 		Type:       protocol.PacketData,
 		SessionID:  session.ID,
 		SequenceNo: seq,
 		PayloadLen: uint16(len(plaintext)),
 	}
-	additionalData := header.MarshalHeader()
 
-	// Шифруем
-	nonce, ciphertext, err := novacrypto.Encrypt(session.Keys.SendKey, plaintext, additionalData)
+	// В v2 протоколе AAD не используется для data-пакетов
+	nonce, ciphertext, err := novacrypto.Encrypt(session.Keys.SendKey, plaintext, nil)
 	if err != nil {
 		if s.cfg.LogLevel == "debug" {
 			log.Printf("[SEND] Ошибка шифрования для сессии #%d: %v", session.ID, err)

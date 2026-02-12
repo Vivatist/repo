@@ -56,6 +56,15 @@ const (
 
 	// MaxPacketSize — максимальный размер пакета
 	MaxPacketSize = TLSHeaderSize + SessionIDSize + NonceSize + MinEncryptedHeaderSize + MaxPaddingSize + MaxPayloadSize + AuthTagSize
+
+	// PacketTypeSize — размер поля типа пакета (открытое, для маршрутизации)
+	PacketTypeSize = 1
+
+	// TotalOverhead — общий оверхед протокола (для расчёта буферов)
+	TotalOverhead = TLSHeaderSize + SessionIDSize + PacketTypeSize + NonceSize + AuthTagSize
+
+	// HeaderSize — минимальный размер заголовка для валидации входящих пакетов
+	HeaderSize = TLSHeaderSize + SessionIDSize + PacketTypeSize + NonceSize
 )
 
 // PacketType определяет тип пакета протокола.
@@ -210,20 +219,23 @@ func ParseTLSHeader(data []byte) ([]byte, error) {
 
 // Marshal сериализует пакет в байты для отправки по сети.
 // Внимание: Payload должен быть уже зашифрован!
-// Формат: TLS_Header(5) + SessionID(4) + Nonce(12) + EncryptedData
+// Формат: TLS_Header(5) + SessionID(4) + Type(1) + Nonce(12) + EncryptedData
 func (p *Packet) Marshal() ([]byte, error) {
 	// Собираем пакет без TLS заголовка
-	rawSize := SessionIDSize + NonceSize + len(p.Payload)
+	rawSize := SessionIDSize + 1 + NonceSize + len(p.Payload)
 	raw := make([]byte, rawSize)
 	
 	// SessionID (открытый)
 	binary.BigEndian.PutUint32(raw[0:4], p.Header.SessionID)
 	
+	// PacketType (открытый, для маршрутизации)
+	raw[4] = uint8(p.Header.Type)
+	
 	// Nonce
-	copy(raw[4:16], p.Nonce[:])
+	copy(raw[5:17], p.Nonce[:])
 	
 	// Payload (уже зашифрованный)
-	copy(raw[16:], p.Payload)
+	copy(raw[17:], p.Payload)
 	
 	// Добавляем TLS обёртку
 	return AddTLSHeader(raw), nil
@@ -243,24 +255,29 @@ func Unmarshal(data []byte) (*Packet, error) {
 		}
 	}
 	
-	if len(raw) < SessionIDSize+NonceSize {
+	// SessionID(4) + Type(1) + Nonce(12) = 17 bytes minimum
+	if len(raw) < SessionIDSize+1+NonceSize {
 		return nil, ErrPacketTooShort
 	}
 	
 	// Извлекаем SessionID
 	sessionID := binary.BigEndian.Uint32(raw[0:4])
 	
+	// Извлекаем PacketType
+	pktType := PacketType(raw[4])
+	
 	// Извлекаем Nonce
 	var nonce [NonceSize]byte
-	copy(nonce[:], raw[4:16])
+	copy(nonce[:], raw[5:17])
 	
 	// Payload (зашифрованный)
-	payload := make([]byte, len(raw)-16)
-	copy(payload, raw[16:])
+	payload := make([]byte, len(raw)-17)
+	copy(payload, raw[17:])
 	
 	p := &Packet{
 		Header: PacketHeader{
 			SessionID: sessionID,
+			Type:      pktType,
 		},
 		Nonce:   nonce,
 		Payload: payload,

@@ -26,7 +26,14 @@ const (
 	MinPacketSize          = TLSHeaderSize + SessionIDSize + NonceSize + MinEncryptedHeaderSize + AuthTagSize
 	MaxPayloadSize         = 65535
 	MaxPacketSize          = TLSHeaderSize + SessionIDSize + NonceSize + MinEncryptedHeaderSize + MaxPaddingSize + MaxPayloadSize + AuthTagSize
-)
+	// PacketTypeSize — размер поля типа пакета
+	PacketTypeSize = 1
+
+	// TotalOverhead — общий оверхед протокола (для расчёта буферов)
+	TotalOverhead = TLSHeaderSize + SessionIDSize + PacketTypeSize + NonceSize + AuthTagSize
+
+	// HeaderSize — минимальный размер заголовка для валидации входящих пакетов
+	HeaderSize = TLSHeaderSize + SessionIDSize + PacketTypeSize + NonceSize)
 
 type PacketType uint8
 
@@ -141,11 +148,13 @@ func ParseTLSHeader(data []byte) ([]byte, error) {
 }
 
 func (p *Packet) Marshal() ([]byte, error) {
-	rawSize := SessionIDSize + NonceSize + len(p.Payload)
+	// Формат: SessionID(4) + Type(1) + Nonce(12) + Payload
+	rawSize := SessionIDSize + 1 + NonceSize + len(p.Payload)
 	raw := make([]byte, rawSize)
 	binary.BigEndian.PutUint32(raw[0:4], p.Header.SessionID)
-	copy(raw[4:16], p.Nonce[:])
-	copy(raw[16:], p.Payload)
+	raw[4] = uint8(p.Header.Type)
+	copy(raw[5:17], p.Nonce[:])
+	copy(raw[17:], p.Payload)
 	return AddTLSHeader(raw), nil
 }
 
@@ -158,16 +167,18 @@ func Unmarshal(data []byte) (*Packet, error) {
 			return nil, err
 		}
 	}
-	if len(raw) < SessionIDSize+NonceSize {
+	// SessionID(4) + Type(1) + Nonce(12) = 17 bytes minimum
+	if len(raw) < SessionIDSize+1+NonceSize {
 		return nil, ErrPacketTooShort
 	}
 	sessionID := binary.BigEndian.Uint32(raw[0:4])
+	pktType := PacketType(raw[4])
 	var nonce [NonceSize]byte
-	copy(nonce[:], raw[4:16])
-	payload := make([]byte, len(raw)-16)
-	copy(payload, raw[16:])
+	copy(nonce[:], raw[5:17])
+	payload := make([]byte, len(raw)-17)
+	copy(payload, raw[17:])
 	p := &Packet{
-		Header: PacketHeader{SessionID: sessionID},
+		Header: PacketHeader{SessionID: sessionID, Type: pktType},
 		Nonce:  nonce,
 		Payload: payload,
 	}
@@ -220,8 +231,10 @@ func NewDisconnectPacket(sessionID uint32, seq uint32) *Packet {
 // --- Handshake structures ---
 
 type HandshakeInit struct {
+	ClientPublicKey      [32]byte // Ephemeral Curve25519 public key
 	Timestamp            uint64
 	EncryptedCredentials []byte
+	HMAC                 [32]byte // HMAC-SHA256(PSK, pubkey+timestamp+creds)
 }
 
 type HandshakeResp struct {
@@ -233,13 +246,26 @@ type HandshakeResp struct {
 	MTU        uint16
 }
 
+type HandshakeComplete struct {
+	ConfirmHMAC [32]byte
+}
+
 func MarshalHandshakeInit(h *HandshakeInit) []byte {
 	credsLen := len(h.EncryptedCredentials)
-	totalLen := 8 + 2 + credsLen
+	// pubkey(32) + timestamp(8) + credsLen(2) + creds(variable) + hmac(32)
+	totalLen := 32 + 8 + 2 + credsLen + 32
 	buf := make([]byte, totalLen)
-	binary.BigEndian.PutUint64(buf[0:8], h.Timestamp)
-	binary.BigEndian.PutUint16(buf[8:10], uint16(credsLen))
-	copy(buf[10:], h.EncryptedCredentials)
+	copy(buf[0:32], h.ClientPublicKey[:])
+	binary.BigEndian.PutUint64(buf[32:40], h.Timestamp)
+	binary.BigEndian.PutUint16(buf[40:42], uint16(credsLen))
+	copy(buf[42:42+credsLen], h.EncryptedCredentials)
+	copy(buf[42+credsLen:42+credsLen+32], h.HMAC[:])
+	return buf
+}
+
+func MarshalHandshakeComplete(h *HandshakeComplete) []byte {
+	buf := make([]byte, 32)
+	copy(buf[0:32], h.ConfirmHMAC[:])
 	return buf
 }
 
@@ -256,15 +282,17 @@ func MarshalCredentials(email, password string) []byte {
 }
 
 func UnmarshalHandshakeResp(data []byte) (*HandshakeResp, error) {
-	if len(data) < 15 {
+	// Серверный формат: ServerPublicKey(32) + SessionID(4) + IP(4) + Mask(1) + DNS1(4) + DNS2(4) + MTU(2) + ServerHMAC(32) = 83 bytes
+	// Пропускаем ServerPublicKey (уже извлечён отдельно)
+	if len(data) < 83 {
 		return nil, fmt.Errorf("handshake resp too short: %d bytes", len(data))
 	}
 	h := &HandshakeResp{}
-	h.SessionID = binary.BigEndian.Uint32(data[0:4])
-	h.AssignedIP = net.IPv4(data[4], data[5], data[6], data[7])
-	h.SubnetMask = data[8]
-	h.DNS1 = net.IPv4(data[9], data[10], data[11], data[12])
-	h.DNS2 = net.IPv4(data[13], data[14], data[15], data[16])
-	h.MTU = binary.BigEndian.Uint16(data[17:19])
+	h.SessionID = binary.BigEndian.Uint32(data[32:36])
+	h.AssignedIP = net.IPv4(data[36], data[37], data[38], data[39])
+	h.SubnetMask = data[40]
+	h.DNS1 = net.IPv4(data[41], data[42], data[43], data[44])
+	h.DNS2 = net.IPv4(data[45], data[46], data[47], data[48])
+	h.MTU = binary.BigEndian.Uint16(data[49:51])
 	return h, nil
 }
