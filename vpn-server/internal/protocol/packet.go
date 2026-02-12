@@ -27,10 +27,10 @@ const (
 	ProtocolVersion uint8 = 0x02
 
 	// TLS Record Header constants (для имитации TLS 1.2 Application Data)
-	TLSContentType    byte   = 0x17 // Application Data
-	TLSVersionMajor   byte   = 0x03 // TLS 1.x
-	TLSVersionMinor   byte   = 0x03 // TLS 1.2
-	TLSHeaderSize            = 5    // type(1) + version(2) + length(2)
+	TLSContentType  byte = 0x17 // Application Data
+	TLSVersionMajor byte = 0x03 // TLS 1.x
+	TLSVersionMinor byte = 0x03 // TLS 1.2
+	TLSHeaderSize        = 5    // type(1) + version(2) + length(2)
 
 	// SessionIDSize — размер SessionID (единственное открытое поле)
 	SessionIDSize = 4
@@ -186,11 +186,11 @@ func UnmarshalEncryptedHeader(data []byte, sessionID uint32) (*PacketHeader, err
 func AddTLSHeader(data []byte) []byte {
 	length := uint16(len(data))
 	header := make([]byte, TLSHeaderSize)
-	header[0] = TLSContentType    // 0x17 = Application Data
-	header[1] = TLSVersionMajor   // 0x03
-	header[2] = TLSVersionMinor   // 0x03 = TLS 1.2
+	header[0] = TLSContentType  // 0x17 = Application Data
+	header[1] = TLSVersionMajor // 0x03
+	header[2] = TLSVersionMinor // 0x03 = TLS 1.2
 	binary.BigEndian.PutUint16(header[3:5], length)
-	
+
 	result := make([]byte, TLSHeaderSize+len(data))
 	copy(result[0:TLSHeaderSize], header)
 	copy(result[TLSHeaderSize:], data)
@@ -202,18 +202,18 @@ func ParseTLSHeader(data []byte) ([]byte, error) {
 	if len(data) < TLSHeaderSize {
 		return nil, ErrPacketTooShort
 	}
-	
+
 	// Опциональная проверка TLS заголовка (для дополнительной валидации)
 	if data[0] != TLSContentType {
 		// Не критично - можем пропустить пакеты без TLS обёртки
 	}
-	
+
 	// Извлекаем длину из TLS заголовка
 	length := binary.BigEndian.Uint16(data[3:5])
 	if int(length) != len(data)-TLSHeaderSize {
 		return nil, ErrInvalidTLS
 	}
-	
+
 	return data[TLSHeaderSize:], nil
 }
 
@@ -224,19 +224,19 @@ func (p *Packet) Marshal() ([]byte, error) {
 	// Собираем пакет без TLS заголовка
 	rawSize := SessionIDSize + 1 + NonceSize + len(p.Payload)
 	raw := make([]byte, rawSize)
-	
+
 	// SessionID (открытый)
 	binary.BigEndian.PutUint32(raw[0:4], p.Header.SessionID)
-	
+
 	// PacketType (открытый, для маршрутизации)
 	raw[4] = uint8(p.Header.Type)
-	
+
 	// Nonce
 	copy(raw[5:17], p.Nonce[:])
-	
+
 	// Payload (уже зашифрованный)
 	copy(raw[17:], p.Payload)
-	
+
 	// Добавляем TLS обёртку
 	return AddTLSHeader(raw), nil
 }
@@ -254,26 +254,26 @@ func Unmarshal(data []byte) (*Packet, error) {
 			return nil, err
 		}
 	}
-	
+
 	// SessionID(4) + Type(1) + Nonce(12) = 17 bytes minimum
 	if len(raw) < SessionIDSize+1+NonceSize {
 		return nil, ErrPacketTooShort
 	}
-	
+
 	// Извлекаем SessionID
 	sessionID := binary.BigEndian.Uint32(raw[0:4])
-	
+
 	// Извлекаем PacketType
 	pktType := PacketType(raw[4])
-	
+
 	// Извлекаем Nonce
 	var nonce [NonceSize]byte
 	copy(nonce[:], raw[5:17])
-	
+
 	// Payload (зашифрованный)
 	payload := make([]byte, len(raw)-17)
 	copy(payload, raw[17:])
-	
+
 	p := &Packet{
 		Header: PacketHeader{
 			SessionID: sessionID,
@@ -282,7 +282,7 @@ func Unmarshal(data []byte) (*Packet, error) {
 		Nonce:   nonce,
 		Payload: payload,
 	}
-	
+
 	return p, nil
 }
 

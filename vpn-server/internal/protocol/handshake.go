@@ -51,6 +51,7 @@ type HandshakeResp struct {
 	DNS2            net.IP   // Второй DNS
 	MTU             uint16   // MTU туннеля
 	ServerHMAC      [32]byte // Подтверждение сервера
+	PSK             []byte   // PSK для bootstrap-подключений (32 байта или nil)
 }
 
 // HandshakeComplete — подтверждение от клиента, что рукопожатие завершено.
@@ -143,7 +144,13 @@ func UnmarshalCredentials(data []byte) (email, password string, err error) {
 
 // MarshalHandshakeResp сериализует HandshakeResp в байты.
 func MarshalHandshakeResp(h *HandshakeResp) []byte {
-	buf := make([]byte, 32+4+4+1+4+4+2+32) // 83 bytes
+	// Базовый размер: 83 байта + 1 (hasPSK) + 0 или 32 (PSK)
+	hasPSK := len(h.PSK) == 32
+	size := 84 // 83 + 1 byte hasPSK flag
+	if hasPSK {
+		size += 32
+	}
+	buf := make([]byte, size)
 	copy(buf[0:32], h.ServerPublicKey[:])
 	binary.BigEndian.PutUint32(buf[32:36], h.SessionID)
 
@@ -166,12 +173,19 @@ func MarshalHandshakeResp(h *HandshakeResp) []byte {
 
 	binary.BigEndian.PutUint16(buf[49:51], h.MTU)
 	copy(buf[51:83], h.ServerHMAC[:])
+
+	if hasPSK {
+		buf[83] = 1
+		copy(buf[84:116], h.PSK)
+	} else {
+		buf[83] = 0
+	}
 	return buf
 }
 
 // UnmarshalHandshakeResp десериализует HandshakeResp из байтов.
 func UnmarshalHandshakeResp(data []byte) (*HandshakeResp, error) {
-	if len(data) < 83 {
+	if len(data) < 84 {
 		return nil, fmt.Errorf("handshake resp слишком короткий: %d байт", len(data))
 	}
 
@@ -184,6 +198,13 @@ func UnmarshalHandshakeResp(data []byte) (*HandshakeResp, error) {
 	h.DNS2 = net.IPv4(data[45], data[46], data[47], data[48])
 	h.MTU = binary.BigEndian.Uint16(data[49:51])
 	copy(h.ServerHMAC[:], data[51:83])
+
+	// PSK (bootstrap)
+	if data[83] == 1 && len(data) >= 116 {
+		h.PSK = make([]byte, 32)
+		copy(h.PSK, data[84:116])
+	}
+
 	return h, nil
 }
 

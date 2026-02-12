@@ -11,13 +11,13 @@ import (
 
 const (
 	ProtocolVersion uint8 = 0x02
-	
+
 	// TLS Record Header constants
 	TLSContentType  byte = 0x17
 	TLSVersionMajor byte = 0x03
 	TLSVersionMinor byte = 0x03
 	TLSHeaderSize        = 5
-	
+
 	SessionIDSize          = 4
 	NonceSize              = 12
 	AuthTagSize            = 16
@@ -33,7 +33,8 @@ const (
 	TotalOverhead = TLSHeaderSize + SessionIDSize + PacketTypeSize + NonceSize + AuthTagSize
 
 	// HeaderSize — минимальный размер заголовка для валидации входящих пакетов
-	HeaderSize = TLSHeaderSize + SessionIDSize + PacketTypeSize + NonceSize)
+	HeaderSize = TLSHeaderSize + SessionIDSize + PacketTypeSize + NonceSize
+)
 
 type PacketType uint8
 
@@ -178,8 +179,8 @@ func Unmarshal(data []byte) (*Packet, error) {
 	payload := make([]byte, len(raw)-17)
 	copy(payload, raw[17:])
 	p := &Packet{
-		Header: PacketHeader{SessionID: sessionID, Type: pktType},
-		Nonce:  nonce,
+		Header:  PacketHeader{SessionID: sessionID, Type: pktType},
+		Nonce:   nonce,
 		Payload: payload,
 	}
 	return p, nil
@@ -244,6 +245,7 @@ type HandshakeResp struct {
 	DNS1       net.IP
 	DNS2       net.IP
 	MTU        uint16
+	PSK        []byte // PSK от сервера при bootstrap-подключении (32 байта или nil)
 }
 
 type HandshakeComplete struct {
@@ -282,9 +284,9 @@ func MarshalCredentials(email, password string) []byte {
 }
 
 func UnmarshalHandshakeResp(data []byte) (*HandshakeResp, error) {
-	// Серверный формат: ServerPublicKey(32) + SessionID(4) + IP(4) + Mask(1) + DNS1(4) + DNS2(4) + MTU(2) + ServerHMAC(32) = 83 bytes
-	// Пропускаем ServerPublicKey (уже извлечён отдельно)
-	if len(data) < 83 {
+	// Серверный формат: ServerPublicKey(32) + SessionID(4) + IP(4) + Mask(1) + DNS1(4) + DNS2(4) + MTU(2) + ServerHMAC(32) + HasPSK(1) [+ PSK(32)]
+	// Минимум 84 байта (83 + 1 байт hasPSK)
+	if len(data) < 84 {
 		return nil, fmt.Errorf("handshake resp too short: %d bytes", len(data))
 	}
 	h := &HandshakeResp{}
@@ -294,5 +296,11 @@ func UnmarshalHandshakeResp(data []byte) (*HandshakeResp, error) {
 	h.DNS1 = net.IPv4(data[41], data[42], data[43], data[44])
 	h.DNS2 = net.IPv4(data[45], data[46], data[47], data[48])
 	h.MTU = binary.BigEndian.Uint16(data[49:51])
+
+	// PSK (bootstrap-режим)
+	if data[83] == 1 && len(data) >= 116 {
+		h.PSK = make([]byte, 32)
+		copy(h.PSK, data[84:116])
+	}
 	return h, nil
 }

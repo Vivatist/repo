@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"math/big"
@@ -46,7 +47,7 @@ func (s ConnectionState) String() string {
 // ConnectParams — параметры подключения.
 type ConnectParams struct {
 	ServerAddr string // host:port
-	PSK        string // hex-encoded PSK
+	PSK        string // hex-encoded PSK (пустой = bootstrap-режим)
 	Email      string
 	Password   string
 }
@@ -54,10 +55,14 @@ type ConnectParams struct {
 // StatusCallback — колбэк для уведомлений UI о смене состояния.
 type StatusCallback func(state ConnectionState, info string)
 
+// PSKCallback — колбэк для сохранения полученного PSK.
+type PSKCallback func(pskHex string)
+
 // Client — VPN-клиент NovaVPN.
 type Client struct {
 	state      atomic.Int32
 	onStatus   StatusCallback
+	onPSK      PSKCallback
 	mu         sync.Mutex
 	conn       *net.UDPConn
 	tun        *tunnel.WinTUN
@@ -83,9 +88,10 @@ type Client struct {
 }
 
 // NewClient создаёт новый VPN-клиент.
-func NewClient(onStatus StatusCallback) *Client {
+func NewClient(onStatus StatusCallback, onPSK PSKCallback) *Client {
 	return &Client{
 		onStatus: onStatus,
+		onPSK:    onPSK,
 	}
 }
 
@@ -121,13 +127,19 @@ func (c *Client) Connect(params ConnectParams) error {
 
 	c.setState(StateConnecting)
 
-	// Декодируем PSK
-	psk, err := novacrypto.DecodePSK(params.PSK)
-	if err != nil {
-		c.setState(StateDisconnected)
-		return fmt.Errorf("неверный PSK: %w", err)
+	// Декодируем PSK (пустой = bootstrap-режим с нулевым PSK)
+	if params.PSK != "" {
+		psk, err := novacrypto.DecodePSK(params.PSK)
+		if err != nil {
+			c.setState(StateDisconnected)
+			return fmt.Errorf("неверный PSK: %w", err)
+		}
+		c.psk = psk
+	} else {
+		// Bootstrap-режим: используем нулевой PSK
+		c.psk = [novacrypto.KeySize]byte{}
+		log.Println("[VPN] Режим без PSK (bootstrap)")
 	}
-	c.psk = psk
 
 	// Резолвим адрес сервера
 	serverAddr, err := net.ResolveUDPAddr("udp4", params.ServerAddr)
@@ -163,11 +175,31 @@ func (c *Client) Connect(params ConnectParams) error {
 	_ = conn.SetWriteBuffer(4 * 1024 * 1024)
 
 	// Выполняем рукопожатие
-	if err := c.performHandshake(params.Email, params.Password); err != nil {
-		conn.Close()
-		c.conn = nil
-		c.setState(StateDisconnected)
-		return fmt.Errorf("рукопожатие: %w", err)
+	// Определяем, есть ли сохранённый PSK
+	var zeroPSK [novacrypto.KeySize]byte
+	hasStoredPSK := c.psk != zeroPSK
+
+	if hasStoredPSK {
+		// Быстрая попытка с сохранённым PSK (2 сек)
+		if err := c.performHandshake(params.Email, params.Password, 2*time.Second); err != nil {
+			log.Printf("[VPN] Сохранённый PSK не подошёл, пробуем bootstrap: %v", err)
+			c.psk = zeroPSK
+			if err2 := c.performHandshake(params.Email, params.Password, 10*time.Second); err2 != nil {
+				conn.Close()
+				c.conn = nil
+				c.setState(StateDisconnected)
+				return fmt.Errorf("рукопожатие: %w", err2)
+			}
+			// Bootstrap удался — новый PSK уже сохранён через onPSK callback
+		}
+	} else {
+		// Bootstrap-режим напрямую
+		if err := c.performHandshake(params.Email, params.Password, 10*time.Second); err != nil {
+			conn.Close()
+			c.conn = nil
+			c.setState(StateDisconnected)
+			return fmt.Errorf("рукопожатие: %w", err)
+		}
 	}
 
 	// Создаём TUN-адаптер
@@ -249,7 +281,7 @@ func (c *Client) Disconnect() {
 }
 
 // performHandshake выполняет 3-way handshake с сервером.
-func (c *Client) performHandshake(email, password string) error {
+func (c *Client) performHandshake(email, password string, timeout time.Duration) error {
 	// 1. Генерируем ephemeral ключевую пару
 	clientKP, err := novacrypto.GenerateKeyPair()
 	if err != nil {
@@ -295,7 +327,7 @@ func (c *Client) performHandshake(email, password string) error {
 	}
 
 	// Ставим таймаут на чтение
-	c.conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	c.conn.SetReadDeadline(time.Now().Add(timeout))
 
 	if _, err := c.conn.Write(pktBytes); err != nil {
 		return fmt.Errorf("отправка HandshakeInit: %w", err)
@@ -362,6 +394,16 @@ func (c *Client) performHandshake(email, password string) error {
 	c.dns2 = hsResp.DNS2
 	c.mtu = hsResp.MTU
 	c.keys = sessionKeys
+
+	// Если сервер прислал PSK (bootstrap-режим) — сохраняем
+	if len(hsResp.PSK) == 32 {
+		copy(c.psk[:], hsResp.PSK)
+		pskHex := hex.EncodeToString(hsResp.PSK)
+		log.Printf("[HANDSHAKE] Получен PSK от сервера (bootstrap)")
+		if c.onPSK != nil {
+			c.onPSK(pskHex)
+		}
+	}
 
 	log.Printf("[HANDSHAKE] Получен HandshakeResp: SessionID=%d, VPN IP=%s, MTU=%d",
 		c.sessionID, c.assignedIP, c.mtu)
@@ -560,11 +602,11 @@ func (c *Client) keepaliveLoop() {
 	randomKeepaliveInterval := func() time.Duration {
 		minInterval := 20 * time.Second
 		_ = 35 * time.Second // maxInterval для документации
-		
+
 		// Генерируем случайное значение от 0 до 15 секунд
 		randomSec, _ := rand.Int(rand.Reader, big.NewInt(16)) // 0-15
 		interval := minInterval + time.Duration(randomSec.Int64())*time.Second
-		
+
 		return interval
 	}
 

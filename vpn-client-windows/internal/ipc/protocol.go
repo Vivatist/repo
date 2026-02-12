@@ -67,6 +67,7 @@ type StatusInfo struct {
 	State       int    `json:"state"`
 	StateText   string `json:"state_text"`
 	AssignedIP  string `json:"assigned_ip,omitempty"`
+	ReceivedPSK string `json:"received_psk,omitempty"` // PSK полученный при bootstrap-подключении
 	BytesSent   uint64 `json:"bytes_sent"`
 	BytesRecv   uint64 `json:"bytes_recv"`
 	PacketsSent uint64 `json:"packets_sent"`
