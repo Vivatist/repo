@@ -464,6 +464,16 @@ func (c *NovaVPNClient) handleUDPPacket(data []byte) {
 	case protocol.PacketKeepalive:
 		// Игнорируем keepalive
 
+	case protocol.PacketDisconnect:
+		// Сервер уведомил об отключении (например, перезагрузка).
+		// Очищаем resume-данные (сессия на сервере уже не существует)
+		// и закрываем соединение — udpReadLoop обнаружит ошибку и вызовет reconnect.
+		log.Println("[VPN] Сервер инициировал отключение (shutdown/restart)")
+		c.clearResumeData()
+		if conn := c.conn; conn != nil {
+			conn.Close()
+		}
+
 	default:
 		log.Printf("[VPN] Unknown packet type: 0x%02X", uint8(pktType))
 	}

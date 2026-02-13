@@ -165,6 +165,12 @@ func (s *VPNServer) Start() error {
 // Stop останавливает VPN-сервер.
 func (s *VPNServer) Stop() {
 	log.Println("[SERVER] Останавливаем сервер...")
+
+	// Уведомляем всех подключённых клиентов об остановке сервера.
+	// Клиенты получат PacketDisconnect и сразу начнут переподключение,
+	// не дожидаясь dead-peer detection (45 сек).
+	s.notifyShutdown()
+
 	s.cancel()
 
 	// Закрываем UDP-сокет (прерывает ReadFromUDP)
@@ -451,6 +457,32 @@ func (s *VPNServer) printStats() {
 // Wait ожидает завершения сервера.
 func (s *VPNServer) Wait() {
 	s.wg.Wait()
+}
+
+// notifyShutdown отправляет PacketDisconnect всем активным клиентам.
+// Вызывается перед остановкой сервера, чтобы клиенты сразу начали переподключение.
+func (s *VPNServer) notifyShutdown() {
+	if s.udpConn == nil {
+		return
+	}
+	sessions := s.sessions.GetAllSessions()
+	var buf [10]byte
+	buf[0] = protocol.TLSContentType
+	buf[1] = protocol.TLSVersionMajor
+	buf[2] = protocol.TLSVersionMinor
+	binary.BigEndian.PutUint16(buf[3:5], 5)
+	buf[9] = byte(protocol.PacketDisconnect)
+	count := 0
+	for _, session := range sessions {
+		if session.IsActive() {
+			binary.BigEndian.PutUint32(buf[5:9], session.ID)
+			s.udpConn.WriteToUDP(buf[:], session.ClientAddr)
+			count++
+		}
+	}
+	if count > 0 {
+		log.Printf("[SERVER] Отправлен disconnect %d клиентам", count)
+	}
 }
 
 // ReloadUsers перезагружает список пользователей из файла.
