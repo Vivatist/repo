@@ -126,6 +126,25 @@ func (s *ChaCha20Session) DecryptWithNonce(nonce []byte, ciphertext []byte, addi
 	return plaintext, nil
 }
 
+// EncryptInto шифрует plaintext прямо в dst буфер (nonce + ciphertext + tag).
+// Zero-copy: не создаёт промежуточных буферов.
+func (s *ChaCha20Session) EncryptInto(dst []byte, plaintext []byte, additionalData []byte) (int, error) {
+	totalLen := NonceSize + len(plaintext) + AuthTagSize
+	if len(dst) < totalLen {
+		return 0, fmt.Errorf("dst too small: %d < %d", len(dst), totalLen)
+	}
+
+	// Генерируем nonce прямо в начало dst
+	if _, err := rand.Read(dst[:NonceSize]); err != nil {
+		return 0, fmt.Errorf("nonce generation: %w", err)
+	}
+
+	// Seal прямо в dst после nonce
+	s.sendAEAD.Seal(dst[NonceSize:NonceSize], dst[:NonceSize], plaintext, additionalData)
+
+	return totalLen, nil
+}
+
 // ComputeHMAC вычисляет HMAC для данных.
 func (s *ChaCha20Session) ComputeHMAC(data []byte) []byte {
 	mac := hmac.New(sha256.New, s.keys.HMACKey)

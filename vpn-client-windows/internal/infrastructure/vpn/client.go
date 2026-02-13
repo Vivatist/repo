@@ -27,11 +27,12 @@ type NovaVPNClient struct {
 	netConfig    domainnet.NetworkConfigurator
 
 	// Состояние
-	state  atomic.Int32
-	mu     sync.Mutex
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	state   atomic.Int32
+	stopped atomic.Bool
+	mu      sync.Mutex
+	ctx     context.Context
+	cancel  context.CancelFunc
+	wg      sync.WaitGroup
 
 	// Соединение
 	conn       *net.UDPConn
@@ -182,6 +183,7 @@ func (c *NovaVPNClient) Connect(params domainvpn.ConnectParams) error {
 
 	// Запускаем циклы обработки
 	c.ctx, c.cancel = context.WithCancel(context.Background())
+	c.stopped.Store(false)
 	c.wg.Add(3)
 	go c.udpReadLoop()
 	go c.tunReadLoop()
@@ -203,6 +205,9 @@ func (c *NovaVPNClient) Disconnect() error {
 
 	c.setState(domainvpn.StateDisconnecting)
 	log.Println("[VPN] Отключение...")
+
+	// Сначала ставим флаг остановки, затем cancel
+	c.stopped.Store(true)
 
 	// Останавливаем циклы
 	if c.cancel != nil {
@@ -301,10 +306,8 @@ func (c *NovaVPNClient) udpReadLoop() {
 
 	// Устанавливаем deadline один раз с большим таймаутом
 	for {
-		select {
-		case <-c.ctx.Done():
+		if c.stopped.Load() {
 			return
-		default:
 		}
 
 		c.conn.SetReadDeadline(time.Now().Add(2 * time.Second))
@@ -376,10 +379,8 @@ func (c *NovaVPNClient) tunReadLoop() {
 	sendBuf := make([]byte, protocol.TLSHeaderSize+4+1+protocol.NonceSize+mtu+100+protocol.AuthTagSize)
 
 	for {
-		select {
-		case <-c.ctx.Done():
+		if c.stopped.Load() {
 			return
-		default:
 		}
 
 		n, err := c.tunnelDevice.Read(tunBuf)
@@ -388,16 +389,16 @@ func (c *NovaVPNClient) tunReadLoop() {
 			return
 		}
 
-		// Шифруем
-		encrypted, err := c.session.Encrypt(tunBuf[:n], nil)
+		// EncryptInto: nonce + ciphertext прямо в sendBuf[10:]
+		encLen, err := c.session.EncryptInto(sendBuf[10:], tunBuf[:n], nil)
 		if err != nil {
 			log.Printf("[VPN] Encrypt error: %v", err)
 			continue
 		}
 
-		// Собираем пакет inline без аллокаций (используем sendBuf)
-		// Формат: TLS_Header(5) + SessionID(4) + Type(1) + Nonce(12) + Payload
-		dataLen := 4 + 1 + protocol.NonceSize + len(encrypted) - protocol.NonceSize
+		// Собираем пакет inline без аллокаций
+		// Формат: TLS_Header(5) + SessionID(4) + Type(1) + Nonce(12) + Ciphertext
+		dataLen := 4 + 1 + encLen
 
 		// TLS Record Header
 		sendBuf[0] = protocol.TLSContentType
@@ -415,11 +416,7 @@ func (c *NovaVPNClient) tunReadLoop() {
 		// Type
 		sendBuf[9] = byte(protocol.PacketData)
 
-		// Nonce (из encrypted[:12])
-		copy(sendBuf[10:22], encrypted[:protocol.NonceSize])
-
-		// Payload (ciphertext без nonce)
-		copy(sendBuf[22:], encrypted[protocol.NonceSize:])
+		// Nonce + Ciphertext уже на месте (sendBuf[10:10+encLen])
 
 		totalLen := protocol.TLSHeaderSize + dataLen
 

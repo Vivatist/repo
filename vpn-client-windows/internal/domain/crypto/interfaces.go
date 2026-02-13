@@ -24,6 +24,10 @@ type Session interface {
 	// DecryptWithNonce дешифрует ciphertext с отдельным nonce (без промежуточного буфера).
 	DecryptWithNonce(nonce []byte, ciphertext []byte, additionalData []byte) ([]byte, error)
 
+	// EncryptInto шифрует plaintext прямо в dst (nonce + ciphertext + tag).
+	// Возвращает количество записанных байт. Zero-copy для hot path.
+	EncryptInto(dst []byte, plaintext []byte, additionalData []byte) (int, error)
+
 	// ComputeHMAC вычисляет HMAC для данных.
 	ComputeHMAC(data []byte) []byte
 

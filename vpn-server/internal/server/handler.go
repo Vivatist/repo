@@ -156,6 +156,13 @@ func (s *VPNServer) handleHandshakeInit(pkt *protocol.Packet, remoteAddr *net.UD
 	}
 	session.Keys = sessionKeys
 
+	// Инициализируем кешированные AEAD для быстрого шифрования/дешифрования
+	if err := session.InitCrypto(); err != nil {
+		log.Printf("[HANDSHAKE] Ошибка инициализации AEAD: %v", err)
+		s.sessions.RemoveSession(session)
+		return
+	}
+
 	// Обнуляем shared secret
 	protocol.ZeroKey(&sharedSecret)
 
@@ -292,8 +299,8 @@ func (s *VPNServer) handleDataPacket(pkt *protocol.Packet, remoteAddr *net.UDPAd
 		return
 	}
 
-	// Расшифровываем
-	plaintext, err := protocol.Decrypt(session.Keys.RecvKey, pkt.Nonce, pkt.Payload, nil)
+	// Используем кешированный AEAD (без создания AEAD на каждый пакет)
+	plaintext, err := session.recvAEAD.Open(nil, pkt.Nonce[:], pkt.Payload, nil)
 	if err != nil {
 		if s.cfg.LogLevel == "debug" {
 			log.Printf("[DATA] Ошибка расшифровки от сессии #%d: %v", session.ID, err)
@@ -344,20 +351,9 @@ func (s *VPNServer) handleDisconnect(pkt *protocol.Packet, remoteAddr *net.UDPAd
 }
 
 // sendToClient шифрует и отправляет данные клиенту.
-func (s *VPNServer) sendToClient(session *Session, plaintext []byte) {
-	seq := session.NextSendSeq()
-
-	// Формируем заголовок пакета
-	header := protocol.PacketHeader{
-		Version:    protocol.ProtocolVersion,
-		Type:       protocol.PacketData,
-		SessionID:  session.ID,
-		SequenceNo: seq,
-		PayloadLen: uint16(len(plaintext)),
-	}
-
-	// В v2 протоколе AAD не используется для data-пакетов
-	nonce, ciphertext, err := protocol.Encrypt(session.Keys.SendKey, plaintext, nil)
+// buf — пре-аллоцированный буфер для inline-сборки пакета (zero-alloc hot path).
+func (s *VPNServer) sendToClient(session *Session, plaintext []byte, buf []byte) {
+	n, err := session.EncryptAndBuild(buf, plaintext)
 	if err != nil {
 		if s.cfg.LogLevel == "debug" {
 			log.Printf("[SEND] Ошибка шифрования для сессии #%d: %v", session.ID, err)
@@ -365,21 +361,7 @@ func (s *VPNServer) sendToClient(session *Session, plaintext []byte) {
 		return
 	}
 
-	var nonceArr [protocol.NonceSize]byte
-	copy(nonceArr[:], nonce[:])
-
-	pkt := &protocol.Packet{
-		Header:  header,
-		Nonce:   nonceArr,
-		Payload: ciphertext,
-	}
-	data, err := pkt.Marshal()
-	if err != nil {
-		return
-	}
-
-	// Отправляем
-	if _, err := s.udpConn.WriteToUDP(data, session.ClientAddr); err != nil {
+	if _, err := s.udpConn.WriteToUDP(buf[:n], session.ClientAddr); err != nil {
 		if s.cfg.LogLevel == "debug" {
 			log.Printf("[SEND] Ошибка отправки в сессию #%d: %v", session.ID, err)
 		}
