@@ -3,7 +3,8 @@ package server
 
 import (
 	"crypto/cipher"
-	"crypto/rand"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"log"
@@ -12,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/crypto/chacha20"
 	"golang.org/x/crypto/chacha20poly1305"
 
 	"github.com/novavpn/vpn-server/internal/protocol"
@@ -71,9 +73,10 @@ type Session struct {
 	recvAEAD cipher.AEAD
 
 	// Counter-nonce: prefix(4) + counter(8) = 12 байт nonce.
-	// Убирает сисколлы crypto/rand.Read с hot path.
-	noncePrefix [4]byte        // случайный, генерируется при InitCrypto
-	sendCounter atomic.Uint64   // инкрементируется на каждый пакет
+	// Prefix выводится из ключа (обе стороны вычисляют одинаково), на wire только counter(4).
+	noncePrefix     [4]byte       // deriveNoncePrefix(sendKey)
+	recvNoncePrefix [4]byte       // deriveNoncePrefix(recvKey)
+	sendCounter     atomic.Uint64 // инкрементируется на каждый пакет
 
 	// ServerKeyPair — ephemeral ключевая пара сервера для этой сессии
 	ServerKeyPair *protocol.KeyPair
@@ -162,20 +165,29 @@ func (s *Session) InitCrypto() error {
 		return fmt.Errorf("init recv AEAD: %w", err)
 	}
 
-	// Counter-nonce: случайный prefix (один раз на сессию)
-	if _, err := rand.Read(s.noncePrefix[:]); err != nil {
-		return fmt.Errorf("nonce prefix generation: %w", err)
-	}
+	// Nonce prefix выводится из ключа (обе стороны вычисляют одинаково)
+	s.noncePrefix = deriveNoncePrefix(s.Keys.SendKey[:])
+	s.recvNoncePrefix = deriveNoncePrefix(s.Keys.RecvKey[:])
 
 	return nil
 }
 
+// deriveNoncePrefix выводит 4-байтный nonce prefix из ключа.
+func deriveNoncePrefix(key []byte) [4]byte {
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte("nova-nonce-prefix"))
+	sum := mac.Sum(nil)
+	var prefix [4]byte
+	copy(prefix[:], sum[:4])
+	return prefix
+}
+
 // EncryptAndBuild шифрует plaintext и собирает готовый VPN-пакет в buf.
-// Inline-сборка пакета без промежуточных аллокаций.
-// Формат: TLS_Header(5) + SessionID(4) + Type(1) + Nonce(12) + Ciphertext+Tag
+// Plain ChaCha20 (XOR) без Poly1305 — нет auth tag.
+// Формат: TLS_Header(5) + SessionID(4) + Type(1) + Counter(4) + Ciphertext
 func (s *Session) EncryptAndBuild(buf []byte, plaintext []byte) (int, error) {
-	ciphertextLen := len(plaintext) + chacha20poly1305.Overhead
-	dataLen := 4 + 1 + protocol.NonceSize + ciphertextLen
+	ciphertextLen := len(plaintext) // без overhead: plain XOR
+	dataLen := 4 + 1 + 4 + ciphertextLen // SID + Type + Counter + CT
 	totalLen := protocol.TLSHeaderSize + dataLen
 
 	if len(buf) < totalLen {
@@ -194,13 +206,22 @@ func (s *Session) EncryptAndBuild(buf []byte, plaintext []byte) (int, error) {
 	// Type
 	buf[9] = byte(protocol.PacketData)
 
-	// Counter-nonce: prefix(4) + counter(8) = 12 байт (без сисколлов)
 	ctr := s.sendCounter.Add(1)
-	copy(buf[10:14], s.noncePrefix[:])
-	binary.BigEndian.PutUint64(buf[14:22], ctr)
 
-	// Seal ciphertext прямо в buf[22:] — zero-copy
-	s.sendAEAD.Seal(buf[22:22], buf[10:22], plaintext, nil)
+	// Полный nonce внутри
+	var nonce [protocol.NonceSize]byte
+	copy(nonce[0:4], s.noncePrefix[:])
+	binary.BigEndian.PutUint64(nonce[4:12], ctr)
+
+	// На wire только counter
+	binary.BigEndian.PutUint32(buf[10:14], uint32(ctr))
+
+	// Plain ChaCha20 XOR прямо в buf[14:]
+	c, err := chacha20.NewUnauthenticatedCipher(s.Keys.SendKey[:], nonce[:])
+	if err != nil {
+		return 0, fmt.Errorf("chacha20 init: %w", err)
+	}
+	c.XORKeyStream(buf[14:14+len(plaintext)], plaintext)
 
 	return totalLen, nil
 }

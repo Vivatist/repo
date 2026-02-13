@@ -5,6 +5,7 @@ package vpn
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"log"
 	"net"
@@ -59,6 +60,14 @@ type NovaVPNClient struct {
 	// Колбэки
 	onStatus domainvpn.StatusCallback
 	onPSK    domainvpn.PSKCallback
+
+	// 0-RTT resume data
+	resumeSessionID  uint32
+	resumeKeys       *domaincrypto.SessionKeys
+	resumeIP         net.IP
+	resumeDNS        []net.IP
+	resumeMTU        uint16
+	resumeSubnetMask uint8
 }
 
 // NewNovaVPNClient создаёт новый VPN-клиент.
@@ -123,71 +132,90 @@ func (c *NovaVPNClient) Connect(params domainvpn.ConnectParams) error {
 	_ = conn.SetReadBuffer(4 * 1024 * 1024)
 	_ = conn.SetWriteBuffer(4 * 1024 * 1024)
 
-	// Выполняем рукопожатие
-	performer := handshake.NewPerformer(conn, psk, params.Email, params.Password, c.onPSK)
-
-	// Пробуем быстро с сохранённым PSK, затем bootstrap
-	timeout := 2 * time.Second
-	if params.PSK == "" {
-		timeout = 10 * time.Second
+	// 0-RTT Resume: пробуем восстановить сессию
+	resumed := false
+	if c.resumeSessionID != 0 && c.resumeKeys != nil {
+		resumed = c.tryResume()
+		if !resumed {
+			c.clearResumeData()
+		}
 	}
 
-	result, err := performer.Perform(timeout)
-	if err != nil {
-		// Если есть PSK, пробуем bootstrap
-		if params.PSK != "" {
-			log.Printf("[VPN] Saved PSK failed, trying bootstrap: %v", err)
-			psk = make([]byte, domaincrypto.KeySize)
-			performer = handshake.NewPerformer(conn, psk, params.Email, params.Password, c.onPSK)
-			result, err = performer.Perform(10 * time.Second)
-			if err != nil {
+	if !resumed {
+		// Выполняем рукопожатие
+		performer := handshake.NewPerformer(conn, psk, params.Email, params.Password, c.onPSK)
+
+		// Пробуем быстро с сохранённым PSK, затем bootstrap
+		timeout := 2 * time.Second
+		if params.PSK == "" {
+			timeout = 10 * time.Second
+		}
+
+		result, err := performer.Perform(timeout)
+		if err != nil {
+			// Если есть PSK, пробуем bootstrap
+			if params.PSK != "" {
+				log.Printf("[VPN] Saved PSK failed, trying bootstrap: %v", err)
+				psk = make([]byte, domaincrypto.KeySize)
+				performer = handshake.NewPerformer(conn, psk, params.Email, params.Password, c.onPSK)
+				result, err = performer.Perform(10 * time.Second)
+				if err != nil {
+					conn.Close()
+					c.conn = nil
+					c.setState(domainvpn.StateDisconnected)
+					return fmt.Errorf("handshake failed: %w", err)
+				}
+			} else {
 				conn.Close()
 				c.conn = nil
 				c.setState(domainvpn.StateDisconnected)
 				return fmt.Errorf("handshake failed: %w", err)
 			}
-		} else {
+		}
+
+		// Сохраняем результаты рукопожатия
+		c.sessionID = result.SessionID
+		c.assignedIP = result.AssignedIP
+		c.mtu = result.MTU
+		c.subnetMask = result.SubnetMask
+		c.dns = []net.IP{result.DNS1, result.DNS2}
+		c.connectedAt = time.Now()
+
+		// Создаём криптографическую сессию
+		session, err := infracrypto.NewChaCha20Session(result.Keys)
+		if err != nil {
 			conn.Close()
 			c.conn = nil
 			c.setState(domainvpn.StateDisconnected)
-			return fmt.Errorf("handshake failed: %w", err)
+			return fmt.Errorf("create session: %w", err)
 		}
+		c.session = session
 	}
 
-	// Сохраняем результаты рукопожатия
-	c.sessionID = result.SessionID
-	c.assignedIP = result.AssignedIP
-	c.mtu = result.MTU
-	c.subnetMask = result.SubnetMask
-	c.dns = []net.IP{result.DNS1, result.DNS2}
-	c.connectedAt = time.Now()
-
-	// Создаём криптографическую сессию
-	session, err := infracrypto.NewChaCha20Session(result.Keys)
-	if err != nil {
-		conn.Close()
-		c.conn = nil
-		c.setState(domainvpn.StateDisconnected)
-		return fmt.Errorf("create session: %w", err)
-	}
-	c.session = session
-
-	// Настраиваем сеть
-	if err := c.configureNetwork(); err != nil {
-		session.Close()
-		conn.Close()
-		c.conn = nil
-		c.setState(domainvpn.StateDisconnected)
-		return fmt.Errorf("configure network: %w", err)
-	}
-
-	// Запускаем циклы обработки
+	// Запускаем циклы обработки ДО настройки сети (UDP read/keepalive работают сразу)
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 	c.stopped.Store(false)
 	c.wg.Add(3)
 	go c.udpReadLoop()
 	go c.tunReadLoop()
 	go c.keepaliveLoop()
+
+	// Настраиваем сеть (параллельно с уже запущенными циклами)
+	if err := c.configureNetwork(); err != nil {
+		c.stopped.Store(true)
+		c.cancel()
+		if c.conn != nil {
+			c.conn.Close()
+		}
+		c.wg.Wait()
+		if c.session != nil {
+			c.session.Close()
+			c.session = nil
+		}
+		c.conn = nil
+		c.setState(domainvpn.StateDisconnected)
+		return fmt.Errorf("configure network: %w", err)
+	}
 
 	c.setState(domainvpn.StateConnected)
 	log.Println("[VPN] Подключено к VPN")
@@ -205,6 +233,16 @@ func (c *NovaVPNClient) Disconnect() error {
 
 	c.setState(domainvpn.StateDisconnecting)
 	log.Println("[VPN] Отключение...")
+
+	// Сохраняем данные для 0-RTT resume ДО очистки сессии
+	if c.session != nil && c.sessionID != 0 {
+		c.resumeSessionID = c.sessionID
+		c.resumeKeys = copySessionKeys(c.session)
+		c.resumeIP = c.assignedIP
+		c.resumeDNS = c.dns
+		c.resumeMTU = c.mtu
+		c.resumeSubnetMask = c.subnetMask
+	}
 
 	// Сначала ставим флаг остановки, затем cancel
 	c.stopped.Store(true)
@@ -278,23 +316,31 @@ func (c *NovaVPNClient) setState(state domainvpn.ConnectionState) {
 func (c *NovaVPNClient) configureNetwork() error {
 	ifaceName := c.tunnelDevice.Name()
 
-	// Настраиваем IP-адрес
+	// IP-адрес должен быть первым (маршруты зависят от него)
 	if err := c.netConfig.ConfigureInterface(ifaceName, c.assignedIP, c.subnetMask); err != nil {
 		return fmt.Errorf("configure interface: %w", err)
 	}
 
-	// Настраиваем DNS
-	if err := c.netConfig.SetDNS(ifaceName, c.dns); err != nil {
-		return fmt.Errorf("set DNS: %w", err)
-	}
+	// DNS и маршруты параллельно (~100-200мс экономии)
+	errCh := make(chan error, 2)
 
-	// Настраиваем маршруты (требует специального метода в configurator)
-	// Временно используем прямой вызов
-	if wc, ok := c.netConfig.(interface {
-		SetupVPNRoutes(ifaceName string, vpnIP, serverIP net.IP) error
-	}); ok {
-		if err := wc.SetupVPNRoutes(ifaceName, c.assignedIP, net.ParseIP(c.serverAddr.IP.String())); err != nil {
-			return fmt.Errorf("setup routes: %w", err)
+	go func() {
+		errCh <- c.netConfig.SetDNS(ifaceName, c.dns)
+	}()
+
+	go func() {
+		if wc, ok := c.netConfig.(interface {
+			SetupVPNRoutes(ifaceName string, vpnIP, serverIP net.IP) error
+		}); ok {
+			errCh <- wc.SetupVPNRoutes(ifaceName, c.assignedIP, net.ParseIP(c.serverAddr.IP.String()))
+		} else {
+			errCh <- nil
+		}
+	}()
+
+	for i := 0; i < 2; i++ {
+		if err := <-errCh; err != nil {
+			return fmt.Errorf("network config: %w", err)
 		}
 	}
 
@@ -330,8 +376,8 @@ func (c *NovaVPNClient) handleUDPPacket(data []byte) {
 	if len(raw) >= protocol.TLSHeaderSize && raw[0] == protocol.TLSContentType {
 		raw = raw[protocol.TLSHeaderSize:]
 	}
-	// SessionID(4) + Type(1) + Nonce(12) = 17
-	if len(raw) < 17 {
+	// SessionID(4) + Type(1) = 5 минимум
+	if len(raw) < 5 {
 		return
 	}
 
@@ -339,11 +385,15 @@ func (c *NovaVPNClient) handleUDPPacket(data []byte) {
 
 	switch pktType {
 	case protocol.PacketData:
-		nonce := raw[5:17]
-		payload := raw[17:]
+		// Data: SessionID(4) + Type(1) + Counter(4) + CT (plain ChaCha20, без auth tag)
+		if len(raw) < 9 {
+			return
+		}
+		counter := binary.BigEndian.Uint32(raw[5:9])
+		payload := raw[9:]
 
-		// Дешифруем напрямую без промежуточного буфера
-		plaintext, err := c.session.DecryptWithNonce(nonce, payload, nil)
+		// Дешифруем с восстановленным nonce
+		plaintext, err := c.session.DecryptWithCounter(counter, payload, nil)
 		if err != nil {
 			log.Printf("[VPN] Decrypt error: %v", err)
 			return
@@ -372,8 +422,8 @@ func (c *NovaVPNClient) tunReadLoop() {
 	tunBuf := make([]byte, mtu+100)
 
 	// Пре-аллоцируем буфер для исходящих пакетов
-	// TLS(5) + SessionID(4) + Type(1) + Nonce(12) + MaxPayload + AuthTag(16)
-	sendBuf := make([]byte, protocol.TLSHeaderSize+4+1+protocol.NonceSize+mtu+100+protocol.AuthTagSize)
+	// TLS(5) + SessionID(4) + Type(1) + Counter(4) + MaxPayload (без AuthTag)
+	sendBuf := make([]byte, protocol.TLSHeaderSize+4+1+4+mtu+100)
 
 	for {
 		if c.stopped.Load() {
@@ -394,7 +444,7 @@ func (c *NovaVPNClient) tunReadLoop() {
 		}
 
 		// Собираем пакет inline без аллокаций
-		// Формат: TLS_Header(5) + SessionID(4) + Type(1) + Nonce(12) + Ciphertext
+		// Формат: TLS_Header(5) + SessionID(4) + Type(1) + Counter(4) + Ciphertext + Tag
 		dataLen := 4 + 1 + encLen
 
 		// TLS Record Header
@@ -413,7 +463,7 @@ func (c *NovaVPNClient) tunReadLoop() {
 		// Type
 		sendBuf[9] = byte(protocol.PacketData)
 
-		// Nonce + Ciphertext уже на месте (sendBuf[10:10+encLen])
+		// Counter + Ciphertext уже на месте (sendBuf[10:10+encLen])
 
 		totalLen := protocol.TLSHeaderSize + dataLen
 
@@ -444,4 +494,79 @@ func (c *NovaVPNClient) keepaliveLoop() {
 			c.conn.Write(pktBytes)
 		}
 	}
+}
+
+// tryResume пытается восстановить сессию по сохранённым данным (0-RTT).
+func (c *NovaVPNClient) tryResume() bool {
+	log.Printf("[VPN] 0-RTT resume: пробуем сессию #%d", c.resumeSessionID)
+
+	// Отправляем keepalive со старым sessionID
+	pkt := protocol.NewPacket(protocol.PacketKeepalive, c.resumeSessionID, 1, [protocol.NonceSize]byte{}, nil)
+	pktBytes, _ := pkt.Marshal()
+	if _, err := c.conn.Write(pktBytes); err != nil {
+		log.Printf("[VPN] 0-RTT resume: ошибка отправки keepalive: %v", err)
+		return false
+	}
+
+	// Ждём ответ (1 секунда)
+	c.conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+	buf := make([]byte, 2048)
+	n, err := c.conn.Read(buf)
+	c.conn.SetReadDeadline(time.Time{})
+	if err != nil {
+		log.Printf("[VPN] 0-RTT resume: нет ответа, переход к полному handshake")
+		return false
+	}
+
+	// Проверяем что это keepalive-ответ
+	raw := buf[:n]
+	if len(raw) >= protocol.TLSHeaderSize && raw[0] == protocol.TLSContentType {
+		raw = raw[protocol.TLSHeaderSize:]
+	}
+	if len(raw) < 5 || protocol.PacketType(raw[4]) != protocol.PacketKeepalive {
+		log.Printf("[VPN] 0-RTT resume: получен не keepalive, переход к handshake")
+		return false
+	}
+
+	// Session жива на сервере! Восстанавливаем.
+	session, err := infracrypto.NewChaCha20Session(c.resumeKeys)
+	if err != nil {
+		log.Printf("[VPN] 0-RTT resume: ошибка создания сессии: %v", err)
+		return false
+	}
+
+	c.sessionID = c.resumeSessionID
+	c.session = session
+	c.assignedIP = c.resumeIP
+	c.dns = c.resumeDNS
+	c.mtu = c.resumeMTU
+	c.subnetMask = c.resumeSubnetMask
+	c.connectedAt = time.Now()
+
+	log.Printf("[VPN] 0-RTT resume: сессия #%d восстановлена (VPN IP: %s)", c.sessionID, c.assignedIP)
+	return true
+}
+
+// clearResumeData очищает сохранённые данные для resume.
+func (c *NovaVPNClient) clearResumeData() {
+	c.resumeSessionID = 0
+	c.resumeKeys = nil
+	c.resumeIP = nil
+	c.resumeDNS = nil
+	c.resumeMTU = 0
+	c.resumeSubnetMask = 0
+}
+
+// copySessionKeys создаёт копию ключей сессии для 0-RTT resume.
+func copySessionKeys(session domaincrypto.Session) *domaincrypto.SessionKeys {
+	// Получаем ключи через интерфейс KeysProvider
+	if kp, ok := session.(interface{ GetKeys() *domaincrypto.SessionKeys }); ok {
+		orig := kp.GetKeys()
+		return &domaincrypto.SessionKeys{
+			SendKey: append([]byte{}, orig.SendKey...),
+			RecvKey: append([]byte{}, orig.RecvKey...),
+			HMACKey: append([]byte{}, orig.HMACKey...),
+		}
+	}
+	return nil
 }

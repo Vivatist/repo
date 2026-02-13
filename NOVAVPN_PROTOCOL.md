@@ -11,7 +11,7 @@ NovaVPN — собственный VPN-протокол поверх **UDP** с 
 
 **Ключевые характеристики:**
 - Транспорт: UDP
-- Шифрование: ChaCha20-Poly1305 (AEAD)
+- Шифрование: ChaCha20 (data) / ChaCha20-Poly1305 AEAD (handshake)
 - Обмен ключами: ECDH Curve25519 (ephemeral)
 - Аутентификация: email + пароль (Argon2id на сервере)
 - Маскировка: пакеты обёрнуты в TLS 1.2 Application Data Record Header (обход DPI)
@@ -25,7 +25,7 @@ NovaVPN — собственный VPN-протокол поверх **UDP** с 
 
 Каждый пакет оборачивается в TLS Record Header для имитации HTTPS-трафика.
 
-### 2.1. Общий формат
+### 2.1. Общий формат (Handshake / Keepalive / Disconnect)
 
 ```
 ┌─────────────────────────────┬───────────┬──────┬───────┬───────────────────┐
@@ -33,6 +33,20 @@ NovaVPN — собственный VPN-протокол поверх **UDP** с 
 │ 0x17 0x03 0x03 [len: 2B]   │    4B     │  1B  │  12B  │     variable      │
 └─────────────────────────────┴───────────┴──────┴───────┴───────────────────┘
 ```
+
+### 2.1.1. Формат Data-пакетов (0x10)
+
+```
+┌─────────────────────────────┬───────────┬──────┬─────────┬────────────────────┐
+│    TLS Record Header (5B)   │ SessionID │ Type │ Counter │ ChaCha20 XOR data  │
+│ 0x17 0x03 0x03 [len: 2B]   │    4B     │  1B  │   4B    │     IP packet      │
+└─────────────────────────────┴───────────┴──────┴─────────┴────────────────────┘
+```
+
+- **Counter** (4 байта): младшие 4 байта атомарного счётчика пакетов (Big-Endian uint32)
+- **Nonce** восстанавливается: `HMAC(key, "nova-nonce-prefix")[:4] + BE_uint64(counter)` = 12 байт
+- **Шифрование**: plain ChaCha20 XOR (без Poly1305, без auth tag)
+- **Data overhead**: TLS(5) + SID(4) + Type(1) + Counter(4) = **14 байт**
 
 ### 2.2. TLS Record Header (5 байт)
 
@@ -49,7 +63,8 @@ NovaVPN — собственный VPN-протокол поверх **UDP** с 
 |-----------------------------|--------|----------|
 | 0-3 | 4 | **SessionID** — идентификатор сессии (Big-Endian uint32). `0` для HandshakeInit. |
 | 4 | 1 | **Type** — тип пакета (см. ниже) |
-| 5-16 | 12 | **Nonce** — случайный nonce для ChaCha20-Poly1305 |
+| 5-16 | 12 | **Nonce** — nonce для AEAD (только Handshake/Keepalive/Disconnect) |
+| 5-8 | 4 | **Counter** — счётчик пакетов (только Data, BE uint32) |
 | 17+ | var | **Payload** — зашифрованные данные (или открытый payload для Handshake) |
 
 ### 2.4. Типы пакетов
@@ -71,10 +86,12 @@ NovaVPN — собственный VPN-протокол поверх **UDP** с 
 | TLSHeaderSize | 5 | type(1) + version(2) + length(2) |
 | SessionIDSize | 4 | — |
 | PacketTypeSize | 1 | — |
-| NonceSize | 12 | ChaCha20-Poly1305 стандарт |
-| AuthTagSize | 16 | ChaCha20-Poly1305 стандарт |
-| HeaderSize | 22 | TLS(5) + SessionID(4) + Type(1) + Nonce(12) |
-| TotalOverhead | 38 | TLS(5) + SessionID(4) + Type(1) + Nonce(12) + AuthTag(16) |
+| NonceSize | 12 | ChaCha20-Poly1305 (только handshake) |
+| AuthTagSize | 16 | ChaCha20-Poly1305 (только handshake) |
+| DataCounterSize | 4 | Counter в data-пакетах |
+| HandshakeHeaderSize | 22 | TLS(5) + SessionID(4) + Type(1) + Nonce(12) |
+| DataOverhead | 14 | TLS(5) + SessionID(4) + Type(1) + Counter(4) |
+| HandshakeOverhead | 38 | TLS(5) + SessionID(4) + Type(1) + Nonce(12) + AuthTag(16) |
 
 ---
 
@@ -86,7 +103,8 @@ NovaVPN — собственный VPN-протокол поверх **UDP** с 
 |----------|----------|--------|
 | Обмен ключами | ECDH Curve25519 | Ephemeral ключевые пары на каждую сессию |
 | Вывод ключей | HKDF-SHA256 | salt=PSK, info=`"novavpn-session-keys-v1"` |
-| Шифрование | ChaCha20-Poly1305 (AEAD) | 12B random nonce, 16B auth tag |
+| Шифрование (data) | ChaCha20 (XOR) | 4B counter на wire, nonce = HMAC-prefix + counter |
+| Шифрование (handshake) | ChaCha20-Poly1305 (AEAD) | 12B nonce на wire, 16B auth tag |
 | Целостность | HMAC-SHA256 | Проверка при handshake |
 | Пароли (сервер) | Argon2id | time=3, memory=64MB, threads=4, keyLen=32 |
 

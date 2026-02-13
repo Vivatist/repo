@@ -14,6 +14,7 @@ import (
 	"io"
 	"sync/atomic"
 
+	"golang.org/x/crypto/chacha20"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/hkdf"
@@ -33,9 +34,11 @@ type ChaCha20Session struct {
 	recvAEAD cipher.AEAD
 
 	// Counter-nonce: prefix(4) + counter(8) = 12 байт nonce.
-	// Убирает сисколл crypto/rand.Read с hot path.
-	noncePrefix [4]byte        // случайный, генерируется при создании сессии
-	sendCounter atomic.Uint64   // инкрементируется на каждый пакет
+	// Prefix выводится из ключа (обе стороны вычисляют одинаково).
+	// На wire передаётся только 4-байтный counter (без prefix).
+	noncePrefix     [4]byte       // HMAC(sendKey, "nova-nonce-prefix")[:4]
+	recvNoncePrefix [4]byte       // HMAC(recvKey, "nova-nonce-prefix")[:4]
+	sendCounter     atomic.Uint64 // инкрементируется на каждый пакет
 
 	// Пре-аллоцированные буферы для hot path (используются по одному на горутину)
 	sendBuf []byte // буфер для шифрования (nonce + ciphertext + tag)
@@ -54,20 +57,26 @@ func NewChaCha20Session(keys *crypto.SessionKeys) (*ChaCha20Session, error) {
 		return nil, fmt.Errorf("recv AEAD init: %w", err)
 	}
 
-	// Генерируем случайный prefix для counter-nonce (один раз на сессию)
-	var noncePrefix [4]byte
-	if _, err := rand.Read(noncePrefix[:]); err != nil {
-		return nil, fmt.Errorf("nonce prefix generation: %w", err)
-	}
-
 	return &ChaCha20Session{
-		keys:        keys,
-		sendAEAD:    sendAEAD,
-		recvAEAD:    recvAEAD,
-		noncePrefix: noncePrefix,
-		sendBuf:     make([]byte, 0, 2048),
-		recvBuf:     make([]byte, 0, 2048),
+		keys:            keys,
+		sendAEAD:        sendAEAD,
+		recvAEAD:        recvAEAD,
+		noncePrefix:     deriveNoncePrefix(keys.SendKey),
+		recvNoncePrefix: deriveNoncePrefix(keys.RecvKey),
+		sendBuf:         make([]byte, 0, 2048),
+		recvBuf:         make([]byte, 0, 2048),
 	}, nil
+}
+
+// deriveNoncePrefix выводит 4-байтный nonce prefix из ключа.
+// Обе стороны вычисляют одинаковый prefix из одного ключа.
+func deriveNoncePrefix(key []byte) [4]byte {
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte("nova-nonce-prefix"))
+	sum := mac.Sum(nil)
+	var prefix [4]byte
+	copy(prefix[:], sum[:4])
+	return prefix
 }
 
 // Encrypt шифрует plaintext и возвращает nonce + ciphertext + auth tag.
@@ -140,23 +149,60 @@ func (s *ChaCha20Session) DecryptWithNonce(nonce []byte, ciphertext []byte, addi
 	return plaintext, nil
 }
 
-// EncryptInto шифрует plaintext прямо в dst буфер (nonce + ciphertext + tag).
-// Zero-copy, counter-nonce (без сисколлов crypto/rand).
+// EncryptInto шифрует plaintext прямо в dst буфер (counter(4) + ciphertext).
+// Plain ChaCha20 (XOR) без Poly1305 — нет auth tag.
 func (s *ChaCha20Session) EncryptInto(dst []byte, plaintext []byte, additionalData []byte) (int, error) {
-	totalLen := NonceSize + len(plaintext) + AuthTagSize
+	// counter(4) + ciphertext (same size as plaintext, no tag)
+	totalLen := 4 + len(plaintext)
 	if len(dst) < totalLen {
 		return 0, fmt.Errorf("dst too small: %d < %d", len(dst), totalLen)
 	}
 
-	// Counter-nonce: prefix(4) + counter(8) = 12 байт
 	ctr := s.sendCounter.Add(1)
-	copy(dst[0:4], s.noncePrefix[:])
-	binary.BigEndian.PutUint64(dst[4:12], ctr)
 
-	// Seal прямо в dst после nonce
-	s.sendAEAD.Seal(dst[NonceSize:NonceSize], dst[:NonceSize], plaintext, additionalData)
+	// Полный nonce (prefix + counter)
+	var nonce [NonceSize]byte
+	copy(nonce[0:4], s.noncePrefix[:])
+	binary.BigEndian.PutUint64(nonce[4:12], ctr)
+
+	// На wire только counter (4 байта)
+	binary.BigEndian.PutUint32(dst[0:4], uint32(ctr))
+
+	// Plain ChaCha20 XOR
+	cipher, err := chacha20.NewUnauthenticatedCipher(s.keys.SendKey, nonce[:])
+	if err != nil {
+		return 0, fmt.Errorf("chacha20 init: %w", err)
+	}
+	cipher.XORKeyStream(dst[4:4+len(plaintext)], plaintext)
 
 	return totalLen, nil
+}
+
+// DecryptWithCounter дешифрует ciphertext с plain ChaCha20 (XOR).
+// Nonce = recvNoncePrefix(4) + uint64(counter) big-endian(8).
+func (s *ChaCha20Session) DecryptWithCounter(counter uint32, ciphertext []byte, additionalData []byte) ([]byte, error) {
+	if len(ciphertext) == 0 {
+		return nil, fmt.Errorf("empty ciphertext")
+	}
+
+	var nonce [NonceSize]byte
+	copy(nonce[0:4], s.recvNoncePrefix[:])
+	binary.BigEndian.PutUint64(nonce[4:12], uint64(counter))
+
+	plaintextLen := len(ciphertext)
+	if cap(s.recvBuf) < plaintextLen {
+		s.recvBuf = make([]byte, plaintextLen)
+	} else {
+		s.recvBuf = s.recvBuf[:plaintextLen]
+	}
+
+	cipher, err := chacha20.NewUnauthenticatedCipher(s.keys.RecvKey, nonce[:])
+	if err != nil {
+		return nil, fmt.Errorf("chacha20 init: %w", err)
+	}
+	cipher.XORKeyStream(s.recvBuf, ciphertext)
+
+	return s.recvBuf, nil
 }
 
 // ComputeHMAC вычисляет HMAC для данных.
@@ -179,6 +225,11 @@ func (s *ChaCha20Session) Close() {
 		zeroBytes(s.keys.RecvKey)
 		zeroBytes(s.keys.HMACKey)
 	}
+}
+
+// GetKeys возвращает указатель на ключи сессии (для 0-RTT resume).
+func (s *ChaCha20Session) GetKeys() *crypto.SessionKeys {
+	return s.keys
 }
 
 // Curve25519KeyExchange реализует обмен ключами по Curve25519.

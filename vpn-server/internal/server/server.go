@@ -13,6 +13,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/crypto/chacha20"
+
 	"github.com/novavpn/vpn-server/config"
 	"github.com/novavpn/vpn-server/internal/auth"
 	"github.com/novavpn/vpn-server/internal/protocol"
@@ -219,8 +221,8 @@ func (s *VPNServer) udpReadLoop() {
 		if len(raw) >= protocol.TLSHeaderSize && raw[0] == protocol.TLSContentType {
 			raw = raw[protocol.TLSHeaderSize:]
 		}
-		// SessionID(4) + Type(1) + Nonce(12) = 17
-		if len(raw) < 17 {
+		// SessionID(4) + Type(1) = 5 минимум
+		if len(raw) < 5 {
 			continue
 		}
 
@@ -230,22 +232,37 @@ func (s *VPNServer) udpReadLoop() {
 		switch pktType {
 		case protocol.PacketData:
 			// Hot path: inline обработка без горутины и Unmarshal
+			// Data: SID(4) + Type(1) + Counter(4) + CT (plain ChaCha20, без auth tag)
+			if len(raw) < 9 {
+				continue
+			}
+
 			session := s.sessions.GetSessionByID(sessionID)
 			if session == nil || !session.IsActive() {
 				continue
 			}
 
-			nonce := raw[5:17]
-			payload := raw[17:]
+			counter := binary.BigEndian.Uint32(raw[5:9])
+			payload := raw[9:]
 
-			// Дешифровка через кешированный AEAD (zero-alloc)
-			plaintext, err := session.recvAEAD.Open(decryptBuf[:0], nonce, payload, nil)
+			// Восстанавливаем полный nonce
+			var nonce [protocol.NonceSize]byte
+			copy(nonce[:4], session.recvNoncePrefix[:])
+			binary.BigEndian.PutUint64(nonce[4:], uint64(counter))
+
+			// Plain ChaCha20 XOR дешифровка (zero-alloc)
+			plaintextLen := len(payload)
+			if cap(decryptBuf) < plaintextLen {
+				decryptBuf = make([]byte, plaintextLen)
+			} else {
+				decryptBuf = decryptBuf[:plaintextLen]
+			}
+			c, err := chacha20.NewUnauthenticatedCipher(session.Keys.RecvKey[:], nonce[:])
 			if err != nil {
-				if s.cfg.LogLevel == "debug" {
-					log.Printf("[DATA] Ошибка расшифровки от сессии #%d: %v", session.ID, err)
-				}
 				continue
 			}
+			c.XORKeyStream(decryptBuf, payload)
+			plaintext := decryptBuf
 
 			session.UpdateActivity()
 			session.BytesRecv.Add(uint64(len(plaintext)))
@@ -263,6 +280,11 @@ func (s *VPNServer) udpReadLoop() {
 				continue
 			}
 			session.UpdateActivity()
+			// Address migration: обновляем адрес клиента при смене IP/порта (0-RTT resume, NAT rebind)
+			if session.ClientAddr.String() != remoteAddr.String() {
+				log.Printf("[KEEPALIVE] Address migration #%d: %s -> %s", session.ID, session.ClientAddr, remoteAddr)
+				session.ClientAddr = remoteAddr
+			}
 			if s.cfg.LogLevel == "debug" {
 				log.Printf("[KEEPALIVE] Получен от сессии #%d", session.ID)
 			}
@@ -275,8 +297,10 @@ func (s *VPNServer) udpReadLoop() {
 			if session == nil {
 				continue
 			}
-			log.Printf("[DISCONNECT] Клиент отключается: сессия #%d (%s)", session.ID, remoteAddr)
-			s.sessions.RemoveSession(session)
+			// НЕ удаляем сессию — держим для 0-RTT resume.
+			// Истечёт по таймауту (SessionTimeout) в maintenanceLoop.
+			session.UpdateActivity()
+			log.Printf("[DISCONNECT] Клиент отключается: сессия #%d (%s) — сохранена для 0-RTT resume", session.ID, remoteAddr)
 
 		case protocol.PacketHandshakeInit, protocol.PacketHandshakeComplete:
 			// Handshake требует сложной обработки — выносим в горутину
