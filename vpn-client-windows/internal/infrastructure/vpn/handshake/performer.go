@@ -188,9 +188,13 @@ func (p *Performer) receiveHandshakeResp(clientPrivKey []byte) (*Result, error) 
 	}
 	defer session.Close()
 
-	// Расшифровываем остальную часть payload (nonce + encrypted data)
+	// Расшифровываем остальную часть payload
+	// Nonce находится в заголовке пакета, а не в payload — нужно подставить его
 	encryptedResp := respPkt.Payload[32:]
-	respPlaintext, err := session.Decrypt(encryptedResp, nil)
+	decryptData := make([]byte, protocol.NonceSize+len(encryptedResp))
+	copy(decryptData[:protocol.NonceSize], respPkt.Nonce[:])
+	copy(decryptData[protocol.NonceSize:], encryptedResp)
+	respPlaintext, err := session.Decrypt(decryptData, nil)
 	if err != nil {
 		return nil, fmt.Errorf("decrypt HandshakeResp: %w", err)
 	}

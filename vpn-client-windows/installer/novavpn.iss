@@ -50,9 +50,9 @@ Name: "autostart"; Description: "Запускать NovaVPN при входе в
 
 [Files]
 ; Основные файлы
-Source: "..\dist\NovaVPN.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\dist\novavpn-service.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\wintun.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\dist\NovaVPN\NovaVPN.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\dist\NovaVPN\novavpn-service.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\dist\NovaVPN\wintun.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\assets\logo.ico"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]

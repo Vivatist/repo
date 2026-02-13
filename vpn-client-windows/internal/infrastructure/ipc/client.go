@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/Microsoft/go-winio"
@@ -26,6 +27,7 @@ const (
 // NamedPipeClient реализует IPC-клиент через Named Pipe.
 type NamedPipeClient struct {
 	conn net.Conn
+	mu   sync.Mutex
 }
 
 // NewNamedPipeClient создаёт новый IPC-клиент.
@@ -33,8 +35,8 @@ func NewNamedPipeClient() domainipc.Client {
 	return &NamedPipeClient{}
 }
 
-// Connect подключается к Named Pipe.
-func (c *NamedPipeClient) connect() error {
+// connectLocked подключается к Named Pipe (вызывать под мьютексом).
+func (c *NamedPipeClient) connectLocked() error {
 	if c.conn != nil {
 		return nil // уже подключены
 	}
@@ -51,7 +53,10 @@ func (c *NamedPipeClient) connect() error {
 
 // Connect отправляет запрос на подключение к VPN.
 func (c *NamedPipeClient) Connect(req domainipc.ConnectRequest) error {
-	if err := c.connect(); err != nil {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if err := c.connectLocked(); err != nil {
 		return err
 	}
 
@@ -65,8 +70,9 @@ func (c *NamedPipeClient) Connect(req domainipc.ConnectRequest) error {
 		},
 	}
 
-	resp, err := c.sendRequest(request)
+	resp, err := c.sendRequestLocked(request)
 	if err != nil {
+		c.closeLocked()
 		return fmt.Errorf("send request: %w", err)
 	}
 
@@ -79,7 +85,10 @@ func (c *NamedPipeClient) Connect(req domainipc.ConnectRequest) error {
 
 // Disconnect отправляет запрос на отключение.
 func (c *NamedPipeClient) Disconnect() error {
-	if err := c.connect(); err != nil {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if err := c.connectLocked(); err != nil {
 		return err
 	}
 
@@ -87,8 +96,9 @@ func (c *NamedPipeClient) Disconnect() error {
 		"type": "disconnect",
 	}
 
-	resp, err := c.sendRequest(request)
+	resp, err := c.sendRequestLocked(request)
 	if err != nil {
+		c.closeLocked()
 		return fmt.Errorf("send request: %w", err)
 	}
 
@@ -101,7 +111,10 @@ func (c *NamedPipeClient) Disconnect() error {
 
 // GetStatus запрашивает текущий статус.
 func (c *NamedPipeClient) GetStatus() (*domainipc.StatusResponse, error) {
-	if err := c.connect(); err != nil {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if err := c.connectLocked(); err != nil {
 		return nil, err
 	}
 
@@ -109,8 +122,9 @@ func (c *NamedPipeClient) GetStatus() (*domainipc.StatusResponse, error) {
 		"type": "get_status",
 	}
 
-	resp, err := c.sendRequest(request)
+	resp, err := c.sendRequestLocked(request)
 	if err != nil {
+		c.closeLocked()
 		return nil, fmt.Errorf("send request: %w", err)
 	}
 
@@ -149,14 +163,23 @@ func (c *NamedPipeClient) GetStatus() (*domainipc.StatusResponse, error) {
 
 // Close закрывает соединение.
 func (c *NamedPipeClient) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closeLocked()
+}
+
+// closeLocked закрывает соединение (вызывать под мьютексом).
+func (c *NamedPipeClient) closeLocked() error {
 	if c.conn != nil {
-		return c.conn.Close()
+		err := c.conn.Close()
+		c.conn = nil
+		return err
 	}
 	return nil
 }
 
-// sendRequest отправляет запрос и получает ответ.
-func (c *NamedPipeClient) sendRequest(request map[string]interface{}) (map[string]interface{}, error) {
+// sendRequestLocked отправляет запрос и получает ответ (вызывать под мьютексом).
+func (c *NamedPipeClient) sendRequestLocked(request map[string]interface{}) (map[string]interface{}, error) {
 	// Сериализуем запрос
 	data, err := json.Marshal(request)
 	if err != nil {
