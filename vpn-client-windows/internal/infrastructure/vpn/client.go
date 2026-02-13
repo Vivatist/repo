@@ -62,12 +62,13 @@ type NovaVPNClient struct {
 	onPSK    domainvpn.PSKCallback
 
 	// 0-RTT resume data
-	resumeSessionID  uint32
-	resumeKeys       *domaincrypto.SessionKeys
-	resumeIP         net.IP
-	resumeDNS        []net.IP
-	resumeMTU        uint16
-	resumeSubnetMask uint8
+	resumeSessionID   uint32
+	resumeKeys        *domaincrypto.SessionKeys
+	resumeSendCounter uint64
+	resumeIP          net.IP
+	resumeDNS         []net.IP
+	resumeMTU         uint16
+	resumeSubnetMask  uint8
 }
 
 // NewNovaVPNClient создаёт новый VPN-клиент.
@@ -238,10 +239,23 @@ func (c *NovaVPNClient) Disconnect() error {
 	if c.session != nil && c.sessionID != 0 {
 		c.resumeSessionID = c.sessionID
 		c.resumeKeys = copySessionKeys(c.session)
+		c.resumeSendCounter = getSendCounter(c.session)
 		c.resumeIP = c.assignedIP
 		c.resumeDNS = c.dns
 		c.resumeMTU = c.mtu
 		c.resumeSubnetMask = c.subnetMask
+	}
+
+	// Уведомляем сервер об отключении (lightweight, без аллокаций)
+	if c.conn != nil && c.sessionID != 0 {
+		var disconnBuf [10]byte
+		disconnBuf[0] = protocol.TLSContentType
+		disconnBuf[1] = protocol.TLSVersionMajor
+		disconnBuf[2] = protocol.TLSVersionMinor
+		binary.BigEndian.PutUint16(disconnBuf[3:5], 5)
+		binary.BigEndian.PutUint32(disconnBuf[5:9], c.sessionID)
+		disconnBuf[9] = byte(protocol.PacketDisconnect)
+		c.conn.Write(disconnBuf[:])
 	}
 
 	// Сначала ставим флаг остановки, затем cancel
@@ -483,15 +497,21 @@ func (c *NovaVPNClient) keepaliveLoop() {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 
+	// Lightweight keepalive: TLS(5) + SID(4) + Type(1) = 10 bytes, zero-alloc
+	var kaBuf [10]byte
+	kaBuf[0] = protocol.TLSContentType
+	kaBuf[1] = protocol.TLSVersionMajor
+	kaBuf[2] = protocol.TLSVersionMinor
+	binary.BigEndian.PutUint16(kaBuf[3:5], 5)
+	binary.BigEndian.PutUint32(kaBuf[5:9], c.sessionID)
+	kaBuf[9] = byte(protocol.PacketKeepalive)
+
 	for {
 		select {
 		case <-c.ctx.Done():
 			return
 		case <-ticker.C:
-			seq := c.sendSeq.Add(1)
-			pkt := protocol.NewPacket(protocol.PacketKeepalive, c.sessionID, seq, [protocol.NonceSize]byte{}, nil)
-			pktBytes, _ := pkt.Marshal()
-			c.conn.Write(pktBytes)
+			c.conn.Write(kaBuf[:])
 		}
 	}
 }
@@ -500,10 +520,15 @@ func (c *NovaVPNClient) keepaliveLoop() {
 func (c *NovaVPNClient) tryResume() bool {
 	log.Printf("[VPN] 0-RTT resume: пробуем сессию #%d", c.resumeSessionID)
 
-	// Отправляем keepalive со старым sessionID
-	pkt := protocol.NewPacket(protocol.PacketKeepalive, c.resumeSessionID, 1, [protocol.NonceSize]byte{}, nil)
-	pktBytes, _ := pkt.Marshal()
-	if _, err := c.conn.Write(pktBytes); err != nil {
+	// Lightweight keepalive probe: TLS(5) + SID(4) + Type(1) = 10 bytes
+	var kaBuf [10]byte
+	kaBuf[0] = protocol.TLSContentType
+	kaBuf[1] = protocol.TLSVersionMajor
+	kaBuf[2] = protocol.TLSVersionMinor
+	binary.BigEndian.PutUint16(kaBuf[3:5], 5)
+	binary.BigEndian.PutUint32(kaBuf[5:9], c.resumeSessionID)
+	kaBuf[9] = byte(protocol.PacketKeepalive)
+	if _, err := c.conn.Write(kaBuf[:]); err != nil {
 		log.Printf("[VPN] 0-RTT resume: ошибка отправки keepalive: %v", err)
 		return false
 	}
@@ -535,6 +560,9 @@ func (c *NovaVPNClient) tryResume() bool {
 		return false
 	}
 
+	// Восстанавливаем счётчик, чтобы избежать повторного использования nonce
+	session.SetSendCounter(c.resumeSendCounter)
+
 	c.sessionID = c.resumeSessionID
 	c.session = session
 	c.assignedIP = c.resumeIP
@@ -551,6 +579,7 @@ func (c *NovaVPNClient) tryResume() bool {
 func (c *NovaVPNClient) clearResumeData() {
 	c.resumeSessionID = 0
 	c.resumeKeys = nil
+	c.resumeSendCounter = 0
 	c.resumeIP = nil
 	c.resumeDNS = nil
 	c.resumeMTU = 0
@@ -560,7 +589,9 @@ func (c *NovaVPNClient) clearResumeData() {
 // copySessionKeys создаёт копию ключей сессии для 0-RTT resume.
 func copySessionKeys(session domaincrypto.Session) *domaincrypto.SessionKeys {
 	// Получаем ключи через интерфейс KeysProvider
-	if kp, ok := session.(interface{ GetKeys() *domaincrypto.SessionKeys }); ok {
+	if kp, ok := session.(interface {
+		GetKeys() *domaincrypto.SessionKeys
+	}); ok {
 		orig := kp.GetKeys()
 		return &domaincrypto.SessionKeys{
 			SendKey: append([]byte{}, orig.SendKey...),
@@ -569,4 +600,12 @@ func copySessionKeys(session domaincrypto.Session) *domaincrypto.SessionKeys {
 		}
 	}
 	return nil
+}
+
+// getSendCounter получает текущее значение sendCounter сессии (для 0-RTT resume).
+func getSendCounter(session domaincrypto.Session) uint64 {
+	if sc, ok := session.(interface{ GetSendCounter() uint64 }); ok {
+		return sc.GetSendCounter()
+	}
+	return 0
 }

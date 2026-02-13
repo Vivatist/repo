@@ -372,13 +372,19 @@ func (s *VPNServer) sendToClient(session *Session, plaintext []byte, buf []byte)
 }
 
 // sendKeepalives отправляет keepalive всем активным клиентам.
+// Lightweight формат: TLS(5) + SID(4) + Type(1) = 10 bytes, zero-alloc.
 func (s *VPNServer) sendKeepalives() {
 	sessions := s.sessions.GetAllSessions()
+	var kaBuf [10]byte
+	kaBuf[0] = protocol.TLSContentType
+	kaBuf[1] = protocol.TLSVersionMajor
+	kaBuf[2] = protocol.TLSVersionMinor
+	binary.BigEndian.PutUint16(kaBuf[3:5], 5)
+	kaBuf[9] = byte(protocol.PacketKeepalive)
 	for _, session := range sessions {
 		if session.IsActive() {
-			pkt := protocol.NewKeepalivePacket(session.ID, session.NextSendSeq())
-			data, _ := pkt.Marshal()
-			s.udpConn.WriteToUDP(data, session.ClientAddr)
+			binary.BigEndian.PutUint32(kaBuf[5:9], session.ID)
+			s.udpConn.WriteToUDP(kaBuf[:], session.ClientAddr)
 		}
 	}
 }

@@ -88,11 +88,13 @@ func (p *Performer) sendHandshakeInit(clientPubKey []byte) error {
 	// Шифруем credentials PSK-ключом
 	credsPlaintext := protocol.MarshalCredentials(p.email, p.password)
 
-	// Создаём временную сессию для шифрования
+	// Создаём временную сессию для шифрования (копируем PSK, чтобы Close() не занулил оригинал)
+	pskCopy := make([]byte, len(p.psk))
+	copy(pskCopy, p.psk)
 	tempKeys := &domaincrypto.SessionKeys{
-		SendKey: p.psk,
-		RecvKey: p.psk,
-		HMACKey: p.psk,
+		SendKey: pskCopy,
+		RecvKey: pskCopy,
+		HMACKey: pskCopy,
 	}
 	tempSession, err := infracrypto.NewChaCha20Session(tempKeys)
 	if err != nil {

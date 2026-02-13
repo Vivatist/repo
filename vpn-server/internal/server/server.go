@@ -212,7 +212,7 @@ func (s *VPNServer) udpReadLoop() {
 			}
 		}
 
-		if n < protocol.HeaderSize {
+		if n < protocol.MinPacketSize {
 			continue
 		}
 
@@ -283,14 +283,20 @@ func (s *VPNServer) udpReadLoop() {
 			// Address migration: обновляем адрес клиента при смене IP/порта (0-RTT resume, NAT rebind)
 			if session.ClientAddr.String() != remoteAddr.String() {
 				log.Printf("[KEEPALIVE] Address migration #%d: %s -> %s", session.ID, session.ClientAddr, remoteAddr)
-				session.ClientAddr = remoteAddr
+				s.sessions.UpdateClientAddr(session, remoteAddr)
 			}
 			if s.cfg.LogLevel == "debug" {
 				log.Printf("[KEEPALIVE] Получен от сессии #%d", session.ID)
 			}
-			respPkt := protocol.NewKeepalivePacket(session.ID, session.NextSendSeq())
-			respBytes, _ := respPkt.Marshal()
-			s.udpConn.WriteToUDP(respBytes, remoteAddr)
+			// Lightweight keepalive response: TLS(5) + SID(4) + Type(1) = 10 bytes, zero-alloc
+			var kaBuf [10]byte
+			kaBuf[0] = protocol.TLSContentType
+			kaBuf[1] = protocol.TLSVersionMajor
+			kaBuf[2] = protocol.TLSVersionMinor
+			binary.BigEndian.PutUint16(kaBuf[3:5], 5)
+			binary.BigEndian.PutUint32(kaBuf[5:9], session.ID)
+			kaBuf[9] = byte(protocol.PacketKeepalive)
+			s.udpConn.WriteToUDP(kaBuf[:], remoteAddr)
 
 		case protocol.PacketDisconnect:
 			session := s.sessions.GetSessionByID(sessionID)

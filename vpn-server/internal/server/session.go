@@ -186,7 +186,7 @@ func deriveNoncePrefix(key []byte) [4]byte {
 // Plain ChaCha20 (XOR) без Poly1305 — нет auth tag.
 // Формат: TLS_Header(5) + SessionID(4) + Type(1) + Counter(4) + Ciphertext
 func (s *Session) EncryptAndBuild(buf []byte, plaintext []byte) (int, error) {
-	ciphertextLen := len(plaintext) // без overhead: plain XOR
+	ciphertextLen := len(plaintext)      // без overhead: plain XOR
 	dataLen := 4 + 1 + 4 + ciphertextLen // SID + Type + Counter + CT
 	totalLen := protocol.TLSHeaderSize + dataLen
 
@@ -207,14 +207,15 @@ func (s *Session) EncryptAndBuild(buf []byte, plaintext []byte) (int, error) {
 	buf[9] = byte(protocol.PacketData)
 
 	ctr := s.sendCounter.Add(1)
+	wireCtr := uint32(ctr) // truncate to 32 bit — nonce и wire используют одно значение
 
-	// Полный nonce внутри
+	// Полный nonce: prefix(4) + truncated counter(8)
 	var nonce [protocol.NonceSize]byte
 	copy(nonce[0:4], s.noncePrefix[:])
-	binary.BigEndian.PutUint64(nonce[4:12], ctr)
+	binary.BigEndian.PutUint64(nonce[4:12], uint64(wireCtr))
 
-	// На wire только counter
-	binary.BigEndian.PutUint32(buf[10:14], uint32(ctr))
+	// На wire только counter (4 байта)
+	binary.BigEndian.PutUint32(buf[10:14], wireCtr)
 
 	// Plain ChaCha20 XOR прямо в buf[14:]
 	c, err := chacha20.NewUnauthenticatedCipher(s.Keys.SendKey[:], nonce[:])
@@ -382,6 +383,22 @@ func (sm *SessionManager) removeSessionLocked(session *Session) {
 		session.BytesSent.Load(),
 		session.BytesRecv.Load(),
 	)
+}
+
+// UpdateClientAddr обновляет UDP-адрес клиента при address migration.
+// Исправляет addrToSession mapping, предотвращая stale entries.
+func (sm *SessionManager) UpdateClientAddr(session *Session, newAddr *net.UDPAddr) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	// Удаляем старый адрес из маппинга
+	if session.ClientAddr != nil {
+		delete(sm.addrToSession, session.ClientAddr.String())
+	}
+
+	// Обновляем адрес и маппинг
+	session.ClientAddr = newAddr
+	sm.addrToSession[newAddr.String()] = session
 }
 
 // CleanupExpired удаляет истёкшие сессии. Вызывается периодически.

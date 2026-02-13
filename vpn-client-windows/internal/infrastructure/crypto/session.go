@@ -159,14 +159,15 @@ func (s *ChaCha20Session) EncryptInto(dst []byte, plaintext []byte, additionalDa
 	}
 
 	ctr := s.sendCounter.Add(1)
+	wireCtr := uint32(ctr) // truncate to 32 bit — nonce и wire используют одно значение
 
-	// Полный nonce (prefix + counter)
+	// Полный nonce (prefix + truncated counter)
 	var nonce [NonceSize]byte
 	copy(nonce[0:4], s.noncePrefix[:])
-	binary.BigEndian.PutUint64(nonce[4:12], ctr)
+	binary.BigEndian.PutUint64(nonce[4:12], uint64(wireCtr))
 
 	// На wire только counter (4 байта)
-	binary.BigEndian.PutUint32(dst[0:4], uint32(ctr))
+	binary.BigEndian.PutUint32(dst[0:4], wireCtr)
 
 	// Plain ChaCha20 XOR
 	cipher, err := chacha20.NewUnauthenticatedCipher(s.keys.SendKey, nonce[:])
@@ -230,6 +231,16 @@ func (s *ChaCha20Session) Close() {
 // GetKeys возвращает указатель на ключи сессии (для 0-RTT resume).
 func (s *ChaCha20Session) GetKeys() *crypto.SessionKeys {
 	return s.keys
+}
+
+// GetSendCounter возвращает текущее значение счётчика отправки (для 0-RTT resume).
+func (s *ChaCha20Session) GetSendCounter() uint64 {
+	return s.sendCounter.Load()
+}
+
+// SetSendCounter устанавливает значение счётчика отправки (при 0-RTT resume).
+func (s *ChaCha20Session) SetSendCounter(val uint64) {
+	s.sendCounter.Store(val)
 }
 
 // Curve25519KeyExchange реализует обмен ключами по Curve25519.
