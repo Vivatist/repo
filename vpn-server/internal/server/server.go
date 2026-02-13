@@ -461,6 +461,7 @@ func (s *VPNServer) Wait() {
 
 // notifyShutdown отправляет PacketDisconnect всем активным клиентам.
 // Вызывается перед остановкой сервера, чтобы клиенты сразу начали переподключение.
+// Метод вызывается в начале Stop(), до закрытия udpConn — race condition исключён.
 func (s *VPNServer) notifyShutdown() {
 	if s.udpConn == nil {
 		return
@@ -476,8 +477,11 @@ func (s *VPNServer) notifyShutdown() {
 	for _, session := range sessions {
 		if session.IsActive() {
 			binary.BigEndian.PutUint32(buf[5:9], session.ID)
-			s.udpConn.WriteToUDP(buf[:], session.ClientAddr)
-			count++
+			if _, err := s.udpConn.WriteToUDP(buf[:], session.ClientAddr); err != nil {
+				log.Printf("[SERVER] Ошибка отправки disconnect сессии #%d: %v", session.ID, err)
+			} else {
+				count++
+			}
 		}
 	}
 	if count > 0 {
