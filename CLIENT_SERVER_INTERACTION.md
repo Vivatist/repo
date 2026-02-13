@@ -553,7 +553,7 @@ Data-пакеты используют **counter-nonce** вместо случа
 nonce_prefix = HMAC-SHA256(sendKey, "nova-nonce-prefix")[:4]   // 4 байта
 counter      = atomic_increment()                               // uint64
 wire_counter = uint32(counter)                                  // на wire: 4 байта
-nonce        = nonce_prefix(4) + BigEndian_uint64(wire_counter)(8) = 12 байт
+nonce        = nonce_prefix [4 байта] + BigEndian_uint64(wire_counter) [8 байт] = 12 байт
 ```
 
 ### 10.2. Отправка (шифрование)
@@ -783,6 +783,6 @@ HKDF-SHA256(
 1. **SessionID и PacketType открыты** (не зашифрованы) — необходимы для маршрутизации на сервере
 2. **Data-пакеты без аутентификации** — plain ChaCha20 XOR без Poly1305 (trade-off: производительность)
 3. **Сервер молчит при неверном HMAC** — не отправляет ошибку (анти-сканирование)
-4. **Counter wrap-around** — uint32 на wire (~4 млрд пакетов, ~12 часов при 100k pkt/s)
+4. **Counter wrap-around** — uint32 на wire (~4.3 млрд пакетов, ~11 часов при 100k pkt/s)
 5. **0-RTT resume ключи в памяти** — не защищены дополнительно
 6. **UDP без гарантии доставки** — потеря handshake-пакетов обрабатывается таймаутами на клиенте
