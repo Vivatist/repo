@@ -30,23 +30,23 @@ type Result struct {
 
 // Performer выполняет рукопожатие с сервером.
 type Performer struct {
-	conn       *net.UDPConn
-	keyEx      domaincrypto.KeyExchange
-	psk        []byte
-	email      string
-	password   string
-	onNewPSK   func(pskHex string)
+	conn     *net.UDPConn
+	keyEx    domaincrypto.KeyExchange
+	psk      []byte
+	email    string
+	password string
+	onNewPSK func(pskHex string)
 }
 
 // NewPerformer создаёт новый объект для выполнения рукопожатия.
 func NewPerformer(conn *net.UDPConn, psk []byte, email, password string, onNewPSK func(string)) *Performer {
 	return &Performer{
-		conn:      conn,
-		keyEx:     infracrypto.NewCurve25519KeyExchange(),
-		psk:       psk,
-		email:     email,
-		password:  password,
-		onNewPSK:  onNewPSK,
+		conn:     conn,
+		keyEx:    infracrypto.NewCurve25519KeyExchange(),
+		psk:      psk,
+		email:    email,
+		password: password,
+		onNewPSK: onNewPSK,
 	}
 }
 
@@ -85,7 +85,7 @@ func (p *Performer) Perform(timeout time.Duration) (*Result, error) {
 func (p *Performer) sendHandshakeInit(clientPubKey []byte) error {
 	// Шифруем credentials PSK-ключом
 	credsPlaintext := protocol.MarshalCredentials(p.email, p.password)
-	
+
 	// Создаём временную сессию для шифрования
 	tempKeys := &domaincrypto.SessionKeys{
 		SendKey: p.psk,
@@ -127,7 +127,7 @@ func (p *Performer) sendHandshakeInit(clientPubKey []byte) error {
 
 	initPayload := protocol.MarshalHandshakeInit(hsInit)
 	pkt := protocol.NewPacket(protocol.PacketHandshakeInit, 0, 0, [protocol.NonceSize]byte{}, initPayload)
-	
+
 	pktBytes, err := pkt.Marshal()
 	if err != nil {
 		return fmt.Errorf("marshal packet: %w", err)
@@ -182,11 +182,12 @@ func (p *Performer) receiveHandshakeResp(clientPrivKey []byte) (*Result, error) 
 	}
 
 	// Создаём сессию для дешифрования
+	// НЕ вызываем defer session.Close() — он зануляет ключи,
+	// а sessionKeys будет использоваться далее (HandshakeComplete + основная сессия)
 	session, err := infracrypto.NewChaCha20Session(sessionKeys)
 	if err != nil {
 		return nil, fmt.Errorf("create session: %w", err)
 	}
-	defer session.Close()
 
 	// Расшифровываем остальную часть payload
 	// Nonce находится в заголовке пакета, а не в payload — нужно подставить его
@@ -232,11 +233,12 @@ func (p *Performer) receiveHandshakeResp(clientPrivKey []byte) (*Result, error) 
 // sendHandshakeComplete отправляет HandshakeComplete пакет.
 func (p *Performer) sendHandshakeComplete(result *Result) error {
 	// Создаём сессию
+	// НЕ вызываем defer session.Close() — он зануляет result.Keys,
+	// которые нужны для основной VPN-сессии после рукопожатия
 	session, err := infracrypto.NewChaCha20Session(result.Keys)
 	if err != nil {
 		return fmt.Errorf("create session: %w", err)
 	}
-	defer session.Close()
 
 	confirmData := []byte(fmt.Sprintf("novavpn-confirm-%d", result.SessionID))
 	confirmHMAC := session.ComputeHMAC(confirmData)

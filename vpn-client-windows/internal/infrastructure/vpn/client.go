@@ -331,8 +331,11 @@ func (c *NovaVPNClient) handleUDPPacket(data []byte) {
 
 	switch pkt.Header.Type {
 	case protocol.PacketData:
-		// Расшифровываем и записываем в TUN
-		plaintext, err := c.session.Decrypt(pkt.Payload, nil)
+		// Собираем nonce из заголовка + ciphertext из payload для session.Decrypt
+		decryptData := make([]byte, protocol.NonceSize+len(pkt.Payload))
+		copy(decryptData[:protocol.NonceSize], pkt.Nonce[:])
+		copy(decryptData[protocol.NonceSize:], pkt.Payload)
+		plaintext, err := c.session.Decrypt(decryptData, nil)
 		if err != nil {
 			log.Printf("[VPN] Decrypt error: %v", err)
 			return

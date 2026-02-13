@@ -189,7 +189,7 @@ func (c *NamedPipeClient) sendRequestLocked(request map[string]interface{}) (map
 	// Отправляем (4 байта длины + данные)
 	lenBuf := make([]byte, 4)
 	binary.LittleEndian.PutUint32(lenBuf, uint32(len(data)))
-	
+
 	if _, err := c.conn.Write(lenBuf); err != nil {
 		return nil, fmt.Errorf("write length: %w", err)
 	}
