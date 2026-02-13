@@ -2,7 +2,7 @@
 ; Для сборки: iscc.exe novavpn.iss
 
 #define MyAppName "NovaVPN"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "2.0.0"
 #define MyAppPublisher "NovaVPN"
 #define MyAppURL "https://novavpn.app"
 #define MyAppExeName "NovaVPN.exe"
