@@ -35,7 +35,7 @@ type NovaVPNClient struct {
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
 
-	// Соединение
+	// Soединение
 	conn       *net.UDPConn
 	serverAddr *net.UDPAddr
 
@@ -69,6 +69,12 @@ type NovaVPNClient struct {
 	resumeDNS         []net.IP
 	resumeMTU         uint16
 	resumeSubnetMask  uint8
+
+	// Auto-reconnect: сохранённые параметры подключения
+	connectParams domainvpn.ConnectParams
+	pskBytes      []byte       // декодированный PSK
+	reconnecting  atomic.Bool  // флаг: идёт переподключение
+	stopCh        chan struct{} // закрывается при Disconnect
 }
 
 // NewNovaVPNClient создаёт новый VPN-клиент.
@@ -97,6 +103,10 @@ func (c *NovaVPNClient) Connect(params domainvpn.ConnectParams) error {
 
 	c.setState(domainvpn.StateConnecting)
 
+	// Сохраняем параметры для auto-reconnect
+	c.connectParams = params
+	c.stopCh = make(chan struct{})
+
 	// Декодируем PSK
 	var psk []byte
 	if params.PSK != "" {
@@ -111,6 +121,7 @@ func (c *NovaVPNClient) Connect(params domainvpn.ConnectParams) error {
 		psk = make([]byte, domaincrypto.KeySize)
 		log.Println("[VPN] Bootstrap mode (no PSK)")
 	}
+	c.pskBytes = append([]byte{}, psk...) // сохраняем для reconnect
 
 	// Резолвим адрес сервера
 	serverAddr, err := net.ResolveUDPAddr("udp4", params.ServerAddr)
@@ -226,14 +237,31 @@ func (c *NovaVPNClient) Connect(params domainvpn.ConnectParams) error {
 // Disconnect отключается от VPN-сервера.
 func (c *NovaVPNClient) Disconnect() error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 
-	if c.GetState() != domainvpn.StateConnected {
+	if c.GetState() != domainvpn.StateConnected && c.GetState() != domainvpn.StateConnecting {
+		c.mu.Unlock()
 		return fmt.Errorf("not connected")
 	}
 
 	c.setState(domainvpn.StateDisconnecting)
+	c.stopped.Store(true)
 	log.Println("[VPN] Отключение...")
+
+	// Сигнализируем остановку через канал (для keepaliveLoop и reconnect)
+	select {
+	case <-c.stopCh:
+		// уже закрыт
+	default:
+		close(c.stopCh)
+	}
+
+	// Ждём завершения reconnect если в процессе
+	c.mu.Unlock()
+	for c.reconnecting.Load() {
+		time.Sleep(50 * time.Millisecond)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	// Сохраняем данные для 0-RTT resume ДО очистки сессии
 	if c.session != nil && c.sessionID != 0 {
@@ -258,9 +286,6 @@ func (c *NovaVPNClient) Disconnect() error {
 		c.conn.Write(disconnBuf[:])
 	}
 
-	// Сначала ставим флаг остановки, затем cancel
-	c.stopped.Store(true)
-
 	// Останавливаем циклы
 	if c.cancel != nil {
 		c.cancel()
@@ -269,6 +294,11 @@ func (c *NovaVPNClient) Disconnect() error {
 	// Закрываем соединение ДО wg.Wait — разблокирует Read() в udpReadLoop
 	if c.conn != nil {
 		c.conn.Close()
+	}
+
+	// Закрываем TUN — разблокирует Read() в tunReadLoop
+	if c.tunnelDevice != nil {
+		c.tunnelDevice.Close()
 	}
 
 	c.wg.Wait()
@@ -374,6 +404,9 @@ func (c *NovaVPNClient) udpReadLoop() {
 				return
 			}
 			log.Printf("[VPN] UDP read error: %v", err)
+			// Соединение потеряно — запускаем auto-reconnect
+			c.wg.Add(1)
+			go c.reconnect()
 			return
 		}
 
@@ -446,12 +479,26 @@ func (c *NovaVPNClient) tunReadLoop() {
 
 		n, err := c.tunnelDevice.Read(tunBuf)
 		if err != nil {
+			if c.stopped.Load() {
+				return
+			}
 			log.Printf("[VPN] TUN read error: %v", err)
 			return
 		}
 
+		// Пропускаем отправку во время переподключения
+		if c.reconnecting.Load() {
+			continue
+		}
+
+		conn := c.conn
+		session := c.session
+		if conn == nil || session == nil {
+			continue
+		}
+
 		// EncryptInto: nonce + ciphertext прямо в sendBuf[10:]
-		encLen, err := c.session.EncryptInto(sendBuf[10:], tunBuf[:n], nil)
+		encLen, err := session.EncryptInto(sendBuf[10:], tunBuf[:n], nil)
 		if err != nil {
 			log.Printf("[VPN] Encrypt error: %v", err)
 			continue
@@ -460,6 +507,7 @@ func (c *NovaVPNClient) tunReadLoop() {
 		// Собираем пакет inline без аллокаций
 		// Формат: TLS_Header(5) + SessionID(4) + Type(1) + Counter(4) + Ciphertext + Tag
 		dataLen := 4 + 1 + encLen
+		sessionID := c.sessionID
 
 		// TLS Record Header
 		sendBuf[0] = protocol.TLSContentType
@@ -469,10 +517,10 @@ func (c *NovaVPNClient) tunReadLoop() {
 		sendBuf[4] = byte(dataLen)
 
 		// SessionID
-		sendBuf[5] = byte(c.sessionID >> 24)
-		sendBuf[6] = byte(c.sessionID >> 16)
-		sendBuf[7] = byte(c.sessionID >> 8)
-		sendBuf[8] = byte(c.sessionID)
+		sendBuf[5] = byte(sessionID >> 24)
+		sendBuf[6] = byte(sessionID >> 16)
+		sendBuf[7] = byte(sessionID >> 8)
+		sendBuf[8] = byte(sessionID)
 
 		// Type
 		sendBuf[9] = byte(protocol.PacketData)
@@ -481,9 +529,13 @@ func (c *NovaVPNClient) tunReadLoop() {
 
 		totalLen := protocol.TLSHeaderSize + dataLen
 
-		if _, err := c.conn.Write(sendBuf[:totalLen]); err != nil {
+		if _, err := conn.Write(sendBuf[:totalLen]); err != nil {
+			if c.stopped.Load() {
+				return
+			}
+			// Не выходим при ошибке записи — reconnect восстановит соединение
 			log.Printf("[VPN] UDP write error: %v", err)
-			return
+			continue
 		}
 
 		c.packetsSent.Add(1)
@@ -497,21 +549,29 @@ func (c *NovaVPNClient) keepaliveLoop() {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 
-	// Lightweight keepalive: TLS(5) + SID(4) + Type(1) = 10 bytes, zero-alloc
-	var kaBuf [10]byte
-	kaBuf[0] = protocol.TLSContentType
-	kaBuf[1] = protocol.TLSVersionMajor
-	kaBuf[2] = protocol.TLSVersionMinor
-	binary.BigEndian.PutUint16(kaBuf[3:5], 5)
-	binary.BigEndian.PutUint32(kaBuf[5:9], c.sessionID)
-	kaBuf[9] = byte(protocol.PacketKeepalive)
-
 	for {
 		select {
 		case <-c.ctx.Done():
 			return
+		case <-c.stopCh:
+			return
 		case <-ticker.C:
-			c.conn.Write(kaBuf[:])
+			if c.reconnecting.Load() {
+				continue
+			}
+			conn := c.conn
+			if conn == nil {
+				continue
+			}
+			// Строим keepalive inline — sessionID может измениться после reconnect
+			var kaBuf [10]byte
+			kaBuf[0] = protocol.TLSContentType
+			kaBuf[1] = protocol.TLSVersionMajor
+			kaBuf[2] = protocol.TLSVersionMinor
+			binary.BigEndian.PutUint16(kaBuf[3:5], 5)
+			binary.BigEndian.PutUint32(kaBuf[5:9], c.sessionID)
+			kaBuf[9] = byte(protocol.PacketKeepalive)
+			conn.Write(kaBuf[:])
 		}
 	}
 }
@@ -573,6 +633,178 @@ func (c *NovaVPNClient) tryResume() bool {
 
 	log.Printf("[VPN] 0-RTT resume: сессия #%d восстановлена (VPN IP: %s)", c.sessionID, c.assignedIP)
 	return true
+}
+
+// reconnect выполняет автоматическое переподключение при потере соединения.
+// Вызывается из udpReadLoop когда Read() возвращает ошибку (ISP disconnect, NAT timeout).
+// Использует экспоненциальный backoff с попытками 0-RTT resume и полного handshake.
+func (c *NovaVPNClient) reconnect() {
+	defer c.wg.Done()
+
+	// Gate: предотвращаем параллельные reconnect
+	if !c.reconnecting.CompareAndSwap(false, true) {
+		return
+	}
+	defer c.reconnecting.Store(false)
+
+	// Проверяем что не был вызван Disconnect
+	if c.stopped.Load() {
+		return
+	}
+
+	c.setState(domainvpn.StateConnecting)
+	log.Println("[VPN] Соединение потеряно. Автоматическое переподключение...")
+
+	// Останавливаем keepaliveLoop
+	if c.cancel != nil {
+		c.cancel()
+	}
+
+	// Сохраняем данные для 0-RTT resume
+	if c.session != nil && c.sessionID != 0 {
+		c.resumeSessionID = c.sessionID
+		c.resumeKeys = copySessionKeys(c.session)
+		c.resumeSendCounter = getSendCounter(c.session)
+		c.resumeIP = c.assignedIP
+		c.resumeDNS = c.dns
+		c.resumeMTU = c.mtu
+		c.resumeSubnetMask = c.subnetMask
+		c.session.Close()
+		c.session = nil
+	}
+
+	// Закрываем старый conn
+	if c.conn != nil {
+		c.conn.Close()
+		c.conn = nil
+	}
+
+	maxRetries := 60
+	backoff := time.Second
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		if c.stopped.Load() {
+			c.setState(domainvpn.StateDisconnected)
+			return
+		}
+
+		log.Printf("[VPN] Попытка переподключения %d/%d (backoff: %v)", attempt, maxRetries, backoff)
+
+		// Ждём с проверкой stopCh
+		select {
+		case <-time.After(backoff):
+		case <-c.stopCh:
+			c.setState(domainvpn.StateDisconnected)
+			return
+		}
+
+		if c.stopped.Load() {
+			c.setState(domainvpn.StateDisconnected)
+			return
+		}
+
+		// Новый UDP-сокет
+		conn, err := net.DialUDP("udp4", nil, c.serverAddr)
+		if err != nil {
+			log.Printf("[VPN] Reconnect: ошибка UDP: %v", err)
+			backoff = minDuration(backoff*2, 30*time.Second)
+			continue
+		}
+		_ = conn.SetReadBuffer(4 * 1024 * 1024)
+		_ = conn.SetWriteBuffer(4 * 1024 * 1024)
+		c.conn = conn
+
+		if c.stopped.Load() {
+			conn.Close()
+			c.conn = nil
+			c.setState(domainvpn.StateDisconnected)
+			return
+		}
+
+		// Пробуем 0-RTT resume
+		resumed := false
+		if c.resumeSessionID != 0 && c.resumeKeys != nil {
+			resumed = c.tryResume()
+			if !resumed {
+				c.clearResumeData()
+			}
+		}
+
+		if !resumed {
+			// Полный handshake
+			psk := c.pskBytes
+			if psk == nil {
+				psk = make([]byte, domaincrypto.KeySize)
+			}
+
+			performer := handshake.NewPerformer(conn, psk, c.connectParams.Email, c.connectParams.Password, c.onPSK)
+			result, err := performer.Perform(5 * time.Second)
+			if err != nil {
+				log.Printf("[VPN] Reconnect: handshake failed: %v", err)
+				conn.Close()
+				c.conn = nil
+				backoff = minDuration(backoff*2, 30*time.Second)
+				continue
+			}
+
+			c.sessionID = result.SessionID
+			c.assignedIP = result.AssignedIP
+			c.mtu = result.MTU
+			c.subnetMask = result.SubnetMask
+			c.dns = []net.IP{result.DNS1, result.DNS2}
+
+			session, err := infracrypto.NewChaCha20Session(result.Keys)
+			if err != nil {
+				log.Printf("[VPN] Reconnect: ошибка создания сессии: %v", err)
+				conn.Close()
+				c.conn = nil
+				backoff = minDuration(backoff*2, 30*time.Second)
+				continue
+			}
+			c.session = session
+		}
+
+		if c.stopped.Load() {
+			if c.session != nil {
+				c.session.Close()
+				c.session = nil
+			}
+			conn.Close()
+			c.conn = nil
+			c.setState(domainvpn.StateDisconnected)
+			return
+		}
+
+		// Успех! Запускаем новые UDP + keepalive циклы
+		// (tunReadLoop продолжает работать — он не останавливался)
+		c.ctx, c.cancel = context.WithCancel(context.Background())
+		c.wg.Add(2)
+		go c.udpReadLoop()
+		go c.keepaliveLoop()
+
+		// Перенастраиваем сеть если IP изменился (полный handshake)
+		if !resumed {
+			if err := c.configureNetwork(); err != nil {
+				log.Printf("[VPN] Reconnect: ошибка настройки сети: %v (продолжаем)", err)
+			}
+		}
+
+		c.connectedAt = time.Now()
+		c.setState(domainvpn.StateConnected)
+		log.Printf("[VPN] Переподключено успешно (попытка %d)", attempt)
+		return
+	}
+
+	log.Println("[VPN] Все попытки переподключения исчерпаны")
+	c.setState(domainvpn.StateDisconnected)
+}
+
+// minDuration возвращает меньшую из двух длительностей.
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // clearResumeData очищает сохранённые данные для resume.

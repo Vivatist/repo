@@ -109,16 +109,13 @@ if s.client == nil {
 return fmt.Errorf("not connected")
 }
 
-// Отключаемся
+// Отключаемся (client.Disconnect закрывает TUN)
 if err := s.client.Disconnect(); err != nil {
 return err
 }
 
-// Очищаем TUN device
-if s.tunnelDevice != nil {
-s.tunnelDevice.Close()
+// TUN уже закрыт client.Disconnect(), обнуляем ссылку
 s.tunnelDevice = nil
-}
 
 // Обновляем конфигурацию
 s.config.WasConnected = false

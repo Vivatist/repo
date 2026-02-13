@@ -76,6 +76,11 @@ Write-Host "[BUILD] Сборка novavpn-server (linux/amd64)..." -ForegroundCol
 
 $binaryPath = Join-Path $scriptDir "novavpn-server"
 
+# Убедимся, что папка deploy существует
+if (-not (Test-Path $scriptDir)) {
+    New-Item -ItemType Directory -Path $scriptDir -Force | Out-Null
+}
+
 Push-Location $projectDir
 try {
     $env:GOOS = "linux"

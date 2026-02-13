@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"sync/atomic"
 
 	"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wintun"
@@ -23,6 +24,7 @@ type WinTUNDevice struct {
 	name     string
 	mtu      int
 	readWait windows.Handle
+	closed   atomic.Bool
 }
 
 // NewWinTUNDevice создаёт новый TUN-адаптер через WinTUN.
@@ -51,12 +53,19 @@ func NewWinTUNDevice(name string, mtu int) (network.TunnelDevice, error) {
 }
 
 // Read читает пакет из TUN-адаптера.
+// Использует таймаут в WaitForSingleObject для корректного выхода при Close().
 func (d *WinTUNDevice) Read(buf []byte) (int, error) {
 	for {
+		if d.closed.Load() {
+			return 0, fmt.Errorf("device closed")
+		}
 		packet, err := d.session.ReceivePacket()
 		if err != nil {
-			// Ждём данных
-			windows.WaitForSingleObject(d.readWait, windows.INFINITE)
+			if d.closed.Load() {
+				return 0, fmt.Errorf("device closed")
+			}
+			// Таймаут 100мс позволяет проверять closed флаг
+			windows.WaitForSingleObject(d.readWait, 100)
 			continue
 		}
 
@@ -78,8 +87,11 @@ func (d *WinTUNDevice) Write(packet []byte) (int, error) {
 	return len(packet), nil
 }
 
-// Close закрывает TUN-адаптер.
+// Close закрывает TUN-адаптер. Идемпотентный — безопасен для повторных вызовов.
 func (d *WinTUNDevice) Close() error {
+	if d.closed.Swap(true) {
+		return nil // уже закрыт
+	}
 	log.Printf("[TUN] Закрываем адаптер '%s'", d.name)
 	d.session.End()
 	if d.adapter != nil {

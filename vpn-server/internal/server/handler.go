@@ -12,7 +12,8 @@ import (
 	"github.com/novavpn/vpn-server/internal/protocol"
 )
 
-// handlePacket обрабатывает входящий пакет.
+// handlePacket обрабатывает входящий пакет (только handshake — вызывается из горутины).
+// Data/Keepalive/Disconnect обрабатываются inline в udpReadLoop.
 func (s *VPNServer) handlePacket(data []byte, remoteAddr *net.UDPAddr) {
 	pkt, err := protocol.Unmarshal(data)
 	if err != nil {
@@ -29,17 +30,8 @@ func (s *VPNServer) handlePacket(data []byte, remoteAddr *net.UDPAddr) {
 	case protocol.PacketHandshakeComplete:
 		s.handleHandshakeComplete(pkt, remoteAddr)
 
-	case protocol.PacketData:
-		s.handleDataPacket(pkt, remoteAddr)
-
-	case protocol.PacketKeepalive:
-		s.handleKeepalive(pkt, remoteAddr)
-
-	case protocol.PacketDisconnect:
-		s.handleDisconnect(pkt, remoteAddr)
-
 	default:
-		log.Printf("[PROTO] Неизвестный тип пакета 0x%02X от %s", pkt.Header.Type, remoteAddr)
+		log.Printf("[PROTO] Неожиданный тип пакета 0x%02X в handlePacket от %s", pkt.Header.Type, remoteAddr)
 	}
 }
 
@@ -285,68 +277,6 @@ func (s *VPNServer) handleHandshakeComplete(pkt *protocol.Packet, remoteAddr *ne
 
 	log.Printf("[HANDSHAKE] ✓ HandshakeComplete подтверждён для сессии #%d (клиент: %s)",
 		session.ID, remoteAddr)
-}
-
-// handleDataPacket обрабатывает зашифрованный пакет данных.
-func (s *VPNServer) handleDataPacket(pkt *protocol.Packet, remoteAddr *net.UDPAddr) {
-	session := s.sessions.GetSessionByID(pkt.Header.SessionID)
-	if session == nil {
-		return
-	}
-
-	if !session.IsActive() {
-		return
-	}
-
-	// Используем кешированный AEAD (без создания AEAD на каждый пакет)
-	plaintext, err := session.recvAEAD.Open(nil, pkt.Nonce[:], pkt.Payload, nil)
-	if err != nil {
-		if s.cfg.LogLevel == "debug" {
-			log.Printf("[DATA] Ошибка расшифровки от сессии #%d: %v", session.ID, err)
-		}
-		return
-	}
-
-	session.UpdateActivity()
-	session.BytesRecv.Add(uint64(len(plaintext)))
-	session.PacketsRecv.Add(1)
-
-	// Записываем IP-пакет в TUN
-	if _, err := s.tunDev.Write(plaintext); err != nil {
-		if s.cfg.LogLevel == "debug" {
-			log.Printf("[TUN] Ошибка записи в TUN: %v", err)
-		}
-	}
-}
-
-// handleKeepalive обрабатывает keepalive пакет.
-func (s *VPNServer) handleKeepalive(pkt *protocol.Packet, remoteAddr *net.UDPAddr) {
-	session := s.sessions.GetSessionByID(pkt.Header.SessionID)
-	if session == nil {
-		return
-	}
-
-	session.UpdateActivity()
-
-	if s.cfg.LogLevel == "debug" {
-		log.Printf("[KEEPALIVE] Получен от сессии #%d", session.ID)
-	}
-
-	// Отправляем keepalive обратно
-	respPkt := protocol.NewKeepalivePacket(session.ID, session.NextSendSeq())
-	respBytes, _ := respPkt.Marshal()
-	s.udpConn.WriteToUDP(respBytes, remoteAddr)
-}
-
-// handleDisconnect обрабатывает запрос на отключение.
-func (s *VPNServer) handleDisconnect(pkt *protocol.Packet, remoteAddr *net.UDPAddr) {
-	session := s.sessions.GetSessionByID(pkt.Header.SessionID)
-	if session == nil {
-		return
-	}
-
-	log.Printf("[DISCONNECT] Клиент отключается: сессия #%d (%s)", session.ID, remoteAddr)
-	s.sessions.RemoveSession(session)
 }
 
 // sendToClient шифрует и отправляет данные клиенту.
