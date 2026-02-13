@@ -4,6 +4,7 @@
 package crypto
 
 import (
+	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -27,8 +28,8 @@ const (
 // ChaCha20Session реализует криптографическую сессию с ChaCha20-Poly1305.
 type ChaCha20Session struct {
 	keys     *crypto.SessionKeys
-	sendAEAD chacha20poly1305.AEAD
-	recvAEAD chacha20poly1305.AEAD
+	sendAEAD cipher.AEAD
+	recvAEAD cipher.AEAD
 	mu       sync.Mutex
 }
 

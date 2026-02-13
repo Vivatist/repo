@@ -1,69 +1,53 @@
-// Package config — конфигурация и сохранение состояния VPN-клиента.
+//go:build windows
+
+// Package config — обёртка для обратной совместимости.
+// Делегирует в domain/config и infrastructure/config.
 package config
 
 import (
-	"encoding/json"
 	"log"
-	"os"
-	"path/filepath"
+
+	domainconfig "github.com/novavpn/vpn-client-windows/internal/domain/config"
+	infraconfig "github.com/novavpn/vpn-client-windows/internal/infrastructure/config"
 )
 
-const configFileName = "novavpn-config.json"
-
-// Config — настройки клиента.
+// Config — конфигурация приложения.
 type Config struct {
-	ServerAddr   string `json:"server_addr"`   // host:port
-	PSK          string `json:"psk"`           // hex-encoded PSK
-	Email        string `json:"email"`         // логин
-	Password     string `json:"password"`      // пароль (TODO: DPAPI encryption)
-	AutoStart    bool   `json:"auto_start"`    // запуск при старте Windows
-	WasConnected bool   `json:"was_connected"` // было ли соединение перед закрытием
-}
+	ServerAddr   string
+	Email        string
+	Password     string
+	PSK          string
+	WasConnected bool
 
-// configDir возвращает директорию для конфигурации.
-func configDir() string {
-	appData := os.Getenv("APPDATA")
-	if appData == "" {
-		appData = filepath.Join(os.Getenv("USERPROFILE"), "AppData", "Roaming")
-	}
-	dir := filepath.Join(appData, "NovaVPN")
-	os.MkdirAll(dir, 0700)
-	return dir
-}
-
-// ConfigPath возвращает полный путь к файлу конфигурации.
-func ConfigPath() string {
-	return filepath.Join(configDir(), configFileName)
+	mgr domainconfig.Manager
 }
 
 // Load загружает конфигурацию из файла.
 func Load() *Config {
-	cfg := &Config{
-		ServerAddr: "",
-		PSK:        "",
-		Email:      "",
-		Password:   "",
-		AutoStart:  false,
-	}
-
-	data, err := os.ReadFile(ConfigPath())
+	mgr := infraconfig.NewJSONConfigManager()
+	dc, err := mgr.Load()
 	if err != nil {
-		return cfg
+		log.Printf("[CONFIG] Ошибка загрузки: %v", err)
+		dc = &domainconfig.Config{}
 	}
-
-	if err := json.Unmarshal(data, cfg); err != nil {
-		log.Printf("[CONFIG] Ошибка чтения конфигурации: %v", err)
-		return cfg
+	return &Config{
+		ServerAddr:   dc.ServerAddr,
+		Email:        dc.Email,
+		Password:     dc.Password,
+		PSK:          dc.PreSharedKey,
+		WasConnected: dc.WasConnected,
+		mgr:          mgr,
 	}
-
-	return cfg
 }
 
 // Save сохраняет конфигурацию в файл.
 func (c *Config) Save() error {
-	data, err := json.MarshalIndent(c, "", "  ")
-	if err != nil {
-		return err
+	dc := &domainconfig.Config{
+		ServerAddr:   c.ServerAddr,
+		Email:        c.Email,
+		Password:     c.Password,
+		PreSharedKey: c.PSK,
+		WasConnected: c.WasConnected,
 	}
-	return os.WriteFile(ConfigPath(), data, 0600)
+	return c.mgr.Save(dc)
 }

@@ -1,7 +1,5 @@
 //go:build windows
 
-//go:build windows
-
 // Package vpn определяет доменные интерфейсы для VPN-клиента.
 package vpn
 

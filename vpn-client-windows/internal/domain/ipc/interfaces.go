@@ -1,7 +1,5 @@
 //go:build windows
 
-//go:build windows
-
 // Package ipc определяет интерфейсы для межпроцессного взаимодействия.
 package ipc
 

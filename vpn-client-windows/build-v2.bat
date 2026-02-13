@@ -2,12 +2,21 @@
 chcp 65001 >nul
 setlocal EnableDelayedExpansion
 
+:: Переходим в директорию скрипта (vpn-client-windows)
+cd /d "%~dp0"
+
 :: ═══════════════════════════════════════════════════════════════
 ::   NovaVPN Client v2.0.0 — Полная сборка и инсталлятор
 :: ═══════════════════════════════════════════════════════════════
 
 set VERSION=2.0.0
 set APP_NAME=NovaVPN
+
+:: Принудительно устанавливаем целевую платформу Windows
+:: (сбрасывает GOOS=linux, если остался от сборки сервера)
+set GOOS=windows
+set GOARCH=amd64
+set CGO_ENABLED=0
 
 echo.
 echo ╔═══════════════════════════════════════════════════════════════╗
@@ -82,15 +91,21 @@ if "%ISCC%"=="" (
     set CREATE_INSTALLER=1
 )
 
-:: Проверяем wintun.dll
+:: Проверяем wintun.dll (автокопирование из репо если есть)
 if not exist "wintun.dll" (
-    echo [!] wintun.dll не найден
-    echo     Скачайте с https://www.wintun.net/ (amd64)
-    echo     Положите в корень проекта
-    echo.
-    echo [!] Сборка продолжится, но для работы потребуется wintun.dll
-    echo.
-    set HAS_WINTUN=0
+    if exist "wintun\wintun\bin\amd64\wintun.dll" (
+        copy /Y "wintun\wintun\bin\amd64\wintun.dll" . >nul
+        echo [✓] wintun.dll скопирован из wintun\bin\amd64\
+        set HAS_WINTUN=1
+    ) else (
+        echo [!] wintun.dll не найден
+        echo     Скачайте с https://www.wintun.net/ ^(amd64^)
+        echo     Положите в корень проекта
+        echo.
+        echo [!] Сборка продолжится, но для работы потребуется wintun.dll
+        echo.
+        set HAS_WINTUN=0
+    )
 ) else (
     echo [✓] wintun.dll найден
     set HAS_WINTUN=1

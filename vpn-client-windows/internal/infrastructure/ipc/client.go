@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"time"
 
@@ -40,7 +39,8 @@ func (c *NamedPipeClient) connect() error {
 		return nil // уже подключены
 	}
 
-	conn, err := winio.DialPipe(pipeName, &pipeTimeout)
+	timeout := pipeTimeout
+	conn, err := winio.DialPipe(pipeName, &timeout)
 	if err != nil {
 		return fmt.Errorf("dial pipe: %w", err)
 	}
