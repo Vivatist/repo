@@ -8,9 +8,11 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io"
+	"sync/atomic"
 
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
@@ -30,6 +32,11 @@ type ChaCha20Session struct {
 	sendAEAD cipher.AEAD
 	recvAEAD cipher.AEAD
 
+	// Counter-nonce: prefix(4) + counter(8) = 12 байт nonce.
+	// Убирает сисколл crypto/rand.Read с hot path.
+	noncePrefix [4]byte        // случайный, генерируется при создании сессии
+	sendCounter atomic.Uint64   // инкрементируется на каждый пакет
+
 	// Пре-аллоцированные буферы для hot path (используются по одному на горутину)
 	sendBuf []byte // буфер для шифрования (nonce + ciphertext + tag)
 	recvBuf []byte // буфер для дешифрования
@@ -47,12 +54,19 @@ func NewChaCha20Session(keys *crypto.SessionKeys) (*ChaCha20Session, error) {
 		return nil, fmt.Errorf("recv AEAD init: %w", err)
 	}
 
+	// Генерируем случайный prefix для counter-nonce (один раз на сессию)
+	var noncePrefix [4]byte
+	if _, err := rand.Read(noncePrefix[:]); err != nil {
+		return nil, fmt.Errorf("nonce prefix generation: %w", err)
+	}
+
 	return &ChaCha20Session{
-		keys:     keys,
-		sendAEAD: sendAEAD,
-		recvAEAD: recvAEAD,
-		sendBuf:  make([]byte, 0, 2048),
-		recvBuf:  make([]byte, 0, 2048),
+		keys:        keys,
+		sendAEAD:    sendAEAD,
+		recvAEAD:    recvAEAD,
+		noncePrefix: noncePrefix,
+		sendBuf:     make([]byte, 0, 2048),
+		recvBuf:     make([]byte, 0, 2048),
 	}, nil
 }
 
@@ -67,10 +81,10 @@ func (s *ChaCha20Session) Encrypt(plaintext []byte, additionalData []byte) ([]by
 		s.sendBuf = s.sendBuf[:totalLen]
 	}
 
-	// Генерируем nonce прямо в начало буфера
-	if _, err := rand.Read(s.sendBuf[:NonceSize]); err != nil {
-		return nil, fmt.Errorf("nonce generation: %w", err)
-	}
+	// Counter-nonce: prefix(4) + counter(8) вместо rand.Read
+	ctr := s.sendCounter.Add(1)
+	copy(s.sendBuf[0:4], s.noncePrefix[:])
+	binary.BigEndian.PutUint64(s.sendBuf[4:12], ctr)
 
 	// Шифруем прямо в буфер после nonce (Seal дописывает к dst)
 	s.sendAEAD.Seal(s.sendBuf[NonceSize:NonceSize], s.sendBuf[:NonceSize], plaintext, additionalData)
@@ -127,17 +141,17 @@ func (s *ChaCha20Session) DecryptWithNonce(nonce []byte, ciphertext []byte, addi
 }
 
 // EncryptInto шифрует plaintext прямо в dst буфер (nonce + ciphertext + tag).
-// Zero-copy: не создаёт промежуточных буферов.
+// Zero-copy, counter-nonce (без сисколлов crypto/rand).
 func (s *ChaCha20Session) EncryptInto(dst []byte, plaintext []byte, additionalData []byte) (int, error) {
 	totalLen := NonceSize + len(plaintext) + AuthTagSize
 	if len(dst) < totalLen {
 		return 0, fmt.Errorf("dst too small: %d < %d", len(dst), totalLen)
 	}
 
-	// Генерируем nonce прямо в начало dst
-	if _, err := rand.Read(dst[:NonceSize]); err != nil {
-		return 0, fmt.Errorf("nonce generation: %w", err)
-	}
+	// Counter-nonce: prefix(4) + counter(8) = 12 байт
+	ctr := s.sendCounter.Add(1)
+	copy(dst[0:4], s.noncePrefix[:])
+	binary.BigEndian.PutUint64(dst[4:12], ctr)
 
 	// Seal прямо в dst после nonce
 	s.sendAEAD.Seal(dst[NonceSize:NonceSize], dst[:NonceSize], plaintext, additionalData)

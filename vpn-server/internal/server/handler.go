@@ -239,11 +239,17 @@ func (s *VPNServer) handleHandshakeInit(pkt *protocol.Packet, remoteAddr *net.UD
 		return
 	}
 
-	log.Printf("[HANDSHAKE] Отправлен HandshakeResp сессии #%d для %s (VPN IP: %s)",
+	// 1-RTT: активируем сессию сразу после отправки Resp, не дожидаясь Complete.
+	// Клиент может слать данные сразу после получения Resp.
+	session.SetState(SessionStateActive)
+	session.UpdateActivity()
+
+	log.Printf("[HANDSHAKE] Отправлен HandshakeResp сессии #%d для %s (VPN IP: %s), сессия активна",
 		session.ID, remoteAddr, session.AssignedIP)
 }
 
-// handleHandshakeComplete обрабатывает завершение рукопожатия.
+// handleHandshakeComplete обрабатывает подтверждение рукопожатия.
+// При 1-RTT схеме сессия уже активна — Complete служит лишь подтверждением.
 func (s *VPNServer) handleHandshakeComplete(pkt *protocol.Packet, remoteAddr *net.UDPAddr) {
 	session := s.sessions.GetSessionByID(pkt.Header.SessionID)
 	if session == nil {
@@ -252,11 +258,8 @@ func (s *VPNServer) handleHandshakeComplete(pkt *protocol.Packet, remoteAddr *ne
 		return
 	}
 
-	if session.GetState() != SessionStateHandshake {
-		log.Printf("[HANDSHAKE] HandshakeComplete для сессии #%d в неверном состоянии: %s",
-			session.ID, session.GetState())
-		return
-	}
+	// При 1-RTT сессия уже активна после отправки Resp.
+	// Complete — подтверждение клиента, валидируем HMAC для безопасности.
 
 	// Расшифровываем payload
 	plaintext, err := protocol.Decrypt(session.Keys.RecvKey, pkt.Nonce, pkt.Payload, nil)
@@ -280,12 +283,8 @@ func (s *VPNServer) handleHandshakeComplete(pkt *protocol.Packet, remoteAddr *ne
 		return
 	}
 
-	// Активируем сессию
-	session.SetState(SessionStateActive)
-	session.UpdateActivity()
-
-	log.Printf("[HANDSHAKE] ✓ Сессия #%d активирована (клиент: %s, VPN IP: %s)",
-		session.ID, remoteAddr, session.AssignedIP)
+	log.Printf("[HANDSHAKE] ✓ HandshakeComplete подтверждён для сессии #%d (клиент: %s)",
+		session.ID, remoteAddr)
 }
 
 // handleDataPacket обрабатывает зашифрованный пакет данных.

@@ -72,12 +72,14 @@ func (p *Performer) Perform(timeout time.Duration) (*Result, error) {
 	}
 	p.conn.SetReadDeadline(time.Time{}) // убираем таймаут
 
-	// 4. Отправляем HandshakeComplete
-	if err := p.sendHandshakeComplete(result); err != nil {
-		return nil, fmt.Errorf("send handshake complete: %w", err)
-	}
+	// 4. Отправляем HandshakeComplete fire-and-forget (1-RTT: сессия уже активна на сервере)
+	go func() {
+		if err := p.sendHandshakeComplete(result); err != nil {
+			log.Printf("[HANDSHAKE] Ошибка отправки HandshakeComplete: %v", err)
+		}
+	}()
 
-	log.Println("[HANDSHAKE] Рукопожатие завершено")
+	log.Println("[HANDSHAKE] Рукопожатие завершено (1-RTT)")
 	return result, nil
 }
 

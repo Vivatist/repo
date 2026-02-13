@@ -213,6 +213,12 @@ func (c *NovaVPNClient) Disconnect() error {
 	if c.cancel != nil {
 		c.cancel()
 	}
+
+	// Закрываем соединение ДО wg.Wait — разблокирует Read() в udpReadLoop
+	if c.conn != nil {
+		c.conn.Close()
+	}
+
 	c.wg.Wait()
 
 	// Очищаем сессию
@@ -221,11 +227,7 @@ func (c *NovaVPNClient) Disconnect() error {
 		c.session = nil
 	}
 
-	// Закрываем соединение
-	if c.conn != nil {
-		c.conn.Close()
-		c.conn = nil
-	}
+	c.conn = nil
 
 	c.setState(domainvpn.StateDisconnected)
 	log.Println("[VPN] Отключено")
@@ -304,17 +306,12 @@ func (c *NovaVPNClient) udpReadLoop() {
 	defer c.wg.Done()
 	buf := make([]byte, 2048)
 
-	// Устанавливаем deadline один раз с большим таймаутом
+	// Без SetReadDeadline — разблокировка через conn.Close() в Disconnect.
 	for {
-		if c.stopped.Load() {
-			return
-		}
-
-		c.conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 		n, err := c.conn.Read(buf)
 		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				continue
+			if c.stopped.Load() {
+				return
 			}
 			log.Printf("[VPN] UDP read error: %v", err)
 			return

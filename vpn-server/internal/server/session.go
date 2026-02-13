@@ -70,6 +70,11 @@ type Session struct {
 	// recvAEAD — кешированный AEAD для дешифрования
 	recvAEAD cipher.AEAD
 
+	// Counter-nonce: prefix(4) + counter(8) = 12 байт nonce.
+	// Убирает сисколлы crypto/rand.Read с hot path.
+	noncePrefix [4]byte        // случайный, генерируется при InitCrypto
+	sendCounter atomic.Uint64   // инкрементируется на каждый пакет
+
 	// ServerKeyPair — ephemeral ключевая пара сервера для этой сессии
 	ServerKeyPair *protocol.KeyPair
 
@@ -156,6 +161,12 @@ func (s *Session) InitCrypto() error {
 	if err != nil {
 		return fmt.Errorf("init recv AEAD: %w", err)
 	}
+
+	// Counter-nonce: случайный prefix (один раз на сессию)
+	if _, err := rand.Read(s.noncePrefix[:]); err != nil {
+		return fmt.Errorf("nonce prefix generation: %w", err)
+	}
+
 	return nil
 }
 
@@ -183,10 +194,10 @@ func (s *Session) EncryptAndBuild(buf []byte, plaintext []byte) (int, error) {
 	// Type
 	buf[9] = byte(protocol.PacketData)
 
-	// Nonce (случайный, прямо в пакет)
-	if _, err := rand.Read(buf[10:22]); err != nil {
-		return 0, fmt.Errorf("nonce generation: %w", err)
-	}
+	// Counter-nonce: prefix(4) + counter(8) = 12 байт (без сисколлов)
+	ctr := s.sendCounter.Add(1)
+	copy(buf[10:14], s.noncePrefix[:])
+	binary.BigEndian.PutUint64(buf[14:22], ctr)
 
 	// Seal ciphertext прямо в buf[22:] — zero-copy
 	s.sendAEAD.Seal(buf[22:22], buf[10:22], plaintext, nil)
