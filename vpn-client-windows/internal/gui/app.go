@@ -326,14 +326,22 @@ func (a *App) connect() {
 		return
 	}
 
-	// Показываем "Подключение..." сразу
+	// Показываем "Подключение..." сразу — и текст, и иконку трея
 	a.mainWindow.Synchronize(func() {
 		a.statusLabel.SetText("Подключение...")
 		a.statusLabel.SetTextColor(walk.RGB(200, 150, 0))
 		a.connectBtn.SetText("Подключение...")
 		a.connectBtn.SetEnabled(false)
 		a.setFieldsEnabled(false)
+		// Мгновенно переключаем иконку трея на жёлтую
+		if a.iconConnecting != nil {
+			a.notifyIcon.SetIcon(a.iconConnecting)
+		}
+		a.notifyIcon.SetToolTip("NovaVPN — Подключение...")
+		a.trayConnectAction.SetVisible(false)
+		a.trayDisconnectAction.SetVisible(false)
 	})
+	a.lastState = ipc.StateConnecting
 
 	params := ipc.ConnectParams{
 		ServerAddr: a.cfg.ServerAddr,
