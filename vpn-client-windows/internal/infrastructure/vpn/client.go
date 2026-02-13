@@ -75,6 +75,9 @@ type NovaVPNClient struct {
 	pskBytes      []byte        // декодированный PSK
 	reconnecting  atomic.Bool   // флаг: идёт переподключение
 	stopCh        chan struct{} // закрывается при Disconnect
+
+	// Dead-peer detection: время последнего полученного пакета от сервера
+	lastRecvTime atomic.Int64 // UnixNano
 }
 
 // NewNovaVPNClient создаёт новый VPN-клиент.
@@ -230,6 +233,7 @@ func (c *NovaVPNClient) Connect(params domainvpn.ConnectParams) error {
 	}
 
 	c.setState(domainvpn.StateConnected)
+	c.lastRecvTime.Store(time.Now().UnixNano())
 	log.Println("[VPN] Подключено к VPN")
 	return nil
 }
@@ -417,6 +421,9 @@ func (c *NovaVPNClient) udpReadLoop() {
 
 // handleUDPPacket обрабатывает входящий пакет от сервера.
 func (c *NovaVPNClient) handleUDPPacket(data []byte) {
+	// Обновляем время последнего полученного пакета (dead-peer detection)
+	c.lastRecvTime.Store(time.Now().UnixNano())
+
 	// Быстрый inline-парсинг без аллокаций
 	raw := data
 	// Удаляем TLS заголовок
@@ -543,11 +550,14 @@ func (c *NovaVPNClient) tunReadLoop() {
 	}
 }
 
-// keepaliveLoop отправляет keepalive пакеты.
+// keepaliveLoop отправляет keepalive пакеты и проверяет доступность сервера.
+// Если сервер не отвечает дольше deadPeerTimeout, инициирует переподключение.
 func (c *NovaVPNClient) keepaliveLoop() {
 	defer c.wg.Done()
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
+
+	const deadPeerTimeout = 45 * time.Second // 3 пропущенных keepalive
 
 	for {
 		select {
@@ -563,6 +573,19 @@ func (c *NovaVPNClient) keepaliveLoop() {
 			if conn == nil {
 				continue
 			}
+
+			// Dead-peer detection: проверяем время последнего пакета от сервера
+			lastRecv := c.lastRecvTime.Load()
+			if lastRecv != 0 && c.GetState() == domainvpn.StateConnected {
+				elapsed := time.Since(time.Unix(0, lastRecv))
+				if elapsed > deadPeerTimeout {
+					log.Printf("[VPN] Dead peer detected: нет данных от сервера %v, переподключение...", elapsed.Round(time.Second))
+					// Закрываем соединение — udpReadLoop получит ошибку и вызовет reconnect
+					conn.Close()
+					return
+				}
+			}
+
 			// Строим keepalive inline — sessionID может измениться после reconnect
 			var kaBuf [10]byte
 			kaBuf[0] = protocol.TLSContentType
@@ -630,6 +653,7 @@ func (c *NovaVPNClient) tryResume() bool {
 	c.mtu = c.resumeMTU
 	c.subnetMask = c.resumeSubnetMask
 	c.connectedAt = time.Now()
+	c.lastRecvTime.Store(time.Now().UnixNano())
 
 	log.Printf("[VPN] 0-RTT resume: сессия #%d восстановлена (VPN IP: %s)", c.sessionID, c.assignedIP)
 	return true
@@ -790,6 +814,7 @@ func (c *NovaVPNClient) reconnect() {
 		}
 
 		c.connectedAt = time.Now()
+		c.lastRecvTime.Store(time.Now().UnixNano())
 		c.setState(domainvpn.StateConnected)
 		log.Printf("[VPN] Переподключено успешно (попытка %d)", attempt)
 		return

@@ -26,9 +26,16 @@ const serviceName = "NovaVPN"
 // novaVPNService реализует интерфейс svc.Handler.
 type novaVPNService struct{}
 
+// Windows power event constants (PBT_*)
+const (
+	pbtAPMSuspend         = 0x04 // система переходит в спящий режим
+	pbtAPMResumeAutomatic = 0x12 // система возобновлена автоматически
+	pbtAPMResumeSuspend   = 0x07 // система возобновлена пользователем
+)
+
 // Execute — основной цикл Windows-сервиса.
 func (s *novaVPNService) Execute(args []string, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (bool, uint32) {
-	const cmdsAccepted = svc.AcceptStop | svc.AcceptShutdown
+	const cmdsAccepted = svc.AcceptStop | svc.AcceptShutdown | svc.AcceptPowerEvent
 
 	changes <- svc.Status{State: svc.StartPending}
 
@@ -75,6 +82,29 @@ func (s *novaVPNService) Execute(args []string, r <-chan svc.ChangeRequest, chan
 				ipcServer.Stop()
 
 				return false, 0
+			case svc.PowerEvent:
+				switch c.EventType {
+				case pbtAPMSuspend:
+					log.Println("[SERVICE] Система переходит в спящий режим")
+				case pbtAPMResumeAutomatic, pbtAPMResumeSuspend:
+					log.Println("[SERVICE] Система возобновлена из спящего режима")
+					// Если VPN был подключён, принудительно переподключаем:
+					// после sleep UDP-сокет мёртв, но клиент может этого не знать
+					if vpnSvc.GetState() == domainvpn.StateConnected {
+						log.Println("[SERVICE] Переподключение VPN после resume...")
+						go func() {
+							params := vpnSvc.GetConnectParams()
+							if err := vpnSvc.Disconnect(); err != nil {
+								log.Printf("[SERVICE] Ошибка отключения после resume: %v", err)
+							}
+							// Небольшая пауза для восстановления сети
+							time.Sleep(2 * time.Second)
+							if err := vpnSvc.Connect(params); err != nil {
+								log.Printf("[SERVICE] Ошибка переподключения после resume: %v", err)
+							}
+						}()
+					}
+				}
 			}
 		}
 	}

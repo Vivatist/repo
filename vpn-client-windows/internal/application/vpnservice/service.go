@@ -18,12 +18,13 @@ import (
 
 // Service — application-layer сервис для управления VPN.
 type Service struct {
-	client       domainvpn.Client
-	configMgr    domainconfig.Manager
-	tunnelDevice domainnet.TunnelDevice
-	netConfig    domainnet.NetworkConfigurator
-	mu           sync.Mutex
-	config       *domainconfig.Config
+	client        domainvpn.Client
+	configMgr     domainconfig.Manager
+	tunnelDevice  domainnet.TunnelDevice
+	netConfig     domainnet.NetworkConfigurator
+	mu            sync.Mutex
+	config        *domainconfig.Config
+	connectParams domainvpn.ConnectParams // последние параметры подключения
 }
 
 // NewService создаёт новый VPN service.
@@ -52,6 +53,9 @@ func NewService() (*Service, error) {
 func (s *Service) Connect(params domainvpn.ConnectParams) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Сохраняем параметры для возможного переподключения (resume после sleep)
+	s.connectParams = params
 
 	// Создаём TUN device
 	tunnelDevice, err := infranet.NewWinTUNDevice("NovaVPN", 1420)
@@ -170,4 +174,12 @@ func (s *Service) GetConfig() *domainconfig.Config {
 	defer s.mu.Unlock()
 
 	return s.config
+}
+
+// GetConnectParams возвращает последние параметры подключения (для переподключения после sleep/resume).
+func (s *Service) GetConnectParams() domainvpn.ConnectParams {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.connectParams
 }

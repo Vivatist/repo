@@ -499,6 +499,10 @@ func (a *App) updateUIForState(state int, assignedIP string) {
 		a.statusLabel.SetText("Отключение...")
 		a.statusLabel.SetTextColor(walk.RGB(200, 150, 0))
 		a.connectBtn.SetEnabled(false)
+		a.notifyIcon.SetToolTip("NovaVPN — Отключение...")
+		if a.iconConnecting != nil {
+			a.notifyIcon.SetIcon(a.iconConnecting)
+		}
 		a.trayConnectAction.SetVisible(false)
 		a.trayDisconnectAction.SetVisible(false)
 	}
