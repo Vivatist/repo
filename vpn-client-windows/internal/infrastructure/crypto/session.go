@@ -11,7 +11,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"sync"
 
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
@@ -30,7 +29,10 @@ type ChaCha20Session struct {
 	keys     *crypto.SessionKeys
 	sendAEAD cipher.AEAD
 	recvAEAD cipher.AEAD
-	mu       sync.Mutex
+
+	// Пре-аллоцированные буферы для hot path (используются по одному на горутину)
+	sendBuf []byte // буфер для шифрования (nonce + ciphertext + tag)
+	recvBuf []byte // буфер для дешифрования
 }
 
 // NewChaCha20Session создаёт новую криптографическую сессию.
@@ -49,34 +51,38 @@ func NewChaCha20Session(keys *crypto.SessionKeys) (*ChaCha20Session, error) {
 		keys:     keys,
 		sendAEAD: sendAEAD,
 		recvAEAD: recvAEAD,
+		sendBuf:  make([]byte, 0, 2048),
+		recvBuf:  make([]byte, 0, 2048),
 	}, nil
 }
 
 // Encrypt шифрует plaintext и возвращает nonce + ciphertext + auth tag.
 func (s *ChaCha20Session) Encrypt(plaintext []byte, additionalData []byte) ([]byte, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	totalLen := NonceSize + len(plaintext) + AuthTagSize
 
-	nonce := make([]byte, NonceSize)
-	if _, err := rand.Read(nonce); err != nil {
+	// Переиспользуем буфер, расширяя при необходимости
+	if cap(s.sendBuf) < totalLen {
+		s.sendBuf = make([]byte, totalLen)
+	} else {
+		s.sendBuf = s.sendBuf[:totalLen]
+	}
+
+	// Генерируем nonce прямо в начало буфера
+	if _, err := rand.Read(s.sendBuf[:NonceSize]); err != nil {
 		return nil, fmt.Errorf("nonce generation: %w", err)
 	}
 
-	// nonce + ciphertext + auth tag
-	result := make([]byte, NonceSize+len(plaintext)+AuthTagSize)
-	copy(result[:NonceSize], nonce)
+	// Шифруем прямо в буфер после nonce (Seal дописывает к dst)
+	s.sendAEAD.Seal(s.sendBuf[NonceSize:NonceSize], s.sendBuf[:NonceSize], plaintext, additionalData)
 
-	ciphertext := s.sendAEAD.Seal(nil, nonce, plaintext, additionalData)
-	copy(result[NonceSize:], ciphertext)
-
+	// Возвращаем копию — буфер будет переиспользован
+	result := make([]byte, totalLen)
+	copy(result, s.sendBuf)
 	return result, nil
 }
 
 // Decrypt дешифрует ciphertext (nonce + ciphertext + auth tag).
 func (s *ChaCha20Session) Decrypt(ciphertext []byte, additionalData []byte) ([]byte, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if len(ciphertext) < NonceSize+AuthTagSize {
 		return nil, fmt.Errorf("ciphertext too short: %d bytes", len(ciphertext))
 	}
@@ -84,7 +90,35 @@ func (s *ChaCha20Session) Decrypt(ciphertext []byte, additionalData []byte) ([]b
 	nonce := ciphertext[:NonceSize]
 	encrypted := ciphertext[NonceSize:]
 
-	plaintext, err := s.recvAEAD.Open(nil, nonce, encrypted, additionalData)
+	// Open с dst = recvBuf[:0] переиспользует нижележащий массив
+	plaintextLen := len(encrypted) - AuthTagSize
+	if cap(s.recvBuf) < plaintextLen {
+		s.recvBuf = make([]byte, 0, plaintextLen)
+	}
+
+	plaintext, err := s.recvAEAD.Open(s.recvBuf[:0], nonce, encrypted, additionalData)
+	if err != nil {
+		return nil, fmt.Errorf("decryption failed: %w", err)
+	}
+
+	return plaintext, nil
+}
+
+// DecryptWithNonce дешифрует ciphertext, используя nonce отдельно (без промежуточного буфера).
+func (s *ChaCha20Session) DecryptWithNonce(nonce []byte, ciphertext []byte, additionalData []byte) ([]byte, error) {
+	if len(nonce) != NonceSize {
+		return nil, fmt.Errorf("invalid nonce size: %d", len(nonce))
+	}
+	if len(ciphertext) < AuthTagSize {
+		return nil, fmt.Errorf("ciphertext too short: %d bytes", len(ciphertext))
+	}
+
+	plaintextLen := len(ciphertext) - AuthTagSize
+	if cap(s.recvBuf) < plaintextLen {
+		s.recvBuf = make([]byte, 0, plaintextLen)
+	}
+
+	plaintext, err := s.recvAEAD.Open(s.recvBuf[:0], nonce, ciphertext, additionalData)
 	if err != nil {
 		return nil, fmt.Errorf("decryption failed: %w", err)
 	}

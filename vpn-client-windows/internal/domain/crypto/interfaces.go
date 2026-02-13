@@ -21,6 +21,9 @@ type Session interface {
 	// Decrypt дешифрует ciphertext и проверяет auth tag.
 	Decrypt(ciphertext []byte, additionalData []byte) ([]byte, error)
 
+	// DecryptWithNonce дешифрует ciphertext с отдельным nonce (без промежуточного буфера).
+	DecryptWithNonce(nonce []byte, ciphertext []byte, additionalData []byte) ([]byte, error)
+
 	// ComputeHMAC вычисляет HMAC для данных.
 	ComputeHMAC(data []byte) []byte
 

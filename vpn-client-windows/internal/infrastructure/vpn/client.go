@@ -25,39 +25,39 @@ type NovaVPNClient struct {
 	// Зависимости
 	tunnelDevice domainnet.TunnelDevice
 	netConfig    domainnet.NetworkConfigurator
-	
+
 	// Состояние
-	state        atomic.Int32
-	mu           sync.Mutex
-	ctx          context.Context
-	cancel       context.CancelFunc
-	wg           sync.WaitGroup
-	
+	state  atomic.Int32
+	mu     sync.Mutex
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+
 	// Соединение
-	conn         *net.UDPConn
-	serverAddr   *net.UDPAddr
-	
+	conn       *net.UDPConn
+	serverAddr *net.UDPAddr
+
 	// Сессия
-	sessionID    uint32
-	session      domaincrypto.Session
-	sendSeq      atomic.Uint32
-	
+	sessionID uint32
+	session   domaincrypto.Session
+	sendSeq   atomic.Uint32
+
 	// Конфигурация
-	assignedIP   net.IP
-	dns          []net.IP
-	mtu          uint16
-	subnetMask   uint8
-	connectedAt  time.Time
-	
+	assignedIP  net.IP
+	dns         []net.IP
+	mtu         uint16
+	subnetMask  uint8
+	connectedAt time.Time
+
 	// Статистика
-	bytesSent    atomic.Uint64
-	bytesRecv    atomic.Uint64
-	packetsSent  atomic.Uint64
-	packetsRecv  atomic.Uint64
-	
+	bytesSent   atomic.Uint64
+	bytesRecv   atomic.Uint64
+	packetsSent atomic.Uint64
+	packetsRecv atomic.Uint64
+
 	// Колбэки
-	onStatus     domainvpn.StatusCallback
-	onPSK        domainvpn.PSKCallback
+	onStatus domainvpn.StatusCallback
+	onPSK    domainvpn.PSKCallback
 }
 
 // NewNovaVPNClient создаёт новый VPN-клиент.
@@ -124,13 +124,13 @@ func (c *NovaVPNClient) Connect(params domainvpn.ConnectParams) error {
 
 	// Выполняем рукопожатие
 	performer := handshake.NewPerformer(conn, psk, params.Email, params.Password, c.onPSK)
-	
+
 	// Пробуем быстро с сохранённым PSK, затем bootstrap
 	timeout := 2 * time.Second
 	if params.PSK == "" {
 		timeout = 10 * time.Second
 	}
-	
+
 	result, err := performer.Perform(timeout)
 	if err != nil {
 		// Если есть PSK, пробуем bootstrap
@@ -299,6 +299,7 @@ func (c *NovaVPNClient) udpReadLoop() {
 	defer c.wg.Done()
 	buf := make([]byte, 2048)
 
+	// Устанавливаем deadline один раз с большим таймаутом
 	for {
 		select {
 		case <-c.ctx.Done():
@@ -306,7 +307,7 @@ func (c *NovaVPNClient) udpReadLoop() {
 		default:
 		}
 
-		c.conn.SetReadDeadline(time.Now().Add(time.Second))
+		c.conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 		n, err := c.conn.Read(buf)
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
@@ -316,26 +317,33 @@ func (c *NovaVPNClient) udpReadLoop() {
 			return
 		}
 
-		// Обрабатываем пакет
+		// Обрабатываем пакет без копирования
 		c.handleUDPPacket(buf[:n])
 	}
 }
 
 // handleUDPPacket обрабатывает входящий пакет от сервера.
 func (c *NovaVPNClient) handleUDPPacket(data []byte) {
-	pkt, err := protocol.Unmarshal(data)
-	if err != nil {
-		log.Printf("[VPN] Unmarshal error: %v", err)
+	// Быстрый inline-парсинг без аллокаций
+	raw := data
+	// Удаляем TLS заголовок
+	if len(raw) >= protocol.TLSHeaderSize && raw[0] == protocol.TLSContentType {
+		raw = raw[protocol.TLSHeaderSize:]
+	}
+	// SessionID(4) + Type(1) + Nonce(12) = 17
+	if len(raw) < 17 {
 		return
 	}
 
-	switch pkt.Header.Type {
+	pktType := protocol.PacketType(raw[4])
+
+	switch pktType {
 	case protocol.PacketData:
-		// Собираем nonce из заголовка + ciphertext из payload для session.Decrypt
-		decryptData := make([]byte, protocol.NonceSize+len(pkt.Payload))
-		copy(decryptData[:protocol.NonceSize], pkt.Nonce[:])
-		copy(decryptData[protocol.NonceSize:], pkt.Payload)
-		plaintext, err := c.session.Decrypt(decryptData, nil)
+		nonce := raw[5:17]
+		payload := raw[17:]
+
+		// Дешифруем напрямую без промежуточного буфера
+		plaintext, err := c.session.DecryptWithNonce(nonce, payload, nil)
 		if err != nil {
 			log.Printf("[VPN] Decrypt error: %v", err)
 			return
@@ -353,14 +361,19 @@ func (c *NovaVPNClient) handleUDPPacket(data []byte) {
 		// Игнорируем keepalive
 
 	default:
-		log.Printf("[VPN] Unknown packet type: %s", pkt.Header.Type)
+		log.Printf("[VPN] Unknown packet type: 0x%02X", uint8(pktType))
 	}
 }
 
 // tunReadLoop читает пакеты из TUN и отправляет на сервер.
 func (c *NovaVPNClient) tunReadLoop() {
 	defer c.wg.Done()
-	buf := make([]byte, c.tunnelDevice.MTU()+100)
+	mtu := c.tunnelDevice.MTU()
+	tunBuf := make([]byte, mtu+100)
+
+	// Пре-аллоцируем буфер для исходящих пакетов
+	// TLS(5) + SessionID(4) + Type(1) + Nonce(12) + MaxPayload + AuthTag(16)
+	sendBuf := make([]byte, protocol.TLSHeaderSize+4+1+protocol.NonceSize+mtu+100+protocol.AuthTagSize)
 
 	for {
 		select {
@@ -369,31 +382,48 @@ func (c *NovaVPNClient) tunReadLoop() {
 		default:
 		}
 
-		n, err := c.tunnelDevice.Read(buf)
+		n, err := c.tunnelDevice.Read(tunBuf)
 		if err != nil {
 			log.Printf("[VPN] TUN read error: %v", err)
 			return
 		}
 
-		// Шифруем и отправляем
-		encrypted, err := c.session.Encrypt(buf[:n], nil)
+		// Шифруем
+		encrypted, err := c.session.Encrypt(tunBuf[:n], nil)
 		if err != nil {
 			log.Printf("[VPN] Encrypt error: %v", err)
 			continue
 		}
 
-		seq := c.sendSeq.Add(1)
-		var nonce [protocol.NonceSize]byte
-		copy(nonce[:], encrypted[:protocol.NonceSize])
-		
-		pkt := protocol.NewPacket(protocol.PacketData, c.sessionID, seq, nonce, encrypted[protocol.NonceSize:])
-		pktBytes, err := pkt.Marshal()
-		if err != nil {
-			log.Printf("[VPN] Marshal error: %v", err)
-			continue
-		}
+		// Собираем пакет inline без аллокаций (используем sendBuf)
+		// Формат: TLS_Header(5) + SessionID(4) + Type(1) + Nonce(12) + Payload
+		dataLen := 4 + 1 + protocol.NonceSize + len(encrypted) - protocol.NonceSize
 
-		if _, err := c.conn.Write(pktBytes); err != nil {
+		// TLS Record Header
+		sendBuf[0] = protocol.TLSContentType
+		sendBuf[1] = protocol.TLSVersionMajor
+		sendBuf[2] = protocol.TLSVersionMinor
+		sendBuf[3] = byte(dataLen >> 8)
+		sendBuf[4] = byte(dataLen)
+
+		// SessionID
+		sendBuf[5] = byte(c.sessionID >> 24)
+		sendBuf[6] = byte(c.sessionID >> 16)
+		sendBuf[7] = byte(c.sessionID >> 8)
+		sendBuf[8] = byte(c.sessionID)
+
+		// Type
+		sendBuf[9] = byte(protocol.PacketData)
+
+		// Nonce (из encrypted[:12])
+		copy(sendBuf[10:22], encrypted[:protocol.NonceSize])
+
+		// Payload (ciphertext без nonce)
+		copy(sendBuf[22:], encrypted[protocol.NonceSize:])
+
+		totalLen := protocol.TLSHeaderSize + dataLen
+
+		if _, err := c.conn.Write(sendBuf[:totalLen]); err != nil {
 			log.Printf("[VPN] UDP write error: %v", err)
 			return
 		}
