@@ -25,7 +25,7 @@ NovaVPN — собственный VPN-протокол поверх **UDP** с 
 
 Каждый пакет оборачивается в TLS Record Header для имитации HTTPS-трафика.
 
-### 2.1. Общий формат (Handshake / Keepalive / Disconnect)
+### 2.1. Формат Handshake-пакетов (0x01, 0x02, 0x03)
 
 ```
 ┌─────────────────────────────┬───────────┬──────┬───────┬───────────────────┐
@@ -33,6 +33,8 @@ NovaVPN — собственный VPN-протокол поверх **UDP** с 
 │ 0x17 0x03 0x03 [len: 2B]   │    4B     │  1B  │  12B  │     variable      │
 └─────────────────────────────┴───────────┴──────┴───────┴───────────────────┘
 ```
+
+> Формат с Nonce(12B) и AEAD используется **только** для handshake-пакетов.
 
 ### 2.1.1. Формат Data-пакетов (0x10)
 
@@ -48,6 +50,21 @@ NovaVPN — собственный VPN-протокол поверх **UDP** с 
 - **Шифрование**: plain ChaCha20 XOR (без Poly1305, без auth tag)
 - **Data overhead**: TLS(5) + SID(4) + Type(1) + Counter(4) = **14 байт**
 
+### 2.1.2. Формат Keepalive/Disconnect-пакетов (0x20, 0x30)
+
+Lightweight-формат без nonce и payload:
+
+```
+┌─────────────────────────────┬───────────┬──────┐
+│    TLS Record Header (5B)   │ SessionID │ Type │
+│ 0x17 0x03 0x03 [len: 2B]   │    4B     │  1B  │
+└─────────────────────────────┴───────────┴──────┘
+```
+
+- **Общий размер**: 10 байт, zero-alloc
+- **Nonce/Payload**: отсутствуют (не нужны — keepalive/disconnect не несут данных)
+- len в TLS header = 5 (SID + Type)
+
 ### 2.2. TLS Record Header (5 байт)
 
 | Смещение | Размер | Значение | Описание |
@@ -59,13 +76,21 @@ NovaVPN — собственный VPN-протокол поверх **UDP** с 
 
 ### 2.3. Открытые поля (после TLS Header)
 
-| Смещение (от начала данных) | Размер | Описание |
-|-----------------------------|--------|----------|
+Общие поля для **всех** типов пакетов:
+
+| Смещение | Размер | Описание |
+|----------|--------|----------|
 | 0-3 | 4 | **SessionID** — идентификатор сессии (Big-Endian uint32). `0` для HandshakeInit. |
 | 4 | 1 | **Type** — тип пакета (см. ниже) |
-| 5-16 | 12 | **Nonce** — nonce для AEAD (только Handshake/Keepalive/Disconnect) |
-| 5-8 | 4 | **Counter** — счётчик пакетов (только Data, BE uint32) |
-| 17+ | var | **Payload** — зашифрованные данные (или открытый payload для Handshake) |
+
+Дополнительные поля зависят от типа:
+
+| Тип | Смещение 5+ | Описание |
+|-----|-------------|----------|
+| Handshake (0x01-0x03) | 5-16: Nonce(12B), 17+: Payload | AEAD-шифрованные данные |
+| Data (0x10) | 5-8: Counter(4B), 9+: Ciphertext | Plain ChaCha20 XOR |
+| Keepalive (0x20) | — | Нет дополнительных полей |
+| Disconnect (0x30) | — | Нет дополнительных полей |
 
 ### 2.4. Типы пакетов
 
@@ -91,6 +116,7 @@ NovaVPN — собственный VPN-протокол поверх **UDP** с 
 | DataCounterSize | 4 | Counter в data-пакетах |
 | HandshakeHeaderSize | 22 | TLS(5) + SessionID(4) + Type(1) + Nonce(12) |
 | DataOverhead | 14 | TLS(5) + SessionID(4) + Type(1) + Counter(4) |
+| MinPacketSize | 10 | TLS(5) + SessionID(4) + Type(1) — keepalive/disconnect |
 | HandshakeOverhead | 38 | TLS(5) + SessionID(4) + Type(1) + Nonce(12) + AuthTag(16) |
 
 ---
@@ -139,7 +165,7 @@ HKDF-SHA256(
 
 ---
 
-## 4. Рукопожатие (3-way Handshake)
+## 4. Рукопожатие (1-RTT Handshake)
 
 ### 4.1. Общая схема
 
@@ -157,18 +183,22 @@ HKDF-SHA256(
   │  2. HandshakeResp                              │
   │  (ServerPubKey + Enc(сессионные параметры))    │
   │  ◄──────────────────────────────────────────   │
+  │                                               │ ★ Сессия Active сразу после отправки Resp
   │ ECDH → sessionKeys                            │
   │ Расшифровка параметров                        │
   │ Сохранение SessionID, VPN IP, DNS, MTU        │
   │ [Сохранение PSK если bootstrap]               │
   │                                               │
-  │  3. HandshakeComplete                          │
+  │  ═══════ Туннель установлен (1-RTT) ═══════   │
+  │  Клиент может слать Data сразу                 │
+  │                                               │
+  │  3. HandshakeComplete (fire-and-forget)         │
   │  (Enc(ConfirmHMAC))                            │
   │  ──────────────────────────────────────────►   │
-  │                                               │ Проверка HMAC → сессия Active
-  │                                               │
-  │  ═══════ Туннель установлен ═══════           │
+  │                                               │ Проверка HMAC (подтверждение, не блокирует)
 ```
+
+> **1-RTT**: сервер активирует сессию **сразу после отправки HandshakeResp**, не дожидаясь Complete. Клиент может отправлять Data-пакеты сразу после получения Resp. HandshakeComplete отправляется клиентом в фоне (fire-and-forget) как подтверждение — его потеря не нарушает работу.
 
 ### 4.2. Шаг 1: HandshakeInit (Клиент → Сервер)
 
@@ -308,11 +338,13 @@ Plaintext Credentials:
 8. Сохранить SessionID, AssignedIP, DNS, MTU
 ```
 
-### 4.4. Шаг 3: HandshakeComplete (Клиент → Сервер)
+### 4.4. Шаг 3: HandshakeComplete (Клиент → Сервер, fire-and-forget)
 
 **Тип пакета**: `0x03`  
 **SessionID**: полученный из HandshakeResp  
 **Nonce**: случайный
+
+> **Fire-and-forget**: отправляется в отдельной горутине. Потеря этого пакета не влияет на работу — сессия уже активна после Resp (1-RTT).
 
 #### Формат (plaintext перед шифрованием)
 
@@ -385,39 +417,64 @@ PSK **не является дополнительным фактором** ау
 
 ## 6. Передача данных
 
-После завершения handshake обе стороны обмениваются Data-пакетами.
+После получения HandshakeResp обе стороны обмениваются Data-пакетами (1-RTT).
 
-### 6.1. Шифрование Data-пакета (отправка)
+### 6.1. Counter-Nonce схема
+
+Data-пакеты используют **counter-nonce** вместо случайного nonce:
+
+```
+nonce_prefix = HMAC-SHA256(sendKey, "nova-nonce-prefix")[:4]   // 4 байта, фиксированный
+counter      = atomic_increment()                               // uint64, +1 на каждый пакет
+wire_counter = uint32(counter)                                  // на wire только младшие 4 байта
+nonce        = nonce_prefix(4) + BigEndian_uint64(wire_counter)(8)  = 12 байт
+```
+
+Обе стороны вычисляют `nonce_prefix` из ключа одинаково. На wire передаётся только 4-байтный counter.
+
+### 6.2. Шифрование Data-пакета (отправка)
 
 ```
 1. plaintext = IP-пакет из TUN-адаптера
-2. nonce = random(12)
-3. ciphertext = ChaCha20Poly1305.Seal(sessionKeys.SendKey, nonce, plaintext, AAD=nil)
-4. wireBytes = TLSHeader(5) + SessionID(4) + Type=0x10(1) + nonce(12) + ciphertext
-5. Отправить wireBytes по UDP на сервер
+2. counter = sendCounter.Add(1)
+3. wireCtr = uint32(counter)                    // truncate to 32 bit
+4. nonce = nonce_prefix(4) + BE_uint64(wireCtr)(8)
+5. ciphertext = ChaCha20_XOR(sendKey, nonce, plaintext)    // plain ChaCha20, без Poly1305
+6. wireBytes = TLSHeader(5) + SessionID(4) + Type=0x10(1) + BE_uint32(wireCtr)(4) + ciphertext
+7. Отправить wireBytes по UDP
 ```
 
-### 6.2. Расшифровка Data-пакета (приём)
+> **Важно**: используется **plain ChaCha20 XOR** (без Poly1305 и auth tag). Ciphertext имеет тот же размер, что и plaintext.
+
+### 6.3. Расшифровка Data-пакета (приём)
 
 ```
 1. Удалить TLS заголовок (5B) → raw
 2. sessionID = BigEndian_uint32(raw[0:4])
-3. type = raw[4]
-4. nonce = raw[5:17]
-5. ciphertext = raw[17:]
-6. plaintext = ChaCha20Poly1305.Open(sessionKeys.RecvKey, nonce, ciphertext, AAD=nil)
-7. Записать plaintext (IP-пакет) в TUN
+3. type = raw[4]   // 0x10
+4. counter = BigEndian_uint32(raw[5:9])
+5. ciphertext = raw[9:]
+6. nonce = recv_nonce_prefix(4) + BE_uint64(counter)(8)
+7. plaintext = ChaCha20_XOR(recvKey, nonce, ciphertext)
+8. Записать plaintext (IP-пакет) в TUN
 ```
 
-> **AAD**: в текущей реализации = `nil` (не используется). Это упрощает реализацию на разных платформах.
+### 6.4. Keepalive
 
-### 6.3. Keepalive
+Lightweight-формат: **10 байт**, zero-alloc.
 
-- Тип пакета: `0x20`
-- Payload: пустой
-- Nonce: нулевой
-- Шифрование: нет (чистый пакет Header + пустой payload)
+```
+┌─────────────────────────────┬───────────┬──────┐
+│ 0x17 0x03 0x03 [0x00 0x05]  │ SessionID │ 0x20 │
+│         5 байт              │    4B     │  1B  │
+└─────────────────────────────┴───────────┴──────┘
+```
+
+- **Nonce/Payload**: отсутствуют
+- **Шифрование**: нет
 - Сессия истекает на сервере через **120 сек** без активности
+- Сервер отвечает keepalive в том же формате (10 байт) для подтверждения живости
+- При смене IP/порта клиента (NAT rebind) сервер обновляет адрес клиента автоматически (address migration)
 
 **Интервалы:**
 
@@ -428,17 +485,95 @@ PSK **не является дополнительным фактором** ау
 
 > **DPI anti-fingerprinting**: сервер намеренно рандомизирует интервал keepalive при каждой отправке, чтобы трафик не имел детерминированного паттерна.
 
-### 6.4. Disconnect
+### 6.5. Disconnect
 
-- Тип пакета: `0x30`
-- Payload: пустой
-- Отправляется клиентом при отключении
+Lightweight-формат: **10 байт**, аналогичен keepalive.
+
+```
+┌─────────────────────────────┬───────────┬──────┐
+│ 0x17 0x03 0x03 [0x00 0x05]  │ SessionID │ 0x30 │
+│         5 байт              │    4B     │  1B  │
+└─────────────────────────────┴───────────┴──────┘
+```
+
+- Отправляется клиентом перед закрытием соединения
+- Сервер **не удаляет** сессию при получении Disconnect — сохраняет для 0-RTT resume
+- Сессия истекает по таймауту (SessionTimeout) в maintenance loop
 
 ---
 
-## 7. Сетевая настройка (клиент)
+## 7. 0-RTT Session Resume
 
-### 7.1. TUN-адаптер
+### 7.1. Принцип
+
+При штатном отключении клиент сохраняет данные сессии для мгновенного восстановления без полного handshake:
+
+```
+Сохраняемые данные:
+- SessionID
+- SessionKeys (SendKey, RecvKey, HMACKey)
+- SendCounter (для предотвращения повторного использования nonce)
+- Назначенный IP, DNS, MTU, SubnetMask
+```
+
+### 7.2. Алгоритм Resume
+
+```
+Клиент                                          Сервер
+  │                                               │
+  │  Keepalive probe (10 байт)                     │
+  │  (SessionID = сохранённый)                     │
+  │  ──────────────────────────────────────────►   │
+  │                                               │ Находит сессию по SessionID
+  │                                               │ Обновляет адрес (address migration)
+  │  Keepalive response (10 байт)                  │
+  │  ◄──────────────────────────────────────────   │
+  │                                               │
+  │  Сессия восстановлена за 0-RTT!                │
+  │  ═══════ Туннель установлен ═══════           │
+```
+
+### 7.3. Детали
+
+- Таймаут ожидания ответа на probe: **1 секунда**
+- Если ответ не получен → `clearResumeData()`, переход к полному handshake
+- `sendCounter` восстанавливается из сохранённого значения → nonce никогда не повторяется
+- Сервер при получении keepalive обновляет `ClientAddr` (поддержка NAT rebind)
+
+---
+
+## 8. Auto-Reconnect
+
+### 8.1. Поведение при потере соединения
+
+При потере UDP-соединения (ISP disconnect, NAT timeout, смена IP клиента) клиент автоматически переподключается:
+
+```
+1. udpReadLoop() получает ошибку Read() (ISP разорвал соединение)
+2. Состояние → StateConnecting
+3. Сохраняются данные для 0-RTT resume
+4. Закрываются старый conn и keepaliveLoop
+5. Цикл попыток (до 60, ~5 минут):
+   a. Backoff: 1с → 2с → 4с → ... → 30с (макс)
+   b. Новый UDP-сокет
+   c. Попытка 0-RTT resume (keepalive probe)
+   d. Если 0-RTT не удалось → полный handshake
+   e. Успех → запуск новых udpReadLoop + keepaliveLoop
+6. tunReadLoop продолжает работать, дропая пакеты во время reconnect
+7. Состояние → StateConnected
+```
+
+### 8.2. Координация с Disconnect
+
+- `Disconnect()` выставляет `stopped=true` и закрывает `stopCh`
+- Reconnect проверяет `stopped` на каждом шаге и `stopCh` для прерывания backoff sleep
+- Параллельные reconnect предотвращаются через `reconnecting` atomic flag
+
+---
+
+## 9. Сетевая настройка (клиент)
+
+### 9.1. TUN-адаптер
 
 Создание TUN-интерфейса — платформенно-зависимая часть:
 
@@ -450,7 +585,7 @@ PSK **не является дополнительным фактором** ау
 | Android | `VpnService.Builder` | Android VPN API |
 | iOS | `NEPacketTunnelProvider` | Network Extension framework |
 
-### 7.2. Маршрутизация (full tunnel)
+### 9.2. Маршрутизация (full tunnel)
 
 Принцип: **split routes** (0/1 + 128/1) вместо замены default route.
 
@@ -464,11 +599,11 @@ PSK **не является дополнительным фактором** ау
 - `vpnGateway` = первый IP подсети (напр. `10.8.0.1` для `10.8.0.0/24`)
 - `physicalGateway` = гейтвей физического адаптера
 
-### 7.3. DNS
+### 9.3. DNS
 
 Назначить DNS-серверы из HandshakeResp на TUN-интерфейс. На Windows — через `netsh`, на Linux — через `resolvectl`, на macOS — через `scutil`.
 
-### 7.4. UDP-сокет
+### 9.4. UDP-сокет
 
 **Важно**: UDP-сокет должен быть привязан к **физическому** сетевому адаптеру, а не к VPN-интерфейсу. Иначе после настройки маршрутов трафик к серверу пойдёт через туннель → петля.
 
@@ -476,9 +611,9 @@ PSK **не является дополнительным фактором** ау
 
 ---
 
-## 8. Конфигурация
+## 10. Конфигурация
 
-### 8.1. Сервер — `/etc/novavpn/server.yaml`
+### 10.1. Сервер — `/etc/novavpn/server.yaml`
 
 ```yaml
 listen_addr: "0.0.0.0"
@@ -498,7 +633,7 @@ external_interface: "eth0"
 log_level: "info"           # debug, info, warn, error
 ```
 
-### 8.2. Клиент — конфиг-файл (JSON)
+### 10.2. Клиент — конфиг-файл (JSON)
 
 ```json
 {
@@ -513,7 +648,7 @@ log_level: "info"           # debug, info, warn, error
 
 > `psk` — пустая строка при первом подключении. Заполняется автоматически после bootstrap.
 
-### 8.3. Минимально необходимые поля от пользователя
+### 10.3. Минимально необходимые поля от пользователя
 
 | Параметр | Обязательный | Описание |
 |----------|-------------|----------|
@@ -524,7 +659,7 @@ log_level: "info"           # debug, info, warn, error
 
 ---
 
-## 9. Управление пользователями (сервер)
+## 11. Управление пользователями (сервер)
 
 ```bash
 novavpn-server -adduser  -email user@example.com -password secret
@@ -539,9 +674,9 @@ novavpn-server -enable   -email user@example.com
 
 ---
 
-## 10. Справочник для реализации клиента
+## 12. Справочник для реализации клиента
 
-### 10.1. Минимальный набор зависимостей
+### 12.1. Минимальный набор зависимостей
 
 | Библиотека | Назначение |
 |-----------|-----------|
@@ -552,7 +687,7 @@ novavpn-server -enable   -email user@example.com
 | TUN driver | Платформенный сетевой интерфейс |
 | UDP socket | Транспорт |
 
-### 10.2. Последовательность действий клиента
+### 12.2. Последовательность действий клиента
 
 ```
  1. Загрузить конфиг (server_addr, email, password, psk)
@@ -569,17 +704,18 @@ novavpn-server -enable   -email user@example.com
  8. Настроить DNS
  9. Настроить маршруты (split routes)
 10. Запустить 3 горутины/потока:
-      - UDP → расшифровка → TUN (входящие)
-      - TUN → шифрование → UDP (исходящие)
-      - Keepalive каждые 25 сек
-11. При отключении: отправить Disconnect, удалить маршруты, закрыть TUN
+      - UDP → расшифровка (counter-nonce + ChaCha20 XOR) → TUN (входящие)
+      - TUN → шифрование (counter-nonce + ChaCha20 XOR) → UDP (исходящие)
+      - Keepalive каждые 15 сек (lightweight 10 байт)
+11. При потере соединения: auto-reconnect с 0-RTT resume (см. раздел 8)
+12. При отключении: отправить Disconnect (10 байт), удалить маршруты, закрыть TUN
 ```
 
-### 10.3. Построение пакета (пошагово)
+### 12.3. Построение пакета (пошагово)
 
 ```python
-# ===== Отправка =====
-def build_packet(pkt_type, session_id, nonce, payload):
+# ===== Handshake-пакет (с Nonce) =====
+def build_handshake_packet(pkt_type, session_id, nonce, payload):
     raw = b""
     raw += struct.pack(">I", session_id)    # 4 байта, Big-Endian uint32
     raw += bytes([pkt_type])                # 1 байт
@@ -589,6 +725,27 @@ def build_packet(pkt_type, session_id, nonce, payload):
     tls_header = bytes([0x17, 0x03, 0x03]) + struct.pack(">H", len(raw))
     return tls_header + raw
 
+# ===== Data-пакет (с Counter + plain ChaCha20) =====
+def build_data_packet(session_id, send_key, nonce_prefix, counter, plaintext):
+    wire_ctr = counter & 0xFFFFFFFF          # truncate to uint32
+    nonce = nonce_prefix + struct.pack(">Q", wire_ctr)     # 4 + 8 = 12 байт
+    ciphertext = chacha20_xor(send_key, nonce, plaintext)  # plain ChaCha20, без tag!
+
+    raw = struct.pack(">I", session_id)     # 4 байта
+    raw += bytes([0x10])                    # Type = Data
+    raw += struct.pack(">I", wire_ctr)      # 4 байта Counter
+    raw += ciphertext
+
+    tls_header = bytes([0x17, 0x03, 0x03]) + struct.pack(">H", len(raw))
+    return tls_header + raw
+
+# ===== Keepalive/Disconnect (lightweight, 10 байт) =====
+def build_lightweight_packet(pkt_type, session_id):
+    raw = struct.pack(">I", session_id)     # 4 байта
+    raw += bytes([pkt_type])                # 1 байт (0x20 или 0x30)
+    tls_header = bytes([0x17, 0x03, 0x03]) + struct.pack(">H", len(raw))
+    return tls_header + raw                 # итого 10 байт
+
 # ===== Приём =====
 def parse_packet(data):
     assert data[0] == 0x17               # TLS Application Data
@@ -597,12 +754,20 @@ def parse_packet(data):
 
     session_id = struct.unpack(">I", raw[0:4])[0]
     pkt_type   = raw[4]
-    nonce      = raw[5:17]
-    payload    = raw[17:]
-    return session_id, pkt_type, nonce, payload
+
+    if pkt_type == 0x10:  # Data
+        counter = struct.unpack(">I", raw[5:9])[0]
+        ciphertext = raw[9:]
+        return session_id, pkt_type, counter, ciphertext
+    elif pkt_type in (0x01, 0x02, 0x03):  # Handshake
+        nonce   = raw[5:17]
+        payload = raw[17:]
+        return session_id, pkt_type, nonce, payload
+    else:  # Keepalive/Disconnect (нет дополнительных полей)
+        return session_id, pkt_type, None, None
 ```
 
-### 10.4. Пример: полный handshake (псевдокод)
+### 12.4. Пример: полный handshake (псевдокод)
 
 ```python
 # ═══════════════════════════════════════════════════════
@@ -633,7 +798,7 @@ payload = (client_pub +
            hmac_val)
 
 # Отправка
-packet = build_packet(
+packet = build_handshake_packet(
     pkt_type=0x01,
     session_id=0,
     nonce=bytes(12),      # нулевой nonce
@@ -700,7 +865,8 @@ complete_encrypted = chacha20poly1305_seal(
     key=send_key, nonce=complete_nonce, plaintext=confirm_hmac, aad=None
 )
 
-packet = build_packet(
+# Fire-and-forget: отправляем в фоне, потеря не критична (1-RTT)
+packet = build_handshake_packet(
     pkt_type=0x03,
     session_id=session_id,
     nonce=complete_nonce,
@@ -708,13 +874,17 @@ packet = build_packet(
 )
 udp_send(packet)
 
-# ═══════ Туннель установлен ═══════
-# Теперь можно пересылать Data-пакеты
+# ═══════ Туннель установлен (1-RTT) ═══════
+# Можно пересылать Data-пакеты сразу после получения HandshakeResp
+# Nonce prefix для data: HMAC-SHA256(key, "nova-nonce-prefix")[:4]
+send_nonce_prefix = hmac_sha256(key=send_key, data=b"nova-nonce-prefix")[:4]
+recv_nonce_prefix = hmac_sha256(key=recv_key, data=b"nova-nonce-prefix")[:4]
+send_counter = 0
 ```
 
 ---
 
-## 11. Структура файлов (эталонная реализация)
+## 13. Структура файлов (эталонная реализация)
 
 ### Сервер (Go, Linux)
 
@@ -755,7 +925,7 @@ vpn-client-windows/
 │   │   ├── crypto/session.go                  # ChaCha20Session, Curve25519KeyExchange
 │   │   ├── vpn/
 │   │   │   ├── client.go                      # NovaVPNClient, UDP/TUN loops
-│   │   │   └── handshake/performer.go         # 3-way handshake, PSK bootstrap
+│   │   │   └── handshake/performer.go         # 1-RTT handshake, PSK bootstrap
 │   │   ├── network/
 │   │   │   ├── wintun.go                      # WinTUN-адаптер
 │   │   │   └── configurator.go                # Маршруты, DNS, интерфейсы
@@ -777,7 +947,7 @@ vpn-client-windows/
 
 ---
 
-## 12. Деплой сервера
+## 14. Деплой сервера
 
 ```bash
 # Сборка
@@ -799,7 +969,7 @@ WantedBy=multi-user.target
 
 ---
 
-## 13. Известные особенности и ограничения
+## 15. Известные особенности и ограничения
 
 1. **DPI обход**: все пакеты обёрнуты в TLS 1.2 Application Data header. Для DPI трафик выглядит как обычный HTTPS. Порт 443 усиливает маскировку.
 
@@ -809,8 +979,12 @@ WantedBy=multi-user.target
 
 4. **PacketType открыт**: вынесен из зашифрованной части для маршрутизации на уровне сервера (handshake vs data).
 
-5. **Replay protection**: в текущей реализации отсутствует проверка sequence number для Data-пакетов. Nonce случайный.
+5. **Нет аутентификации Data-пакетов**: plain ChaCha20 XOR без Poly1305 означает отсутствие проверки целостности для Data-пакетов. Это осознанный trade-off в пользу производительности. Replay protection для Data-пакетов отсутствует (counter не проверяется на приёмной стороне).
 
 6. **UDP**: нет гарантии доставки. При потере пакета handshake — таймаут и retry на уровне клиента.
 
 7. **Bootstrap безопасность**: нулевой PSK позволяет любому с валидными credentials подключиться. Это by design — PSK не является фактором аутентификации.
+
+8. **Counter wrap-around**: sendCounter — uint64, но на wire используется uint32 (truncation). При 2^32 пакетах (~4 млрд) counter зациклится. При скорости 100k pkt/s это ~12 часов. Для длительных сессий рекомендуется периодический re-handshake.
+
+9. **0-RTT resume безопасность**: сохранённые сессионные ключи на клиенте не защищены дополнительно. При компрометации устройства клиента ключи могут быть извлечены.

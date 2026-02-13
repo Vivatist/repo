@@ -72,8 +72,8 @@ type NovaVPNClient struct {
 
 	// Auto-reconnect: сохранённые параметры подключения
 	connectParams domainvpn.ConnectParams
-	pskBytes      []byte       // декодированный PSK
-	reconnecting  atomic.Bool  // флаг: идёт переподключение
+	pskBytes      []byte        // декодированный PSK
+	reconnecting  atomic.Bool   // флаг: идёт переподключение
 	stopCh        chan struct{} // закрывается при Disconnect
 }
 
