@@ -41,9 +41,24 @@ NOVAVPN_PROTOCOL.md  (корень репозитория)
 | Сервер | `vpn-server/` | Go, Linux, systemd, монолитная архитектура |
 | Клиент | `vpn-client-windows/` | Go, Windows, Walk GUI + Windows Service, Clean Architecture |
 | Протокол | `NOVAVPN_PROTOCOL.md` | **Единственный** источник истины по wire format |
+| Взаимодействие | `CLIENT_SERVER_INTERACTION.md` | Логика взаимодействия клиента и сервера: жизненный цикл, машина состояний, reconnect, обработка ошибок |
 | Контекст | `CONTEXT.md` | Общие принципы и требования ко всем клиентам |
 
-**Правило синхронизации:** после КАЖДОГО изменения в протоколе (код клиента или сервера) — обновляй `NOVAVPN_PROTOCOL.md`.
+**Правила синхронизации:**
+- После КАЖДОГО изменения в протоколе (код клиента или сервера) — обновляй `NOVAVPN_PROTOCOL.md`.
+- После КАЖДОГО изменения логики взаимодействия клиента и сервера (машина состояний, handshake, reconnect, keepalive, обработка ошибок, жизненный цикл соединения) — обновляй `CLIENT_SERVER_INTERACTION.md`.
+
+## 3.1. Руководство по разработке клиентов
+
+Файл `CLIENT_SERVER_INTERACTION.md` — **практическое руководство** для разработки новых клиентов NovaVPN на любой платформе. При реализации нового клиента или изменении существующего **обязательно сверяйся** с этим документом. Он описывает:
+- Машину состояний клиента (Disconnected → Connecting → Connected → Disconnecting)
+- Полный жизненный цикл соединения (Connect, Data exchange, Disconnect)
+- Алгоритм рукопожатия (1-RTT Handshake, PSK bootstrap, PSK fallback)
+- Keepalive и Dead-peer detection
+- Auto-reconnect с экспоненциальным backoff и 0-RTT resume
+- Шифрование данных (counter-nonce, plain ChaCha20)
+- Все типы пакетов и wire format
+- Чек-лист реализации
 
 ## 4. Архитектура клиента (Clean Architecture / DDD)
 
