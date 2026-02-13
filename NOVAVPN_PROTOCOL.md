@@ -395,12 +395,20 @@ PSK **не является дополнительным фактором** ау
 
 ### 6.3. Keepalive
 
-- Интервал: каждые **25 секунд**
 - Тип пакета: `0x20`
 - Payload: пустой
 - Nonce: нулевой
 - Шифрование: нет (чистый пакет Header + пустой payload)
 - Сессия истекает на сервере через **120 сек** без активности
+
+**Интервалы:**
+
+| Сторона | Интервал | Примечание |
+|---------|----------|------------|
+| Клиент → Сервер | каждые **15 секунд** | Фиксированный интервал |
+| Сервер → Клиент | **25 ± 7 секунд** | Рандомизированный (18-32 сек) для снижения DPI fingerprinting |
+
+> **DPI anti-fingerprinting**: сервер намеренно рандомизирует интервал keepalive при каждой отправке, чтобы трафик не имел детерминированного паттерна.
 
 ### 6.4. Disconnect
 
@@ -468,7 +476,8 @@ max_clients: 256
 keepalive_interval: 25
 session_timeout: 120
 enable_nat: true
-external_interface: "ens3"
+external_interface: "eth0"
+log_level: "info"           # debug, info, warn, error
 ```
 
 ### 8.2. Клиент — конфиг-файл (JSON)
@@ -694,37 +703,59 @@ udp_send(packet)
 ```
 vpn-server/
 ├── cmd/vpnserver/main.go          # Точка входа, CLI, graceful shutdown
-├── config/config.go               # VPNConfig, YAML
+├── config/config.go               # ServerConfig, YAML
 ├── internal/
 │   ├── auth/auth.go               # Argon2id, CRUD пользователей
-│   ├── crypto/crypto.go           # ECDH, HKDF, ChaCha20-Poly1305, HMAC
 │   ├── protocol/
+│   │   ├── crypto.go              # ECDH, HKDF, ChaCha20-Poly1305, HMAC
 │   │   ├── packet.go              # Wire format, marshal/unmarshal
 │   │   └── handshake.go           # HandshakeInit/Resp/Complete
 │   ├── server/
-│   │   ├── server.go              # UDP loop, TUN loop, handshake logic
-│   │   └── session.go             # SessionManager, IPPool
+│   │   ├── server.go              # UDP loop, TUN loop, maintenance
+│   │   ├── handler.go             # Обработка пакетов (handshake, data, keepalive)
+│   │   ├── session.go             # Session, SessionManager
+│   │   └── ippool.go              # Пул VPN IP-адресов
 │   └── tun/tun_linux.go           # Linux TUN, NAT, routing
 └── go.mod
 ```
 
-### Клиент (Go, Windows — эталонная реализация)
+### Клиент (Go, Windows — эталонная реализация, Clean Architecture)
 
 ```
 vpn-client-windows/
-├── cmd/novavpn/main.go            # GUI точка входа
-├── cmd/novavpn-service/main.go    # Windows Service
+├── cmd/
+│   ├── novavpn/main.go                        # GUI точка входа
+│   └── novavpn-service/main.go                # Windows Service точка входа
 ├── internal/
-│   ├── crypto/crypto.go           # Крипто (идентично серверу)
-│   ├── protocol/protocol.go       # Протокол (идентично серверу)
-│   ├── vpnclient/client.go        # Connect, handshake, data loops, PSK bootstrap
-│   ├── tunnel/wintun.go           # WinTUN, маршруты, DNS
-│   ├── gui/app.go                 # Walk GUI
-│   ├── ipc/                       # GUI ↔ Service (Named Pipe IPC)
-│   ├── service/service.go         # Windows Service handler
-│   └── config/config.go           # JSON конфиг
+│   ├── domain/                                # Доменные интерфейсы
+│   │   ├── crypto/interfaces.go               # Session, KeyExchange
+│   │   ├── vpn/interfaces.go                  # Client, ConnectParams, States
+│   │   ├── network/interfaces.go              # TunnelDevice, NetworkConfigurator
+│   │   ├── ipc/interfaces.go                  # IPCClient, IPCServer
+│   │   └── config/interfaces.go               # ConfigManager
+│   ├── infrastructure/                        # Реализации
+│   │   ├── crypto/session.go                  # ChaCha20Session, Curve25519KeyExchange
+│   │   ├── vpn/
+│   │   │   ├── client.go                      # NovaVPNClient, UDP/TUN loops
+│   │   │   └── handshake/performer.go         # 3-way handshake, PSK bootstrap
+│   │   ├── network/
+│   │   │   ├── wintun.go                      # WinTUN-адаптер
+│   │   │   └── configurator.go                # Маршруты, DNS, интерфейсы
+│   │   ├── ipc/
+│   │   │   ├── client.go                      # Named Pipe IPC клиент (GUI)
+│   │   │   └── server.go                      # Named Pipe IPC сервер (Service)
+│   │   └── config/manager.go                  # JSON конфиг менеджер
+│   ├── application/vpnservice/service.go      # Бизнес-логика VPN-сервиса
+│   ├── gui/app.go                             # Walk GUI
+│   ├── ipc/ipc.go                             # IPC протокол (команды/ответы)
+│   ├── protocol/protocol.go                   # Wire format (packet, handshake)
+│   ├── service/service.go                     # Windows Service handler
+│   ├── config/config.go                       # Типы конфигурации
+│   └── elevation/elevation.go                 # UAC elevation helper
 └── go.mod
 ```
+
+> **Архитектура**: GUI-процесс (`novavpn.exe`) взаимодействует с Windows Service (`novavpn-service.exe`) через Named Pipe IPC (`\\.\pipe\NovaVPN`). VPN-логика выполняется в контексте сервиса с правами администратора.
 
 ---
 
