@@ -90,8 +90,10 @@ func (c *WindowsConfigurator) RestoreDNS(ifaceName string) error {
 }
 
 // AddRoute добавляет маршрут в таблицу маршрутизации.
+// destination может содержать маску: "10.0.0.0 mask 255.0.0.0" — она разбивается на отдельные аргументы.
 func (c *WindowsConfigurator) AddRoute(destination string, gateway net.IP, metric int) error {
-	args := []string{"add", destination}
+	// Разбиваем destination на отдельные аргументы ("0.0.0.0 mask 128.0.0.0" → ["0.0.0.0", "mask", "128.0.0.0"])
+	args := append([]string{"add"}, strings.Fields(destination)...)
 	if gateway != nil {
 		args = append(args, gateway.String())
 	}
@@ -116,16 +118,22 @@ func (c *WindowsConfigurator) AddRoute(destination string, gateway net.IP, metri
 }
 
 // RemoveRoute удаляет маршрут из таблицы маршрутизации.
+// destination может содержать маску: "0.0.0.0 mask 128.0.0.0" — она разбивается на отдельные аргументы.
 func (c *WindowsConfigurator) RemoveRoute(destination string) error {
-	cmd := exec.Command("route", "delete", destination)
+	// Разбиваем destination на отдельные аргументы, чтобы каждый передавался отдельно.
+	// Без этого Go на Windows оборачивает строку с пробелами в кавычки,
+	// и route.exe не может распарсить "0.0.0.0 mask 128.0.0.0" как один аргумент.
+	args := append([]string{"delete"}, strings.Fields(destination)...)
+	cmd := exec.Command("route", args...)
 	cmd.SysProcAttr = &windows.SysProcAttr{HideWindow: true}
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
+		outStr := string(output)
 		// Игнорируем ошибку если маршрут не существует
-		if !strings.Contains(string(output), "not found") {
-			log.Printf("[NET] route output: %s", string(output))
-			return fmt.Errorf("delete route: %w", err)
+		if !strings.Contains(outStr, "not found") && !strings.Contains(outStr, "not exist") {
+			log.Printf("[NET] route delete output: %s", outStr)
+			return fmt.Errorf("delete route %s: %w", destination, err)
 		}
 	}
 
@@ -238,13 +246,30 @@ func (c *WindowsConfigurator) SetupVPNRoutes(ifaceName string, vpnIP, serverIP n
 
 // CleanupVPNRoutes удаляет VPN маршруты.
 func (c *WindowsConfigurator) CleanupVPNRoutes() error {
-	c.RemoveRoute("0.0.0.0 mask 128.0.0.0")
-	c.RemoveRoute("128.0.0.0 mask 128.0.0.0")
-	if c.serverIP != nil {
-		c.RemoveRoute(fmt.Sprintf("%s mask 255.255.255.255", c.serverIP.String()))
+	var lastErr error
+
+	if err := c.RemoveRoute("0.0.0.0 mask 128.0.0.0"); err != nil {
+		log.Printf("[NET] Не удалось удалить маршрут 0.0.0.0/1: %v", err)
+		lastErr = err
 	}
+	if err := c.RemoveRoute("128.0.0.0 mask 128.0.0.0"); err != nil {
+		log.Printf("[NET] Не удалось удалить маршрут 128.0.0.0/1: %v", err)
+		lastErr = err
+	}
+	if c.serverIP != nil {
+		if err := c.RemoveRoute(fmt.Sprintf("%s mask 255.255.255.255", c.serverIP.String())); err != nil {
+			log.Printf("[NET] Не удалось удалить маршрут сервера: %v", err)
+			lastErr = err
+		}
+	}
+
+	// Сбрасываем DNS-кеш — после смены маршрутов старые DNS-записи могут быть невалидны
+	flushCmd := exec.Command("ipconfig", "/flushdns")
+	flushCmd.SysProcAttr = &windows.SysProcAttr{HideWindow: true}
+	flushCmd.Run()
+
 	log.Println("[NET] VPN маршруты очищены")
-	return nil
+	return lastErr
 }
 
 // getPhysicalGateway возвращает физический шлюз и IF index.

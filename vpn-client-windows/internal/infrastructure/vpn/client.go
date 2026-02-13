@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -210,10 +211,11 @@ func (c *NovaVPNClient) Connect(params domainvpn.ConnectParams) error {
 	// Запускаем циклы обработки ДО настройки сети (UDP read/keepalive работают сразу)
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 	c.stopped.Store(false)
-	c.wg.Add(3)
+	c.wg.Add(4)
 	go c.udpReadLoop()
 	go c.tunReadLoop()
 	go c.keepaliveLoop()
+	go c.networkMonitorLoop()
 
 	// Настраиваем сеть (параллельно с уже запущенными циклами)
 	if err := c.configureNetwork(); err != nil {
@@ -567,7 +569,7 @@ func (c *NovaVPNClient) keepaliveLoop() {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 
-	const deadPeerTimeout = 45 * time.Second // keepalive шлётся каждые 15с; 45с = 3 пропуска
+	const deadPeerTimeout = 20 * time.Second // keepalive шлётся каждые 15с; 20с ≈ 1 пропуск + запас
 
 	for {
 		select {
@@ -716,6 +718,14 @@ func (c *NovaVPNClient) reconnect() {
 	maxRetries := 60
 	backoff := time.Second
 
+	// Очищаем VPN-маршруты — без этого трафик к серверу идёт через мёртвый TUN
+	if wc, ok := c.netConfig.(interface{ CleanupVPNRoutes() error }); ok {
+		log.Println("[VPN] Reconnect: очистка VPN-маршрутов")
+		if err := wc.CleanupVPNRoutes(); err != nil {
+			log.Printf("[VPN] Reconnect: ошибка очистки маршрутов: %v", err)
+		}
+	}
+
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		if c.stopped.Load() {
 			c.setState(domainvpn.StateDisconnected)
@@ -735,6 +745,35 @@ func (c *NovaVPNClient) reconnect() {
 		if c.stopped.Load() {
 			c.setState(domainvpn.StateDisconnected)
 			return
+		}
+
+		// Проверяем наличие физической сети перед попыткой
+		if !c.hasPhysicalNetwork() {
+			log.Printf("[VPN] Reconnect: нет физической сети, ожидание...")
+			backoff = 2 * time.Second // не увеличиваем backoff без сети
+			continue
+		}
+
+		// Ждём стабилизации сети после восстановления Wi-Fi:
+		// DHCP, ARP, маршруты могут быть ещё не готовы
+		log.Printf("[VPN] Reconnect: сеть обнаружена, ожидание стабилизации (3с)...")
+		select {
+		case <-time.After(3 * time.Second):
+		case <-c.stopCh:
+			c.setState(domainvpn.StateDisconnected)
+			return
+		}
+
+		if c.stopped.Load() {
+			c.setState(domainvpn.StateDisconnected)
+			return
+		}
+
+		// Повторно проверяем сеть после ожидания
+		if !c.hasPhysicalNetwork() {
+			log.Printf("[VPN] Reconnect: сеть пропала во время стабилизации")
+			backoff = 2 * time.Second
+			continue
 		}
 
 		// Новый UDP-сокет
@@ -816,11 +855,9 @@ func (c *NovaVPNClient) reconnect() {
 		go c.udpReadLoop()
 		go c.keepaliveLoop()
 
-		// Перенастраиваем сеть если IP изменился (полный handshake)
-		if !resumed {
-			if err := c.configureNetwork(); err != nil {
-				log.Printf("[VPN] Reconnect: ошибка настройки сети: %v (продолжаем)", err)
-			}
+		// Перенастраиваем сеть (маршруты, DNS) — всегда, т.к. физический шлюз мог измениться
+		if err := c.configureNetwork(); err != nil {
+			log.Printf("[VPN] Reconnect: ошибка настройки сети: %v (продолжаем)", err)
 		}
 
 		c.connectedAt = time.Now()
@@ -875,4 +912,88 @@ func getSendCounter(session domaincrypto.Session) uint64 {
 		return sc.GetSendCounter()
 	}
 	return 0
+}
+
+// networkMonitorLoop отслеживает изменения сетевых интерфейсов Windows.
+// При потере физической сети немедленно инициирует переподключение,
+// не дожидаясь dead-peer detection (20с).
+func (c *NovaVPNClient) networkMonitorLoop() {
+	defer c.wg.Done()
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	hadNetwork := true
+
+	for {
+		select {
+		case <-c.stopCh:
+			return
+		case <-ticker.C:
+			if c.stopped.Load() {
+				return
+			}
+
+			// Пропускаем проверку во время переподключения
+			if c.reconnecting.Load() {
+				continue
+			}
+
+			state := c.GetState()
+			if state != domainvpn.StateConnected {
+				// Сбрасываем флаг когда не подключены
+				hadNetwork = true
+				continue
+			}
+
+			hasNetwork := c.hasPhysicalNetwork()
+
+			if hadNetwork && !hasNetwork {
+				// Сеть пропала — немедленно инициируем переподключение
+				log.Println("[VPN] Физическая сеть потеряна (network monitor), инициируем переподключение...")
+				hadNetwork = false
+				// Закрываем соединение — udpReadLoop получит ошибку и вызовет reconnect
+				if conn := c.conn; conn != nil {
+					conn.Close()
+				}
+			} else if !hadNetwork && hasNetwork {
+				log.Println("[VPN] Физическая сеть восстановлена (network monitor)")
+				hadNetwork = true
+			}
+		}
+	}
+}
+
+// hasPhysicalNetwork проверяет наличие активного физического сетевого интерфейса с IPv4-адресом.
+func (c *NovaVPNClient) hasPhysicalNetwork() bool {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return false
+	}
+	for _, iface := range ifaces {
+		// Пропускаем loopback и выключенные интерфейсы
+		if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		// Пропускаем виртуальные интерфейсы (TUN, VPN, VM)
+		name := strings.ToLower(iface.Name)
+		if strings.Contains(name, "wintun") || strings.Contains(name, "novavpn") ||
+			strings.Contains(name, "virtual") || strings.Contains(name, "vmware") ||
+			strings.Contains(name, "virtualbox") || strings.Contains(name, "hyper-v") ||
+			strings.Contains(name, "loopback") || strings.Contains(name, "tailscale") ||
+			strings.Contains(name, "vethernet") || strings.Contains(name, "docker") {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			if ipnet, ok := addr.(*net.IPNet); ok {
+				if ip4 := ipnet.IP.To4(); ip4 != nil && !ip4.IsLoopback() {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }

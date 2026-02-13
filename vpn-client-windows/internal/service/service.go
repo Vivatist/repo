@@ -67,51 +67,50 @@ func (s *novaVPNService) Execute(args []string, r <-chan svc.ChangeRequest, chan
 	changes <- svc.Status{State: svc.Running, Accepts: cmdsAccepted}
 	log.Println("[SERVICE] Сервис запущен")
 
-	for {
-		select {
-		case c := <-r:
-			switch c.Cmd {
-			case svc.Interrogate:
-				changes <- c.CurrentStatus
-			case svc.Stop, svc.Shutdown:
-				changes <- svc.Status{State: svc.StopPending}
-				log.Println("[SERVICE] Останавливаем сервис...")
+	for c := range r {
+		switch c.Cmd {
+		case svc.Interrogate:
+			changes <- c.CurrentStatus
+		case svc.Stop, svc.Shutdown:
+			changes <- svc.Status{State: svc.StopPending}
+			log.Println("[SERVICE] Останавливаем сервис...")
 
-				// Отключаем VPN если подключён
+			// Отключаем VPN если подключён
+			if vpnSvc.GetState() == domainvpn.StateConnected {
+				vpnSvc.Disconnect()
+			}
+
+			// Останавливаем IPC
+			ipcServer.Stop()
+
+			return false, 0
+		case svc.PowerEvent:
+			switch c.EventType {
+			case pbtAPMSuspend:
+				log.Println("[SERVICE] Система переходит в спящий режим")
+			case pbtAPMResumeAutomatic, pbtAPMResumeSuspend:
+				log.Println("[SERVICE] Система возобновлена из спящего режима")
+				// Если VPN был подключён, принудительно переподключаем:
+				// после sleep UDP-сокет мёртв, но клиент может этого не знать
 				if vpnSvc.GetState() == domainvpn.StateConnected {
-					vpnSvc.Disconnect()
-				}
-
-				// Останавливаем IPC
-				ipcServer.Stop()
-
-				return false, 0
-			case svc.PowerEvent:
-				switch c.EventType {
-				case pbtAPMSuspend:
-					log.Println("[SERVICE] Система переходит в спящий режим")
-				case pbtAPMResumeAutomatic, pbtAPMResumeSuspend:
-					log.Println("[SERVICE] Система возобновлена из спящего режима")
-					// Если VPN был подключён, принудительно переподключаем:
-					// после sleep UDP-сокет мёртв, но клиент может этого не знать
-					if vpnSvc.GetState() == domainvpn.StateConnected {
-						log.Println("[SERVICE] Переподключение VPN после resume...")
-						go func() {
-							params := vpnSvc.GetConnectParams()
-							if err := vpnSvc.Disconnect(); err != nil {
-								log.Printf("[SERVICE] Ошибка отключения после resume: %v", err)
-							}
-							// Пауза для восстановления сети
-							time.Sleep(networkRecoveryDelay)
-							if err := vpnSvc.Connect(params); err != nil {
-								log.Printf("[SERVICE] Ошибка переподключения после resume: %v", err)
-							}
-						}()
-					}
+					log.Println("[SERVICE] Переподключение VPN после resume...")
+					go func() {
+						params := vpnSvc.GetConnectParams()
+						if err := vpnSvc.Disconnect(); err != nil {
+							log.Printf("[SERVICE] Ошибка отключения после resume: %v", err)
+						}
+						// Пауза для восстановления сети
+						time.Sleep(networkRecoveryDelay)
+						if err := vpnSvc.Connect(params); err != nil {
+							log.Printf("[SERVICE] Ошибка переподключения после resume: %v", err)
+						}
+					}()
 				}
 			}
 		}
 	}
+
+	return false, 0
 }
 
 // handleIPCRequest обрабатывает IPC-запросы от GUI.
