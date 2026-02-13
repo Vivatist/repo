@@ -12,7 +12,8 @@ import (
 	"github.com/novavpn/vpn-server/internal/protocol"
 )
 
-// handlePacket обрабатывает входящий пакет.
+// handlePacket обрабатывает входящий пакет (только handshake — вызывается из горутины).
+// Data/Keepalive/Disconnect обрабатываются inline в udpReadLoop.
 func (s *VPNServer) handlePacket(data []byte, remoteAddr *net.UDPAddr) {
 	pkt, err := protocol.Unmarshal(data)
 	if err != nil {
@@ -29,17 +30,8 @@ func (s *VPNServer) handlePacket(data []byte, remoteAddr *net.UDPAddr) {
 	case protocol.PacketHandshakeComplete:
 		s.handleHandshakeComplete(pkt, remoteAddr)
 
-	case protocol.PacketData:
-		s.handleDataPacket(pkt, remoteAddr)
-
-	case protocol.PacketKeepalive:
-		s.handleKeepalive(pkt, remoteAddr)
-
-	case protocol.PacketDisconnect:
-		s.handleDisconnect(pkt, remoteAddr)
-
 	default:
-		log.Printf("[PROTO] Неизвестный тип пакета 0x%02X от %s", pkt.Header.Type, remoteAddr)
+		log.Printf("[PROTO] Неожиданный тип пакета 0x%02X в handlePacket от %s", pkt.Header.Type, remoteAddr)
 	}
 }
 
@@ -156,6 +148,13 @@ func (s *VPNServer) handleHandshakeInit(pkt *protocol.Packet, remoteAddr *net.UD
 	}
 	session.Keys = sessionKeys
 
+	// Инициализируем кешированные AEAD для быстрого шифрования/дешифрования
+	if err := session.InitCrypto(); err != nil {
+		log.Printf("[HANDSHAKE] Ошибка инициализации AEAD: %v", err)
+		s.sessions.RemoveSession(session)
+		return
+	}
+
 	// Обнуляем shared secret
 	protocol.ZeroKey(&sharedSecret)
 
@@ -232,11 +231,17 @@ func (s *VPNServer) handleHandshakeInit(pkt *protocol.Packet, remoteAddr *net.UD
 		return
 	}
 
-	log.Printf("[HANDSHAKE] Отправлен HandshakeResp сессии #%d для %s (VPN IP: %s)",
+	// 1-RTT: активируем сессию сразу после отправки Resp, не дожидаясь Complete.
+	// Клиент может слать данные сразу после получения Resp.
+	session.SetState(SessionStateActive)
+	session.UpdateActivity()
+
+	log.Printf("[HANDSHAKE] Отправлен HandshakeResp сессии #%d для %s (VPN IP: %s), сессия активна",
 		session.ID, remoteAddr, session.AssignedIP)
 }
 
-// handleHandshakeComplete обрабатывает завершение рукопожатия.
+// handleHandshakeComplete обрабатывает подтверждение рукопожатия.
+// При 1-RTT схеме сессия уже активна — Complete служит лишь подтверждением.
 func (s *VPNServer) handleHandshakeComplete(pkt *protocol.Packet, remoteAddr *net.UDPAddr) {
 	session := s.sessions.GetSessionByID(pkt.Header.SessionID)
 	if session == nil {
@@ -245,11 +250,8 @@ func (s *VPNServer) handleHandshakeComplete(pkt *protocol.Packet, remoteAddr *ne
 		return
 	}
 
-	if session.GetState() != SessionStateHandshake {
-		log.Printf("[HANDSHAKE] HandshakeComplete для сессии #%d в неверном состоянии: %s",
-			session.ID, session.GetState())
-		return
-	}
+	// При 1-RTT сессия уже активна после отправки Resp.
+	// Complete — подтверждение клиента, валидируем HMAC для безопасности.
 
 	// Расшифровываем payload
 	plaintext, err := protocol.Decrypt(session.Keys.RecvKey, pkt.Nonce, pkt.Payload, nil)
@@ -273,91 +275,14 @@ func (s *VPNServer) handleHandshakeComplete(pkt *protocol.Packet, remoteAddr *ne
 		return
 	}
 
-	// Активируем сессию
-	session.SetState(SessionStateActive)
-	session.UpdateActivity()
-
-	log.Printf("[HANDSHAKE] ✓ Сессия #%d активирована (клиент: %s, VPN IP: %s)",
-		session.ID, remoteAddr, session.AssignedIP)
-}
-
-// handleDataPacket обрабатывает зашифрованный пакет данных.
-func (s *VPNServer) handleDataPacket(pkt *protocol.Packet, remoteAddr *net.UDPAddr) {
-	session := s.sessions.GetSessionByID(pkt.Header.SessionID)
-	if session == nil {
-		return
-	}
-
-	if !session.IsActive() {
-		return
-	}
-
-	// Расшифровываем
-	plaintext, err := protocol.Decrypt(session.Keys.RecvKey, pkt.Nonce, pkt.Payload, nil)
-	if err != nil {
-		if s.cfg.LogLevel == "debug" {
-			log.Printf("[DATA] Ошибка расшифровки от сессии #%d: %v", session.ID, err)
-		}
-		return
-	}
-
-	session.UpdateActivity()
-	session.BytesRecv.Add(uint64(len(plaintext)))
-	session.PacketsRecv.Add(1)
-
-	// Записываем IP-пакет в TUN
-	if _, err := s.tunDev.Write(plaintext); err != nil {
-		if s.cfg.LogLevel == "debug" {
-			log.Printf("[TUN] Ошибка записи в TUN: %v", err)
-		}
-	}
-}
-
-// handleKeepalive обрабатывает keepalive пакет.
-func (s *VPNServer) handleKeepalive(pkt *protocol.Packet, remoteAddr *net.UDPAddr) {
-	session := s.sessions.GetSessionByID(pkt.Header.SessionID)
-	if session == nil {
-		return
-	}
-
-	session.UpdateActivity()
-
-	if s.cfg.LogLevel == "debug" {
-		log.Printf("[KEEPALIVE] Получен от сессии #%d", session.ID)
-	}
-
-	// Отправляем keepalive обратно
-	respPkt := protocol.NewKeepalivePacket(session.ID, session.NextSendSeq())
-	respBytes, _ := respPkt.Marshal()
-	s.udpConn.WriteToUDP(respBytes, remoteAddr)
-}
-
-// handleDisconnect обрабатывает запрос на отключение.
-func (s *VPNServer) handleDisconnect(pkt *protocol.Packet, remoteAddr *net.UDPAddr) {
-	session := s.sessions.GetSessionByID(pkt.Header.SessionID)
-	if session == nil {
-		return
-	}
-
-	log.Printf("[DISCONNECT] Клиент отключается: сессия #%d (%s)", session.ID, remoteAddr)
-	s.sessions.RemoveSession(session)
+	log.Printf("[HANDSHAKE] ✓ HandshakeComplete подтверждён для сессии #%d (клиент: %s)",
+		session.ID, remoteAddr)
 }
 
 // sendToClient шифрует и отправляет данные клиенту.
-func (s *VPNServer) sendToClient(session *Session, plaintext []byte) {
-	seq := session.NextSendSeq()
-
-	// Формируем заголовок пакета
-	header := protocol.PacketHeader{
-		Version:    protocol.ProtocolVersion,
-		Type:       protocol.PacketData,
-		SessionID:  session.ID,
-		SequenceNo: seq,
-		PayloadLen: uint16(len(plaintext)),
-	}
-
-	// В v2 протоколе AAD не используется для data-пакетов
-	nonce, ciphertext, err := protocol.Encrypt(session.Keys.SendKey, plaintext, nil)
+// buf — пре-аллоцированный буфер для inline-сборки пакета (zero-alloc hot path).
+func (s *VPNServer) sendToClient(session *Session, plaintext []byte, buf []byte) {
+	n, err := session.EncryptAndBuild(buf, plaintext)
 	if err != nil {
 		if s.cfg.LogLevel == "debug" {
 			log.Printf("[SEND] Ошибка шифрования для сессии #%d: %v", session.ID, err)
@@ -365,21 +290,7 @@ func (s *VPNServer) sendToClient(session *Session, plaintext []byte) {
 		return
 	}
 
-	var nonceArr [protocol.NonceSize]byte
-	copy(nonceArr[:], nonce[:])
-
-	pkt := &protocol.Packet{
-		Header:  header,
-		Nonce:   nonceArr,
-		Payload: ciphertext,
-	}
-	data, err := pkt.Marshal()
-	if err != nil {
-		return
-	}
-
-	// Отправляем
-	if _, err := s.udpConn.WriteToUDP(data, session.ClientAddr); err != nil {
+	if _, err := s.udpConn.WriteToUDP(buf[:n], session.ClientAddr); err != nil {
 		if s.cfg.LogLevel == "debug" {
 			log.Printf("[SEND] Ошибка отправки в сессию #%d: %v", session.ID, err)
 		}
@@ -391,13 +302,19 @@ func (s *VPNServer) sendToClient(session *Session, plaintext []byte) {
 }
 
 // sendKeepalives отправляет keepalive всем активным клиентам.
+// Lightweight формат: TLS(5) + SID(4) + Type(1) = 10 bytes, zero-alloc.
 func (s *VPNServer) sendKeepalives() {
 	sessions := s.sessions.GetAllSessions()
+	var kaBuf [10]byte
+	kaBuf[0] = protocol.TLSContentType
+	kaBuf[1] = protocol.TLSVersionMajor
+	kaBuf[2] = protocol.TLSVersionMinor
+	binary.BigEndian.PutUint16(kaBuf[3:5], 5)
+	kaBuf[9] = byte(protocol.PacketKeepalive)
 	for _, session := range sessions {
 		if session.IsActive() {
-			pkt := protocol.NewKeepalivePacket(session.ID, session.NextSendSeq())
-			data, _ := pkt.Marshal()
-			s.udpConn.WriteToUDP(data, session.ClientAddr)
+			binary.BigEndian.PutUint32(kaBuf[5:9], session.ID)
+			s.udpConn.WriteToUDP(kaBuf[:], session.ClientAddr)
 		}
 	}
 }

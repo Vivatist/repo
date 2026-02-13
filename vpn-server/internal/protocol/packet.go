@@ -42,10 +42,19 @@ const (
 	// PacketTypeSize — размер поля типа пакета (открытое, для маршрутизации)
 	PacketTypeSize = 1
 
-	// TotalOverhead — общий оверхед протокола (для расчёта буферов)
+	// TotalOverhead — общий оверхед handshake/control пакетов (для расчёта буферов)
 	TotalOverhead = TLSHeaderSize + SessionIDSize + PacketTypeSize + NonceSize + AuthTagSize
 
-	// HeaderSize — минимальный размер заголовка для валидации входящих пакетов
+	// CounterSize — размер counter на wire (4 байта uint32)
+	CounterSize = 4
+
+	// DataOverhead — оверхед data-пакетов: TLS(5) + SID(4) + Type(1) + Counter(4) = 14
+	DataOverhead = TLSHeaderSize + SessionIDSize + PacketTypeSize + CounterSize
+
+	// MinPacketSize — минимальный размер пакета (keepalive/disconnect): TLS(5) + SID(4) + Type(1) = 10
+	MinPacketSize = TLSHeaderSize + SessionIDSize + PacketTypeSize
+
+	// HeaderSize — размер заголовка handshake-пакетов
 	HeaderSize = TLSHeaderSize + SessionIDSize + PacketTypeSize + NonceSize
 )
 

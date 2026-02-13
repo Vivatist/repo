@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"fmt"
 	"log"
 	"math/big"
@@ -11,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/crypto/chacha20"
 
 	"github.com/novavpn/vpn-server/config"
 	"github.com/novavpn/vpn-server/internal/auth"
@@ -36,9 +39,6 @@ type VPNServer struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
-
-	// Буферный пул для снижения нагрузки GC
-	bufPool sync.Pool
 
 	// Хранилище пользователей (email + пароль)
 	userStore *auth.UserStore
@@ -71,12 +71,6 @@ func NewVPNServer(cfg *config.ServerConfig) (*VPNServer, error) {
 		ctx:       ctx,
 		cancel:    cancel,
 		userStore: userStore,
-		bufPool: sync.Pool{
-			New: func() interface{} {
-				buf := make([]byte, cfg.MTU+protocol.TotalOverhead+100)
-				return &buf
-			},
-		},
 	}
 
 	// Загружаем пользователей
@@ -195,44 +189,136 @@ func (s *VPNServer) Stop() {
 }
 
 // udpReadLoop — основной цикл приёма UDP-пакетов.
+// Data/Keepalive/Disconnect обрабатываются inline (без горутин и пулов).
+// Handshake-пакеты обрабатываются в отдельной горутине (редкие).
 func (s *VPNServer) udpReadLoop() {
 	defer s.wg.Done()
 
 	log.Println("[UDP] Запущен цикл приёма пакетов")
 
+	buf := make([]byte, s.cfg.MTU+protocol.TotalOverhead+100)
+	// Пре-аллоцированный буфер для дешифрования (zero-alloc)
+	decryptBuf := make([]byte, 0, s.cfg.MTU+100)
+
 	for {
-		select {
-		case <-s.ctx.Done():
-			return
-		default:
-		}
-
-		bufPtr := s.bufPool.Get().(*[]byte)
-		buf := *bufPtr
-
 		n, remoteAddr, err := s.udpConn.ReadFromUDP(buf)
 		if err != nil {
 			select {
 			case <-s.ctx.Done():
-				s.bufPool.Put(bufPtr)
 				return
 			default:
 				log.Printf("[UDP] Ошибка чтения: %v", err)
-				s.bufPool.Put(bufPtr)
 				continue
 			}
 		}
 
-		if n < protocol.HeaderSize {
-			s.bufPool.Put(bufPtr)
+		if n < protocol.MinPacketSize {
 			continue
 		}
 
-		// Обрабатываем пакет
-		go func() {
-			defer s.bufPool.Put(bufPtr)
-			s.handlePacket(buf[:n], remoteAddr)
-		}()
+		// Inline-парсинг заголовка без аллокаций
+		raw := buf[:n]
+		if len(raw) >= protocol.TLSHeaderSize && raw[0] == protocol.TLSContentType {
+			raw = raw[protocol.TLSHeaderSize:]
+		}
+		// SessionID(4) + Type(1) = 5 минимум
+		if len(raw) < 5 {
+			continue
+		}
+
+		sessionID := binary.BigEndian.Uint32(raw[0:4])
+		pktType := protocol.PacketType(raw[4])
+
+		switch pktType {
+		case protocol.PacketData:
+			// Hot path: inline обработка без горутины и Unmarshal
+			// Data: SID(4) + Type(1) + Counter(4) + CT (plain ChaCha20, без auth tag)
+			if len(raw) < 9 {
+				continue
+			}
+
+			session := s.sessions.GetSessionByID(sessionID)
+			if session == nil || !session.IsActive() {
+				continue
+			}
+
+			counter := binary.BigEndian.Uint32(raw[5:9])
+			payload := raw[9:]
+
+			// Восстанавливаем полный nonce
+			var nonce [protocol.NonceSize]byte
+			copy(nonce[:4], session.recvNoncePrefix[:])
+			binary.BigEndian.PutUint64(nonce[4:], uint64(counter))
+
+			// Plain ChaCha20 XOR дешифровка (zero-alloc)
+			plaintextLen := len(payload)
+			if cap(decryptBuf) < plaintextLen {
+				decryptBuf = make([]byte, plaintextLen)
+			} else {
+				decryptBuf = decryptBuf[:plaintextLen]
+			}
+			c, err := chacha20.NewUnauthenticatedCipher(session.Keys.RecvKey[:], nonce[:])
+			if err != nil {
+				continue
+			}
+			c.XORKeyStream(decryptBuf, payload)
+			plaintext := decryptBuf
+
+			session.UpdateActivity()
+			session.BytesRecv.Add(uint64(len(plaintext)))
+			session.PacketsRecv.Add(1)
+
+			if _, err := s.tunDev.Write(plaintext); err != nil {
+				if s.cfg.LogLevel == "debug" {
+					log.Printf("[TUN] Ошибка записи в TUN: %v", err)
+				}
+			}
+
+		case protocol.PacketKeepalive:
+			session := s.sessions.GetSessionByID(sessionID)
+			if session == nil {
+				continue
+			}
+			session.UpdateActivity()
+			// Address migration: обновляем адрес клиента при смене IP/порта (0-RTT resume, NAT rebind)
+			if session.ClientAddr.String() != remoteAddr.String() {
+				log.Printf("[KEEPALIVE] Address migration #%d: %s -> %s", session.ID, session.ClientAddr, remoteAddr)
+				s.sessions.UpdateClientAddr(session, remoteAddr)
+			}
+			if s.cfg.LogLevel == "debug" {
+				log.Printf("[KEEPALIVE] Получен от сессии #%d", session.ID)
+			}
+			// Lightweight keepalive response: TLS(5) + SID(4) + Type(1) = 10 bytes, zero-alloc
+			var kaBuf [10]byte
+			kaBuf[0] = protocol.TLSContentType
+			kaBuf[1] = protocol.TLSVersionMajor
+			kaBuf[2] = protocol.TLSVersionMinor
+			binary.BigEndian.PutUint16(kaBuf[3:5], 5)
+			binary.BigEndian.PutUint32(kaBuf[5:9], session.ID)
+			kaBuf[9] = byte(protocol.PacketKeepalive)
+			s.udpConn.WriteToUDP(kaBuf[:], remoteAddr)
+
+		case protocol.PacketDisconnect:
+			session := s.sessions.GetSessionByID(sessionID)
+			if session == nil {
+				continue
+			}
+			// НЕ удаляем сессию — держим для 0-RTT resume.
+			// Истечёт по таймауту (SessionTimeout) в maintenanceLoop.
+			session.UpdateActivity()
+			log.Printf("[DISCONNECT] Клиент отключается: сессия #%d (%s) — сохранена для 0-RTT resume", session.ID, remoteAddr)
+
+		case protocol.PacketHandshakeInit, protocol.PacketHandshakeComplete:
+			// Handshake требует сложной обработки — выносим в горутину
+			packet := make([]byte, n)
+			copy(packet, buf[:n])
+			go s.handlePacket(packet, remoteAddr)
+
+		default:
+			if s.cfg.LogLevel == "debug" {
+				log.Printf("[PROTO] Неизвестный тип пакета 0x%02X от %s", pktType, remoteAddr)
+			}
+		}
 	}
 }
 
@@ -243,14 +329,10 @@ func (s *VPNServer) tunReadLoop() {
 	log.Println("[TUN] Запущен цикл чтения из TUN")
 
 	buf := make([]byte, s.cfg.MTU+100)
+	// Пре-аллоцированный буфер для отправки (zero-alloc hot path)
+	sendBuf := make([]byte, s.cfg.MTU+protocol.TotalOverhead+100)
 
 	for {
-		select {
-		case <-s.ctx.Done():
-			return
-		default:
-		}
-
 		n, err := s.tunDev.Read(buf)
 		if err != nil {
 			select {
@@ -266,11 +348,8 @@ func (s *VPNServer) tunReadLoop() {
 			continue
 		}
 
-		packet := make([]byte, n)
-		copy(packet, buf[:n])
-
-		// Определяем адресата по destination IP
-		dstIP := tun.ExtractDstIP(packet)
+		// Определяем адресата по destination IP (без копирования пакета)
+		dstIP := tun.ExtractDstIP(buf[:n])
 		if dstIP == nil {
 			continue
 		}
@@ -288,8 +367,8 @@ func (s *VPNServer) tunReadLoop() {
 			continue
 		}
 
-		// Шифруем и отправляем
-		s.sendToClient(session, packet)
+		// Шифруем и отправляем без промежуточного копирования
+		s.sendToClient(session, buf[:n], sendBuf)
 	}
 }
 

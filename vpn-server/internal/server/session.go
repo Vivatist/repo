@@ -2,12 +2,19 @@
 package server
 
 import (
+	"crypto/cipher"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"log"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/crypto/chacha20"
+	"golang.org/x/crypto/chacha20poly1305"
 
 	"github.com/novavpn/vpn-server/internal/protocol"
 )
@@ -42,8 +49,6 @@ func (s SessionState) String() string {
 
 // Session представляет VPN-сессию клиента.
 type Session struct {
-	mu sync.RWMutex
-
 	// ID — уникальный идентификатор сессии
 	ID uint32
 
@@ -53,11 +58,25 @@ type Session struct {
 	// AssignedIP — назначенный IP внутри VPN
 	AssignedIP net.IP
 
-	// State — состояние сессии
-	State SessionState
+	// assignedKey — [4]byte ключ для быстрого lookup по IP (без аллокаций)
+	assignedKey [4]byte
+
+	// state — состояние сессии (atomic, без мьютекса)
+	state atomic.Int32
 
 	// Keys — сессионные ключи шифрования
 	Keys *protocol.SessionKeys
+
+	// sendAEAD — кешированный AEAD для шифрования (создаётся один раз при handshake)
+	sendAEAD cipher.AEAD
+	// recvAEAD — кешированный AEAD для дешифрования
+	recvAEAD cipher.AEAD
+
+	// Counter-nonce: prefix(4) + counter(8) = 12 байт nonce.
+	// Prefix выводится из ключа (обе стороны вычисляют одинаково), на wire только counter(4).
+	noncePrefix     [4]byte       // deriveNoncePrefix(sendKey)
+	recvNoncePrefix [4]byte       // deriveNoncePrefix(recvKey)
+	sendCounter     atomic.Uint64 // инкрементируется на каждый пакет
 
 	// ServerKeyPair — ephemeral ключевая пара сервера для этой сессии
 	ServerKeyPair *protocol.KeyPair
@@ -71,8 +90,8 @@ type Session struct {
 	// CreatedAt — время создания сессии
 	CreatedAt time.Time
 
-	// LastActivity — время последней активности
-	LastActivity time.Time
+	// lastActivity — время последней активности (unix timestamp, atomic)
+	lastActivity atomic.Int64
 
 	// BytesSent — отправлено байтов
 	BytesSent atomic.Uint64
@@ -93,27 +112,24 @@ type Session struct {
 // NewSession создаёт новую сессию.
 func NewSession(id uint32, clientAddr *net.UDPAddr) *Session {
 	now := time.Now()
-	return &Session{
-		ID:           id,
-		ClientAddr:   clientAddr,
-		State:        SessionStateHandshake,
-		CreatedAt:    now,
-		LastActivity: now,
+	s := &Session{
+		ID:         id,
+		ClientAddr: clientAddr,
+		CreatedAt:  now,
 	}
+	s.state.Store(int32(SessionStateHandshake))
+	s.lastActivity.Store(now.Unix())
+	return s
 }
 
-// UpdateActivity обновляет время последней активности.
+// UpdateActivity обновляет время последней активности (lock-free).
 func (s *Session) UpdateActivity() {
-	s.mu.Lock()
-	s.LastActivity = time.Now()
-	s.mu.Unlock()
+	s.lastActivity.Store(time.Now().Unix())
 }
 
 // GetLastActivity возвращает время последней активности.
 func (s *Session) GetLastActivity() time.Time {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.LastActivity
+	return time.Unix(s.lastActivity.Load(), 0)
 }
 
 // NextSendSeq возвращает и увеличивает счётчик исходящих пакетов.
@@ -121,23 +137,103 @@ func (s *Session) NextSendSeq() uint32 {
 	return s.SendSeq.Add(1) - 1
 }
 
-// SetState устанавливает состояние сессии.
+// SetState устанавливает состояние сессии (lock-free).
 func (s *Session) SetState(state SessionState) {
-	s.mu.Lock()
-	s.State = state
-	s.mu.Unlock()
+	s.state.Store(int32(state))
 }
 
-// GetState возвращает состояние сессии.
+// GetState возвращает состояние сессии (lock-free).
 func (s *Session) GetState() SessionState {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.State
+	return SessionState(s.state.Load())
 }
 
 // IsActive проверяет, активна ли сессия.
 func (s *Session) IsActive() bool {
 	return s.GetState() == SessionStateActive
+}
+
+// InitCrypto инициализирует кешированные AEAD-инстансы из сессионных ключей.
+// Вызывается один раз при завершении handshake.
+func (s *Session) InitCrypto() error {
+	var err error
+	s.sendAEAD, err = chacha20poly1305.New(s.Keys.SendKey[:])
+	if err != nil {
+		return fmt.Errorf("init send AEAD: %w", err)
+	}
+	s.recvAEAD, err = chacha20poly1305.New(s.Keys.RecvKey[:])
+	if err != nil {
+		return fmt.Errorf("init recv AEAD: %w", err)
+	}
+
+	// Nonce prefix выводится из ключа (обе стороны вычисляют одинаково)
+	s.noncePrefix = deriveNoncePrefix(s.Keys.SendKey[:])
+	s.recvNoncePrefix = deriveNoncePrefix(s.Keys.RecvKey[:])
+
+	return nil
+}
+
+// deriveNoncePrefix выводит 4-байтный nonce prefix из ключа.
+func deriveNoncePrefix(key []byte) [4]byte {
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte("nova-nonce-prefix"))
+	sum := mac.Sum(nil)
+	var prefix [4]byte
+	copy(prefix[:], sum[:4])
+	return prefix
+}
+
+// EncryptAndBuild шифрует plaintext и собирает готовый VPN-пакет в buf.
+// Plain ChaCha20 (XOR) без Poly1305 — нет auth tag.
+// Формат: TLS_Header(5) + SessionID(4) + Type(1) + Counter(4) + Ciphertext
+func (s *Session) EncryptAndBuild(buf []byte, plaintext []byte) (int, error) {
+	ciphertextLen := len(plaintext)      // без overhead: plain XOR
+	dataLen := 4 + 1 + 4 + ciphertextLen // SID + Type + Counter + CT
+	totalLen := protocol.TLSHeaderSize + dataLen
+
+	if len(buf) < totalLen {
+		return 0, fmt.Errorf("buffer too small: %d < %d", len(buf), totalLen)
+	}
+
+	// TLS Record Header (имитация TLS 1.2 Application Data)
+	buf[0] = 0x17 // Application Data
+	buf[1] = 0x03
+	buf[2] = 0x03 // TLS 1.2
+	binary.BigEndian.PutUint16(buf[3:5], uint16(dataLen))
+
+	// SessionID
+	binary.BigEndian.PutUint32(buf[5:9], s.ID)
+
+	// Type
+	buf[9] = byte(protocol.PacketData)
+
+	ctr := s.sendCounter.Add(1)
+	wireCtr := uint32(ctr) // truncate to 32 bit — nonce и wire используют одно значение
+
+	// Полный nonce: prefix(4) + truncated counter(8)
+	var nonce [protocol.NonceSize]byte
+	copy(nonce[0:4], s.noncePrefix[:])
+	binary.BigEndian.PutUint64(nonce[4:12], uint64(wireCtr))
+
+	// На wire только counter (4 байта)
+	binary.BigEndian.PutUint32(buf[10:14], wireCtr)
+
+	// Plain ChaCha20 XOR прямо в buf[14:]
+	c, err := chacha20.NewUnauthenticatedCipher(s.Keys.SendKey[:], nonce[:])
+	if err != nil {
+		return 0, fmt.Errorf("chacha20 init: %w", err)
+	}
+	c.XORKeyStream(buf[14:14+len(plaintext)], plaintext)
+
+	return totalLen, nil
+}
+
+// ipToKey конвертирует net.IP в [4]byte ключ для map lookup без аллокаций.
+func ipToKey(ip net.IP) [4]byte {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return [4]byte{}
+	}
+	return [4]byte{ip4[0], ip4[1], ip4[2], ip4[3]}
 }
 
 // SessionManager управляет всеми активными сессиями.
@@ -147,8 +243,8 @@ type SessionManager struct {
 	// sessions — карта: sessionID -> Session
 	sessions map[uint32]*Session
 
-	// ipToSession — карта: VPN IP -> Session (для маршрутизации)
-	ipToSession map[string]*Session
+	// ipToSession — карта: VPN IP -> Session ([4]byte ключ, без аллокаций)
+	ipToSession map[[4]byte]*Session
 
 	// addrToSession — карта: UDP addr -> Session (для приёма пакетов)
 	addrToSession map[string]*Session
@@ -175,7 +271,7 @@ func NewSessionManager(vpnSubnet string, serverIP string, maxSessions int, sessi
 
 	sm := &SessionManager{
 		sessions:       make(map[uint32]*Session),
-		ipToSession:    make(map[string]*Session),
+		ipToSession:    make(map[[4]byte]*Session),
 		addrToSession:  make(map[string]*Session),
 		ipPool:         pool,
 		maxSessions:    maxSessions,
@@ -214,7 +310,9 @@ func (sm *SessionManager) CreateSession(clientAddr *net.UDPAddr) (*Session, erro
 	session.AssignedIP = assignedIP
 
 	sm.sessions[sessionID] = session
-	sm.ipToSession[assignedIP.String()] = session
+	key := ipToKey(assignedIP)
+	session.assignedKey = key
+	sm.ipToSession[key] = session
 	sm.addrToSession[addrKey] = session
 
 	log.Printf("[SESSION] Создана сессия #%d для %s -> VPN IP: %s",
@@ -241,7 +339,7 @@ func (sm *SessionManager) GetSessionByAddr(addr *net.UDPAddr) *Session {
 func (sm *SessionManager) GetSessionByVPNIP(ip net.IP) *Session {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
-	return sm.ipToSession[ip.String()]
+	return sm.ipToSession[ipToKey(ip)]
 }
 
 // RemoveSession удаляет сессию.
@@ -262,7 +360,7 @@ func (sm *SessionManager) removeSessionLocked(session *Session) {
 	// Освобождаем IP-адрес
 	if session.AssignedIP != nil {
 		sm.ipPool.Release(session.AssignedIP)
-		delete(sm.ipToSession, session.AssignedIP.String())
+		delete(sm.ipToSession, session.assignedKey)
 	}
 
 	// Удаляем из карт
@@ -285,6 +383,22 @@ func (sm *SessionManager) removeSessionLocked(session *Session) {
 		session.BytesSent.Load(),
 		session.BytesRecv.Load(),
 	)
+}
+
+// UpdateClientAddr обновляет UDP-адрес клиента при address migration.
+// Исправляет addrToSession mapping, предотвращая stale entries.
+func (sm *SessionManager) UpdateClientAddr(session *Session, newAddr *net.UDPAddr) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	// Удаляем старый адрес из маппинга
+	if session.ClientAddr != nil {
+		delete(sm.addrToSession, session.ClientAddr.String())
+	}
+
+	// Обновляем адрес и маппинг
+	session.ClientAddr = newAddr
+	sm.addrToSession[newAddr.String()] = session
 }
 
 // CleanupExpired удаляет истёкшие сессии. Вызывается периодически.
@@ -347,7 +461,7 @@ func (sm *SessionManager) ReleaseAndReassignIP(session *Session, fixedIP net.IP)
 
 	// Убираем старый IP из маппинга
 	if session.AssignedIP != nil {
-		delete(sm.ipToSession, session.AssignedIP.String())
+		delete(sm.ipToSession, session.assignedKey)
 		sm.ipPool.Release(session.AssignedIP)
 	}
 
@@ -362,11 +476,13 @@ func (sm *SessionManager) ReleaseAndReassignIP(session *Session, fixedIP net.IP)
 			return
 		}
 		session.AssignedIP = newIP
-		sm.ipToSession[newIP.String()] = session
+		session.assignedKey = ipToKey(newIP)
+		sm.ipToSession[session.assignedKey] = session
 		return
 	}
 
 	session.AssignedIP = fixedIP
-	sm.ipToSession[fixedIP.String()] = session
+	session.assignedKey = ipToKey(fixedIP)
+	sm.ipToSession[session.assignedKey] = session
 	log.Printf("[SESSION] Сессии #%d назначен фиксированный IP: %s", session.ID, fixedIP)
 }

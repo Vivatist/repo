@@ -1,146 +1,140 @@
 //go:build windows
 
-// Package service реализует Windows-сервис NovaVPN.
-// Сервис работает с SYSTEM-привилегиями, управляет TUN-адаптером,
-// маршрутами и VPN-подключением. GUI общается с сервисом через IPC (Named Pipe).
+// Package service управляет Windows-сервисом NovaVPN.
+//
+// Предоставляет установку/удаление/запуск/остановку сервиса через
+// Windows Service Control Manager, а также запуск в режиме сервиса.
 package service
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
-	"sync"
+	"time"
 
 	"golang.org/x/sys/windows/svc"
+	"golang.org/x/sys/windows/svc/mgr"
 
-	"github.com/novavpn/vpn-client-windows/internal/ipc"
-	"github.com/novavpn/vpn-client-windows/internal/vpnclient"
+	"github.com/novavpn/vpn-client-windows/internal/application/vpnservice"
+	domainvpn "github.com/novavpn/vpn-client-windows/internal/domain/vpn"
+	infraipc "github.com/novavpn/vpn-client-windows/internal/infrastructure/ipc"
 )
 
-// ServiceName — имя Windows-сервиса.
-const ServiceName = "NovaVPN"
+const serviceName = "NovaVPN"
 
-// ServiceDisplayName — отображаемое имя сервиса.
-const ServiceDisplayName = "NovaVPN VPN Service"
-
-// ServiceDescription — описание сервиса.
-const ServiceDescription = "Управляет VPN-подключениями NovaVPN. Обеспечивает работу TUN-адаптера и маршрутизации."
-
-// novaVPNService — реализация интерфейса svc.Handler.
-type novaVPNService struct {
-	client      *vpnclient.Client
-	ipcServer   *ipc.Server
-	mu          sync.Mutex
-	pskMu       sync.Mutex // отдельный мьютекс для PSK (избегаем deadlock)
-	receivedPSK string     // PSK полученный при bootstrap-подключении
-}
+// novaVPNService реализует интерфейс svc.Handler.
+type novaVPNService struct{}
 
 // Execute — основной цикл Windows-сервиса.
 func (s *novaVPNService) Execute(args []string, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (bool, uint32) {
 	const cmdsAccepted = svc.AcceptStop | svc.AcceptShutdown
+
 	changes <- svc.Status{State: svc.StartPending}
 
-	// Настраиваем логирование в ProgramData
-	setupServiceLogging()
-
-	log.Println("[SERVICE] NovaVPN Service запускается...")
-
-	// Создаём VPN-клиент
-	s.client = vpnclient.NewClient(func(state vpnclient.ConnectionState, info string) {
-		log.Printf("[SERVICE] Состояние VPN: %s (%s)", state, info)
-	}, func(pskHex string) {
-		s.pskMu.Lock()
-		s.receivedPSK = pskHex
-		s.pskMu.Unlock()
-		log.Printf("[SERVICE] Получен PSK от сервера (bootstrap)")
-	})
-
-	// Запускаем IPC-сервер
-	s.ipcServer = ipc.NewServer(s.handleConnect, s.handleDisconnect, s.handleStatus)
-	if err := s.ipcServer.Start(); err != nil {
-		log.Printf("[SERVICE] Ошибка запуска IPC: %v", err)
+	// Создаём VPN service
+	vpnSvc, err := vpnservice.NewService()
+	if err != nil {
+		log.Printf("[SERVICE] Ошибка создания VPN service: %v", err)
 		changes <- svc.Status{State: svc.StopPending}
 		return false, 1
 	}
 
+	// Создаём IPC-сервер
+	ipcServer := infraipc.NewNamedPipeServer()
+	ipcServer.SetHandler(func(req map[string]interface{}) map[string]interface{} {
+		return handleIPCRequest(vpnSvc, req)
+	})
+
+	// Запускаем IPC-сервер
+	go func() {
+		if err := ipcServer.Start(); err != nil {
+			log.Printf("[SERVICE] Ошибка IPC-сервера: %v", err)
+		}
+	}()
+
 	changes <- svc.Status{State: svc.Running, Accepts: cmdsAccepted}
-	log.Println("[SERVICE] NovaVPN Service запущен и ожидает команд")
+	log.Println("[SERVICE] Сервис запущен")
 
-	// Ожидаем команд от SCM
 	for {
-		c := <-r
-		switch c.Cmd {
-		case svc.Stop, svc.Shutdown:
-			changes <- svc.Status{State: svc.StopPending}
-			log.Println("[SERVICE] Получена команда остановки...")
+		select {
+		case c := <-r:
+			switch c.Cmd {
+			case svc.Interrogate:
+				changes <- c.CurrentStatus
+			case svc.Stop, svc.Shutdown:
+				changes <- svc.Status{State: svc.StopPending}
+				log.Println("[SERVICE] Останавливаем сервис...")
 
-			// Отключаем VPN
-			s.client.Disconnect()
+				// Отключаем VPN если подключён
+				if vpnSvc.GetState() == domainvpn.StateConnected {
+					vpnSvc.Disconnect()
+				}
 
-			// Останавливаем IPC
-			s.ipcServer.Stop()
+				// Останавливаем IPC
+				ipcServer.Stop()
 
-			log.Println("[SERVICE] NovaVPN Service остановлен")
-			return false, 0
-
-		case svc.Interrogate:
-			changes <- c.CurrentStatus
+				return false, 0
+			}
 		}
 	}
 }
 
-// handleConnect — обработчик IPC-команды подключения.
-func (s *novaVPNService) handleConnect(params ipc.ConnectParams) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// handleIPCRequest обрабатывает IPC-запросы от GUI.
+func handleIPCRequest(vpnSvc *vpnservice.Service, req map[string]interface{}) map[string]interface{} {
+	reqType, _ := req["type"].(string)
 
-	log.Printf("[SERVICE] Команда Connect: сервер=%s, email=%s", params.ServerAddr, params.Email)
+	switch reqType {
+	case "connect":
+		payload, _ := req["payload"].(map[string]interface{})
+		if payload == nil {
+			return map[string]interface{}{"type": "error", "error": "missing payload"}
+		}
 
-	return s.client.Connect(vpnclient.ConnectParams{
-		ServerAddr: params.ServerAddr,
-		PSK:        params.PSK,
-		Email:      params.Email,
-		Password:   params.Password,
-	})
-}
+		params := domainvpn.ConnectParams{
+			ServerAddr: fmt.Sprintf("%v", payload["server_addr"]),
+			Email:      fmt.Sprintf("%v", payload["email"]),
+			Password:   fmt.Sprintf("%v", payload["password"]),
+			PSK:        fmt.Sprintf("%v", payload["psk"]),
+		}
 
-// handleDisconnect — обработчик IPC-команды отключения.
-func (s *novaVPNService) handleDisconnect() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+		if err := vpnSvc.Connect(params); err != nil {
+			return map[string]interface{}{"type": "error", "error": err.Error()}
+		}
+		return map[string]interface{}{"type": "ok"}
 
-	log.Println("[SERVICE] Команда Disconnect")
-	s.client.Disconnect()
-}
+	case "disconnect":
+		if err := vpnSvc.Disconnect(); err != nil {
+			return map[string]interface{}{"type": "error", "error": err.Error()}
+		}
+		return map[string]interface{}{"type": "ok"}
 
-// handleStatus — обработчик IPC-запроса статуса.
-func (s *novaVPNService) handleStatus() ipc.StatusInfo {
-	s.pskMu.Lock()
-	psk := s.receivedPSK
-	s.pskMu.Unlock()
+	case "get_status":
+		state := vpnSvc.GetState()
+		stats := vpnSvc.GetStatistics()
+		info := vpnSvc.GetInfo()
 
-	state := s.client.GetState()
-	status := ipc.StatusInfo{
-		State:       int(state),
-		StateText:   state.String(),
-		ReceivedPSK: psk,
-		BytesSent:   s.client.BytesSent.Load(),
-		BytesRecv:   s.client.BytesRecv.Load(),
-		PacketsSent: s.client.PacketsSent.Load(),
-		PacketsRecv: s.client.PacketsRecv.Load(),
+		payload := map[string]interface{}{
+			"state":        int(state),
+			"state_text":   state.String(),
+			"bytes_sent":   stats.BytesSent,
+			"bytes_recv":   stats.BytesRecv,
+			"packets_sent": stats.PacketsSent,
+			"packets_recv": stats.PacketsRecv,
+		}
+
+		if info.AssignedIP != nil {
+			payload["assigned_ip"] = info.AssignedIP.String()
+		}
+
+		return map[string]interface{}{"type": "status", "payload": payload}
+
+	default:
+		return map[string]interface{}{"type": "error", "error": "unknown request type"}
 	}
-	if ip := s.client.GetAssignedIP(); ip != nil {
-		status.AssignedIP = ip.String()
-	}
-	return status
 }
 
-// RunService запускает NovaVPN как Windows-сервис (вызывается SCM).
-func RunService() error {
-	return svc.Run(ServiceName, &novaVPNService{})
-}
-
-// IsRunningAsService определяет, запущен ли процесс как Windows-сервис.
+// IsRunningAsService проверяет, запущен ли процесс как Windows-сервис.
 func IsRunningAsService() bool {
 	isService, err := svc.IsWindowsService()
 	if err != nil {
@@ -149,20 +143,160 @@ func IsRunningAsService() bool {
 	return isService
 }
 
-// setupServiceLogging настраивает логирование сервиса.
-func setupServiceLogging() {
+// RunService запускает процесс в режиме Windows-сервиса.
+func RunService() error {
+	// Настраиваем логирование в файл
 	logDir := filepath.Join(os.Getenv("ProgramData"), "NovaVPN")
 	os.MkdirAll(logDir, 0755)
-
-	f, err := os.OpenFile(
+	logFile, err := os.OpenFile(
 		filepath.Join(logDir, "service.log"),
 		os.O_CREATE|os.O_WRONLY|os.O_APPEND,
 		0644,
 	)
-	if err != nil {
-		return
+	if err == nil {
+		log.SetOutput(logFile)
+		defer logFile.Close()
 	}
 
-	log.SetOutput(f)
-	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
+	log.Println("[SERVICE] Запуск Windows-сервиса NovaVPN...")
+	return svc.Run(serviceName, &novaVPNService{})
+}
+
+// Install устанавливает Windows-сервис.
+func Install(exePath string) error {
+	m, err := mgr.Connect()
+	if err != nil {
+		return fmt.Errorf("connect to SCM: %w", err)
+	}
+	defer m.Disconnect()
+
+	// Проверяем, не установлен ли уже
+	s, err := m.OpenService(serviceName)
+	if err == nil {
+		s.Close()
+		return fmt.Errorf("сервис %s уже установлен", serviceName)
+	}
+
+	s, err = m.CreateService(serviceName, exePath, mgr.Config{
+		DisplayName: "NovaVPN VPN Service",
+		Description: "NovaVPN — VPN-клиент с собственным протоколом",
+		StartType:   mgr.StartAutomatic,
+	})
+	if err != nil {
+		return fmt.Errorf("create service: %w", err)
+	}
+	defer s.Close()
+
+	log.Printf("[SERVICE] Сервис %s установлен: %s", serviceName, exePath)
+	return nil
+}
+
+// Uninstall удаляет Windows-сервис.
+func Uninstall() error {
+	m, err := mgr.Connect()
+	if err != nil {
+		return fmt.Errorf("connect to SCM: %w", err)
+	}
+	defer m.Disconnect()
+
+	s, err := m.OpenService(serviceName)
+	if err != nil {
+		return fmt.Errorf("open service: %w", err)
+	}
+	defer s.Close()
+
+	// Останавливаем если запущен
+	status, err := s.Query()
+	if err == nil && status.State == svc.Running {
+		s.Control(svc.Stop)
+		time.Sleep(2 * time.Second)
+	}
+
+	if err := s.Delete(); err != nil {
+		return fmt.Errorf("delete service: %w", err)
+	}
+
+	log.Printf("[SERVICE] Сервис %s удалён", serviceName)
+	return nil
+}
+
+// Start запускает Windows-сервис.
+func Start() error {
+	m, err := mgr.Connect()
+	if err != nil {
+		return fmt.Errorf("connect to SCM: %w", err)
+	}
+	defer m.Disconnect()
+
+	s, err := m.OpenService(serviceName)
+	if err != nil {
+		return fmt.Errorf("open service: %w", err)
+	}
+	defer s.Close()
+
+	if err := s.Start(); err != nil {
+		return fmt.Errorf("start service: %w", err)
+	}
+
+	return nil
+}
+
+// Stop останавливает Windows-сервис.
+func Stop() error {
+	m, err := mgr.Connect()
+	if err != nil {
+		return fmt.Errorf("connect to SCM: %w", err)
+	}
+	defer m.Disconnect()
+
+	s, err := m.OpenService(serviceName)
+	if err != nil {
+		return fmt.Errorf("open service: %w", err)
+	}
+	defer s.Close()
+
+	_, err = s.Control(svc.Stop)
+	if err != nil {
+		return fmt.Errorf("stop service: %w", err)
+	}
+
+	return nil
+}
+
+// IsInstalled проверяет, установлен ли сервис.
+func IsInstalled() bool {
+	m, err := mgr.Connect()
+	if err != nil {
+		return false
+	}
+	defer m.Disconnect()
+
+	s, err := m.OpenService(serviceName)
+	if err != nil {
+		return false
+	}
+	s.Close()
+	return true
+}
+
+// IsRunning проверяет, запущен ли сервис.
+func IsRunning() bool {
+	m, err := mgr.Connect()
+	if err != nil {
+		return false
+	}
+	defer m.Disconnect()
+
+	s, err := m.OpenService(serviceName)
+	if err != nil {
+		return false
+	}
+	defer s.Close()
+
+	status, err := s.Query()
+	if err != nil {
+		return false
+	}
+
+	return status.State == svc.Running
 }

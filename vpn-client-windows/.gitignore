@@ -1,0 +1,38 @@
+# Бинарные файлы
+*.exe
+*.dll
+*.syso
+
+# Артефакты сборки
+/dist/
+/build/
+
+# Go
+vendor/
+*.test
+*.out
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*.iml
+.DS_Store
+
+# Windows
+Thumbs.db
+desktop.ini
+ehthumbs.db
+
+# Логи
+*.log
+
+# Временные файлы
+*.tmp
+*.temp
+~*
+
+# Тестовые артефакты
+coverage.out
+*.prof
