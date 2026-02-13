@@ -557,7 +557,7 @@ func (c *NovaVPNClient) keepaliveLoop() {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 
-	const deadPeerTimeout = 45 * time.Second // 3 пропущенных keepalive
+	const deadPeerTimeout = 45 * time.Second // keepalive шлётся каждые 15с; 45с = 3 пропуска
 
 	for {
 		select {

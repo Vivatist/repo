@@ -31,6 +31,10 @@ const (
 	pbtAPMSuspend         = 0x04 // система переходит в спящий режим
 	pbtAPMResumeAutomatic = 0x12 // система возобновлена автоматически
 	pbtAPMResumeSuspend   = 0x07 // система возобновлена пользователем
+
+	// Задержка перед переподключением после resume: даём время на восстановление
+	// сетевого стека Windows (DHCP, DNS, Wi-Fi reassociation).
+	networkRecoveryDelay = 2 * time.Second
 )
 
 // Execute — основной цикл Windows-сервиса.
@@ -97,8 +101,8 @@ func (s *novaVPNService) Execute(args []string, r <-chan svc.ChangeRequest, chan
 							if err := vpnSvc.Disconnect(); err != nil {
 								log.Printf("[SERVICE] Ошибка отключения после resume: %v", err)
 							}
-							// Небольшая пауза для восстановления сети
-							time.Sleep(2 * time.Second)
+							// Пауза для восстановления сети
+							time.Sleep(networkRecoveryDelay)
 							if err := vpnSvc.Connect(params); err != nil {
 								log.Printf("[SERVICE] Ошибка переподключения после resume: %v", err)
 							}
