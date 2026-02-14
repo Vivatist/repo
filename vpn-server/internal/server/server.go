@@ -40,6 +40,11 @@ type VPNServer struct {
 	// Batch receiver для пакетного приёма UDP через recvmmsg (Linux)
 	batchRecv *batchReceiver
 
+	// Семафор для ограничения параллельных handshake (Argon2id — CPU-intensive).
+	// Без ограничения при 50+ одновременных подключениях сервер перегружается:
+	// Argon2id(time=3, memory=64MB) × N горутин → OOM / CPU starvation.
+	handshakeSem chan struct{}
+
 	// Контекст для graceful shutdown
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -70,12 +75,13 @@ func NewVPNServer(cfg *config.ServerConfig) (*VPNServer, error) {
 	userStore := auth.NewUserStore(cfg.UsersFile)
 
 	srv := &VPNServer{
-		cfg:       cfg,
-		psk:       psk,
-		sessions:  sessions,
-		ctx:       ctx,
-		cancel:    cancel,
-		userStore: userStore,
+		cfg:          cfg,
+		psk:          psk,
+		sessions:     sessions,
+		ctx:          ctx,
+		cancel:       cancel,
+		userStore:    userStore,
+		handshakeSem: make(chan struct{}, 4), // максимум 4 параллельных Argon2id (4 × 64MB = 256MB)
 	}
 
 	// Загружаем пользователей
