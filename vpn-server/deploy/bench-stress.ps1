@@ -15,7 +15,7 @@
     Длительность каждой ступени (по умолчанию: 15s)
 
 .PARAMETER maxClients
-    Потолок клиентов (по умолчанию: 200)
+    Потолок клиентов (по умолчанию: 2000)
 
 .PARAMETER step
     Шаг увеличения (по умолчанию: 25)
@@ -28,7 +28,7 @@
 
 param(
     [string]$stepDuration = "15s",
-    [int]$maxClients = 200,
+    [int]$maxClients = 2000,
     [int]$step = 25,
     [int]$start = 10
 )
