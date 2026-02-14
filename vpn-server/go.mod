@@ -1,6 +1,6 @@
 module github.com/novavpn/vpn-server
 
-go 1.21
+go 1.25
 
 require (
 	golang.org/x/crypto v0.17.0

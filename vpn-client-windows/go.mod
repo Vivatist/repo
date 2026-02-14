@@ -1,6 +1,6 @@
 module github.com/novavpn/vpn-client-windows
 
-go 1.21
+go 1.25
 
 require (
 	github.com/Microsoft/go-winio v0.6.2

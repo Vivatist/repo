@@ -17,7 +17,7 @@ NovaVPN — собственный VPN-протокол поверх **UDP** с 
 - Маскировка: пакеты обёрнуты в TLS 1.2 Application Data Record Header (обход DPI)
 - PSK: автоматически получается при первом подключении (bootstrap)
 
-**Сервер по умолчанию:** `212.118.54.76:443` (UDP), systemd-сервис `novavpn`.
+**Сервер по умолчанию:** `212.118.41.227:443` (UDP), systemd-сервис `novavpn`.
 
 ---
 
@@ -637,7 +637,7 @@ log_level: "info"           # debug, info, warn, error
 
 ```json
 {
-  "server_addr": "212.118.54.76:443",
+  "server_addr": "212.118.41.227:443",
   "psk": "",
   "email": "user@example.com",
   "password": "secret",

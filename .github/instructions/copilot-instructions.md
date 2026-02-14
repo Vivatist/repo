@@ -51,6 +51,7 @@ NOVAVPN_PROTOCOL.md  (корень репозитория)
 - После КАЖДОГО изменения в протоколе (код клиента или сервера) — обновляй `NOVAVPN_PROTOCOL.md`.
 - После КАЖДОГО изменения логики взаимодействия клиента и сервера (машина состояний, handshake, reconnect, keepalive, обработка ошибок, жизненный цикл соединения) — обновляй `CLIENT_SERVER_INTERACTION.md`.
 - После КАЖДОГО изменения производительности сервера — обновляй `Docs/Дорожная карта оптимизации производительности.md` и прогоняй бенчмарк для фиксации новых базовых метрик.
+- После КАЖДОГО изменения в протоколе (wire format, типы пакетов, шифрование, handshake) — **обновляй бенчмарк** (`vpn-server/cmd/vpnbench/`), т.к. он реализует собственный VPN-клиент и должен соответствовать текущему протоколу. Иначе бенчмарк перестанет подключаться к серверу.
 
 ## 3.1. Руководство по разработке клиентов
 
@@ -177,17 +178,40 @@ config/            — ServerConfig (YAML)
 
 ### 9.2. Как запускать
 
-Бенчмарк — полноценный VPN-клиент без TUN. Выполняет настоящий handshake (ECDH, Argon2id аутентификация) и обмен keepalive-пакетами. Рекомендуется запускать **на самом сервере** (localhost) для исключения сетевых артефактов.
+Бенчмарк — полноценный VPN-клиент без TUN. Выполняет настоящий handshake (ECDH, Argon2id аутентификация) и обмен данными. Два режима: `rtt` (keepalive ping-pong) и `throughput` (data flood). Рекомендуется запускать **на самом сервере** (localhost) для исключения сетевых артефактов.
+
+**Ручной запуск на сервере:**
 
 ```bash
 # Кросс-компиляция
 GOOS=linux GOARCH=amd64 go build -o vpnbench ./cmd/vpnbench/
 
-# Запуск (на сервере)
+# RTT (keepalive ping-pong)
 ./vpnbench -server 127.0.0.1:443 -psk <hex64> \
   -email test@novavpn.app -password NovaVPN2026! \
-  -clients 10 -duration 30s -interval 100ms \
-  -json результат.json
+  -clients 10 -duration 15s -interval 100ms \
+  -mode rtt -json результат.json
+
+# Throughput (data flood)
+./vpnbench -server 127.0.0.1:443 -psk <hex64> \
+  -email test@novavpn.app -password NovaVPN2026! \
+  -clients 1 -duration 15s \
+  -mode throughput -json результат.json
+```
+
+**Автоматический запуск с ноутбука (bench.ps1):**
+
+Скрипт `vpn-server/deploy/bench.ps1` автоматически компилирует, деплоит и запускает серию из 5 тестов (throughput×1, throughput×10, rtt×1, rtt×10, rtt×50) с итоговой сводкой и сравнением с другими VPN-протоколами.
+
+```powershell
+# Полный набор (5 тестов)
+.\bench.ps1
+
+# Быстрый режим (3 теста: throughput×1, rtt×1, rtt×10)
+.\bench.ps1 -quick
+
+# С другой длительностью
+.\bench.ps1 -duration 30s
 ```
 
 ### 9.3. Когда прогонять

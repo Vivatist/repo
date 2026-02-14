@@ -398,7 +398,7 @@ send_packet(type=0x03, sessionID=sessionID, nonce=completeNonce, payload=encrypt
 ### 6.1. Когда срабатывает
 
 - Ошибка чтения UDP (`conn.Read()` → error)
-- Dead-peer detection (20 секунд без данных от сервера)
+- Dead-peer detection (60 секунд без данных от сервера — health monitor `HealthLost`)
 - Network monitor: потеря всех физических сетевых интерфейсов (WiFi disconnect и т.п.)
 - Сервер отправил Disconnect (перезагрузка/остановка)
 
@@ -827,7 +827,7 @@ HKDF-SHA256(
 - [ ] Цикл приёма: UDP → ChaCha20 decrypt → TUN
 - [ ] Цикл отправки: TUN → ChaCha20 encrypt → UDP
 - [ ] Keepalive каждые 15 сек (10 байт)
-- [ ] Dead-peer detection (45 сек без данных от сервера)
+- [ ] Dead-peer detection (60 сек без данных от сервера — `healthLostThreshold`)
 - [ ] Обработка Disconnect от сервера
 - [ ] Auto-reconnect с экспоненциальным backoff
 - [ ] 0-RTT session resume
