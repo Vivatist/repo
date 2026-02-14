@@ -132,7 +132,7 @@ Lightweight-формат без nonce и payload:
 | Шифрование (data) | ChaCha20 (XOR) | 4B counter на wire, nonce = HMAC-prefix + counter |
 | Шифрование (handshake) | ChaCha20-Poly1305 (AEAD) | 12B nonce на wire, 16B auth tag |
 | Целостность | HMAC-SHA256 | Проверка при handshake |
-| Пароли (сервер) | Argon2id | time=3, memory=64MB, threads=4, keyLen=32 |
+| Пароли (сервер) | Argon2id | time=1, memory=4MB, threads=4, keyLen=32 |
 
 ### 3.2. Сессионные ключи
 
@@ -630,7 +630,7 @@ keepalive_interval: 25
 session_timeout: 120
 enable_nat: true
 external_interface: "eth0"
-max_parallel_handshakes: 8  # 1-32, макс. параллельных Argon2id (8 × 64МБ = 512МБ)
+max_parallel_handshakes: 64  # 1-256, макс. параллельных Argon2id (64 × 4МБ = 256МБ)
 enable_gro_gso: "auto"      # "auto"/"true"/"false" — GRO/GSO для TUN (IFF_VNET_HDR)
 log_level: "info"           # debug, info, warn, error
 ```

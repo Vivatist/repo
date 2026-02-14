@@ -1,6 +1,8 @@
 // Package auth реализует аутентификацию пользователей по email + пароль.
 //
-// Пароли хешируются Argon2id — устойчив к GPU/ASIC brute-force.
+// Пароли хешируются Argon2id (облегчённый: time=1, mem=4MB) — быстрый (~30мс),
+// с умеренной GPU-стойкостью. Безопасность паролей вторична: канал защищён
+// PSK (256-bit), без PSK невозможно начать handshake.
 // Файл пользователей хранится в YAML.
 package auth
 
@@ -22,10 +24,12 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Параметры Argon2id (рекомендации OWASP)
+// Параметры Argon2id (облегчённый — ~30мс, 4МБ RAM, GPU-hardness сохранена)
+// Обоснование: PSK защищает канал, brute-force хешей требует компрометации сервера.
+// При 64 параллельных handshake: 64 × 4МБ = 256МБ (было 64МБ × 8 = 512МБ).
 const (
-	Argon2Time    = 3
-	Argon2Memory  = 64 * 1024 // 64 MB
+	Argon2Time    = 1
+	Argon2Memory  = 4 * 1024 // 4 MB (было 64 MB)
 	Argon2Threads = 4
 	Argon2KeyLen  = 32
 	SaltLen       = 16

@@ -50,7 +50,7 @@ type ServerConfig struct {
 	// Внешний сетевой интерфейс (для NAT)
 	ExternalInterface string `yaml:"external_interface"`
 
-	// Максимальное количество параллельных handshake (Argon2id, ~64МБ RAM каждый)
+	// Максимальное количество параллельных handshake (Argon2id, ~4МБ RAM каждый)
 	MaxParallelHandshakes int `yaml:"max_parallel_handshakes"`
 
 	// GRO/GSO для TUN-устройства: "auto", "true", "false"
@@ -80,7 +80,7 @@ func DefaultConfig() *ServerConfig {
 		SessionTimeout:        120,
 		EnableNAT:             true,
 		ExternalInterface:     "eth0",
-		MaxParallelHandshakes: 8,
+		MaxParallelHandshakes: 64,
 		EnableGROGSO:          "auto",
 		LogLevel:              "info",
 	}
@@ -122,8 +122,8 @@ func (c *ServerConfig) Validate() error {
 	if c.MaxClients < 1 || c.MaxClients > 65534 {
 		return fmt.Errorf("max_clients должен быть от 1 до 65534")
 	}
-	if c.MaxParallelHandshakes < 1 || c.MaxParallelHandshakes > 32 {
-		return fmt.Errorf("max_parallel_handshakes должен быть от 1 до 32")
+	if c.MaxParallelHandshakes < 1 || c.MaxParallelHandshakes > 256 {
+		return fmt.Errorf("max_parallel_handshakes должен быть от 1 до 256")
 	}
 	if c.EnableGROGSO != "auto" && c.EnableGROGSO != "true" && c.EnableGROGSO != "false" {
 		return fmt.Errorf("enable_gro_gso должен быть auto, true или false (текущее: %q)", c.EnableGROGSO)

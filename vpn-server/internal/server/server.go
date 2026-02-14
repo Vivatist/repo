@@ -42,8 +42,7 @@ type VPNServer struct {
 	batchRecv *batchReceiver
 
 	// Семафор для ограничения параллельных handshake (Argon2id — CPU-intensive).
-	// Без ограничения при 50+ одновременных подключениях сервер перегружается:
-	// Argon2id(time=3, memory=64MB) × N горутин → OOM / CPU starvation.
+	// Argon2id(time=1, memory=4MB) × N горутин. При 64 параллельных: 64 × 4МБ = 256МБ.
 	handshakeSem chan struct{}
 
 	// Контекст для graceful shutdown
@@ -82,7 +81,7 @@ func NewVPNServer(cfg *config.ServerConfig) (*VPNServer, error) {
 		ctx:          ctx,
 		cancel:       cancel,
 		userStore:    userStore,
-		handshakeSem: make(chan struct{}, cfg.MaxParallelHandshakes), // N параллельных Argon2id (N × 64MB RAM)
+		handshakeSem: make(chan struct{}, cfg.MaxParallelHandshakes), // N параллельных Argon2id (N × 4MB RAM)
 	}
 
 	// Загружаем пользователей

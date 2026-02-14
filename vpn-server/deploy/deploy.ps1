@@ -203,7 +203,7 @@ users_file: "$CONFIG_DIR/users.yaml"
 max_clients: 65534
 session_timeout: 120
 keepalive_interval: 25
-max_parallel_handshakes: 8
+max_parallel_handshakes: 64
 enable_gro_gso: "$GRO_GSO"
 log_level: "info"
 dns:

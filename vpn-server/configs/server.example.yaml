@@ -30,9 +30,9 @@ max_clients: 65534
 keepalive_interval: 25
 session_timeout: 120
 
-# Максимум параллельных handshake (Argon2id: ~64МБ RAM × N)
-# Рекомендуется: 4 для VPS 1ГБ, 8 для 2ГБ+, 16 для 4ГБ+
-max_parallel_handshakes: 8
+# Максимум параллельных handshake (Argon2id: ~4МБ RAM × N)
+# Рекомендуется: 32 для VPS 1ГБ, 64 для 2ГБ+, 128 для 4ГБ+
+max_parallel_handshakes: 64
 
 # GRO/GSO для TUN-устройства (снижает syscall overhead для TCP-трафика)
 # auto — пытается включить, при неудаче работает без него
