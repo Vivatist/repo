@@ -12,7 +12,7 @@ server_vpn_ip: "10.8.0.1"
 
 # TUN-интерфейс
 tun_name: "nova0"
-mtu: 1400
+mtu: 1380  # Wire MTU = 1380 + 42 = 1422 (безопасно для PPPoE/LTE)
 
 # DNS-серверы для клиентов
 dns:

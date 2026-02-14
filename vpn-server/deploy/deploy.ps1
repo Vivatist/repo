@@ -176,7 +176,7 @@ listen_addr: "0.0.0.0"
 listen_port: $VPN_PORT
 vpn_subnet: "10.8.0.0/24"
 server_vpn_ip: "10.8.0.1"
-mtu: 1400
+mtu: 1380
 tun_name: "nova0"
 enable_nat: true
 external_interface: "$EXT_IF"

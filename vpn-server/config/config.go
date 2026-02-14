@@ -62,7 +62,7 @@ func DefaultConfig() *ServerConfig {
 		VPNSubnet:         "10.8.0.0/24",
 		ServerVPNIP:       "10.8.0.1",
 		TunName:           "nova0",
-		MTU:               1400,
+		MTU:               1380,
 		DNS:               []string{"1.1.1.1", "8.8.8.8"},
 		PreSharedKey:      "",
 		UsersFile:         "/etc/novavpn/users.yaml",

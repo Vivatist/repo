@@ -304,7 +304,7 @@ Plaintext Credentials:
 | SubnetMask | 40 | 1 | uint8 | Маска подсети (CIDR, напр. 24) |
 | DNS1 | 41 | 4 | IPv4 bytes | Первый DNS-сервер |
 | DNS2 | 45 | 4 | IPv4 bytes | Второй DNS-сервер |
-| MTU | 49 | 2 | BE uint16 | MTU туннеля (напр. 1400) |
+| MTU | 49 | 2 | BE uint16 | MTU туннеля (напр. 1380) |
 | ServerHMAC | 51 | 32 | raw | HMAC-SHA256(HMACKey, respData[:51]) |
 | HasPSK | 83 | 1 | 0 или 1 | Флаг наличия PSK |
 | PSK | 84 | 32 | raw | Настоящий PSK сервера (только при bootstrap) |
@@ -621,7 +621,7 @@ listen_port: 443
 vpn_subnet: "10.8.0.0/24"
 server_vpn_ip: "10.8.0.1"
 tun_name: "nova0"
-mtu: 1400
+mtu: 1380
 dns: ["1.1.1.1", "8.8.8.8"]
 pre_shared_key: "<64 hex chars>"
 users_file: "/etc/novavpn/users.yaml"

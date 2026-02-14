@@ -11,6 +11,7 @@ package server
 import (
 	"log"
 	"net"
+	"runtime"
 	"sync"
 	"syscall"
 	"time"
@@ -50,6 +51,13 @@ type batchSender struct {
 
 	// Метаданные пакетов (адрес, длина)
 	entries [batchSize]batchEntry
+
+	// Пре-аллоцированные структуры для sendmmsg (zero-alloc flush path).
+	// Устраняют 3 аллокации на каждый flush: msgs, iovecs, addrs.
+	// GC pressure снижается пропорционально pps, устраняя p99 latency spikes.
+	flushMsgs  [batchSize]mmsghdr
+	flushIovs  [batchSize]unix.Iovec
+	flushAddrs [batchSize]unix.RawSockaddrInet4
 
 	// Текущее количество пакетов в батче
 	count int
@@ -187,39 +195,37 @@ func (bs *batchSender) Flush() {
 }
 
 // flushLocked отправляет все пакеты через sendmmsg. Вызывается под bs.mu.Lock().
+// Zero-alloc: использует пре-аллоцированные массивы flushMsgs/flushIovs/flushAddrs.
 func (bs *batchSender) flushLocked() {
 	n := bs.count
 	if n == 0 {
 		return
 	}
 
-	// Собираем массив mmsghdr для sendmmsg
-	msgs := make([]mmsghdr, n)
-	iovecs := make([]unix.Iovec, n)
-	addrs := make([]unix.RawSockaddrInet4, n)
-
+	// Заполняем пре-аллоцированные структуры (zero-alloc)
 	for i := 0; i < n; i++ {
 		entry := &bs.entries[i]
 
 		// Заполняем sockaddr_in
-		addrs[i].Family = unix.AF_INET
+		bs.flushAddrs[i].Family = unix.AF_INET
 		port := uint16(entry.addr.Port)
-		addrs[i].Port = (port >> 8) | (port << 8) // htons
-		copy(addrs[i].Addr[:], entry.addr.IP.To4())
+		bs.flushAddrs[i].Port = (port >> 8) | (port << 8) // htons
+		copy(bs.flushAddrs[i].Addr[:], entry.addr.IP.To4())
 
 		// Заполняем iovec
-		iovecs[i].Base = &bs.dataBufs[i][0]
-		iovecs[i].Len = uint64(entry.len)
+		bs.flushIovs[i].Base = &bs.dataBufs[i][0]
+		bs.flushIovs[i].Len = uint64(entry.len)
 
 		// Заполняем msghdr
-		msgs[i].Hdr.Name = (*byte)(unsafe.Pointer(&addrs[i]))
-		msgs[i].Hdr.Namelen = unix.SizeofSockaddrInet4
-		msgs[i].Hdr.Iov = &iovecs[i]
-		msgs[i].Hdr.Iovlen = 1
+		bs.flushMsgs[i].Hdr.Name = (*byte)(unsafe.Pointer(&bs.flushAddrs[i]))
+		bs.flushMsgs[i].Hdr.Namelen = unix.SizeofSockaddrInet4
+		bs.flushMsgs[i].Hdr.Iov = &bs.flushIovs[i]
+		bs.flushMsgs[i].Hdr.Iovlen = 1
+		bs.flushMsgs[i].Len = 0 // сброс для sendmmsg
 	}
 
-	// sendmmsg syscall
-	sent, err := sendmmsg(bs.fd, msgs)
+	// sendmmsg syscall (передаём slice от пре-аллоцированного массива — zero-alloc)
+	sent, err := sendmmsg(bs.fd, bs.flushMsgs[:n])
 	if err != nil {
 		log.Printf("[BATCH] sendmmsg ошибка (%d пакетов): %v", n, err)
 	}
@@ -232,8 +238,16 @@ func (bs *batchSender) flushLocked() {
 
 // flushLoop — фоновая горутина, вызывающая flush по таймеру.
 // Обеспечивает минимальную задержку для неполных батчей.
+//
+// Оптимизация: LockOSThread привязывает горутину к ядру CPU,
+// устраняя scheduling jitter (одна из причин p99 спайков).
 func (bs *batchSender) flushLoop() {
 	defer bs.wg.Done()
+
+	// Привязываем к OS thread — устраняет goroutine scheduling jitter.
+	// flushLoop критичен для латентности: задержка flush = задержка пакета.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 
 	timer := time.NewTimer(flushInterval)
 	defer timer.Stop()
@@ -324,6 +338,13 @@ type batchReceiver struct {
 	msgs  [recvBatchSize]mmsghdr
 	iovs  [recvBatchSize]unix.Iovec
 	addrs [recvBatchSize]unix.RawSockaddrInet4
+
+	// Пре-аллоцированные UDPAddr для GetPacket (zero-alloc hot path).
+	// Устраняют 2 аллокации на каждый принятый пакет: net.IPv4() + &net.UDPAddr{}.
+	// Безопасно: буферы перезаписываются перед следующим Recv(), а processUDPPacket
+	// заканчивает работу с addr до следующего Recv().
+	udpAddrs [recvBatchSize]net.UDPAddr
+	ipBufs   [recvBatchSize][4]byte // буферы для IP (IPv4)
 }
 
 // newBatchReceiver создаёт новый batch receiver.
@@ -384,17 +405,25 @@ func (br *batchReceiver) Recv() (int, error) {
 }
 
 // GetPacket возвращает данные и адрес отправителя для i-го пакета.
+// Zero-alloc: использует пре-аллоцированные UDPAddr и IP-буферы.
+// Возвращённый addr валиден до следующего вызова Recv().
 func (br *batchReceiver) GetPacket(i int) (data []byte, addr *net.UDPAddr) {
 	n := int(br.msgs[i].Len)
 	data = br.bufs[i][:n]
 
-	// Извлекаем IP и порт из RawSockaddrInet4
+	// Извлекаем IP и порт из RawSockaddrInet4 в пре-аллоцированные структуры
 	sa := &br.addrs[i]
 	port := int(sa.Port>>8) | int(sa.Port<<8)&0xFF00 // ntohs
-	ip := net.IPv4(sa.Addr[0], sa.Addr[1], sa.Addr[2], sa.Addr[3])
-	addr = &net.UDPAddr{IP: ip, Port: port}
 
-	return data, addr
+	// Записываем IP в пре-аллоцированный буфер (zero-alloc, вместо net.IPv4)
+	br.ipBufs[i] = sa.Addr
+
+	// Заполняем пре-аллоцированный UDPAddr (zero-alloc, вместо &net.UDPAddr{})
+	br.udpAddrs[i].IP = br.ipBufs[i][:]
+	br.udpAddrs[i].Port = port
+	br.udpAddrs[i].Zone = ""
+
+	return data, &br.udpAddrs[i]
 }
 
 // --- Вспомогательные функции для интеграции ---

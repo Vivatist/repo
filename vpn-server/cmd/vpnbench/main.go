@@ -259,9 +259,11 @@ func buildReport(cfg *BenchConfig, results []clientResult) *BenchReport {
 	}
 	report.RTT = computeLatencyStats(allRTT)
 
-	// Потери
-	if report.TotalPacketsSent > 0 && report.TotalPacketsSent > report.TotalPacketsRecv {
-		report.PacketLossRate = float64(report.TotalPacketsSent-report.TotalPacketsRecv) / float64(report.TotalPacketsSent) * 100
+	// Потери (только для RTT режима — throughput однонаправленный, потери не измеряются)
+	if cfg.Mode != "throughput" {
+		if report.TotalPacketsSent > 0 && report.TotalPacketsSent > report.TotalPacketsRecv {
+			report.PacketLossRate = float64(report.TotalPacketsSent-report.TotalPacketsRecv) / float64(report.TotalPacketsSent) * 100
+		}
 	}
 
 	// Throughput
@@ -366,8 +368,12 @@ func printReport(r *BenchReport) {
 
 	fmt.Println("  ── Throughput ─────────────────────────────────────────")
 	fmt.Printf("    Отправлено: %d пакетов\n", r.TotalPacketsSent)
-	fmt.Printf("    Получено:   %d пакетов\n", r.TotalPacketsRecv)
-	fmt.Printf("    Потери:     %.2f%%\n", r.PacketLossRate)
+	if r.Mode == "throughput" {
+		fmt.Printf("    (однонаправленный тест — потери не измеряются)\n")
+	} else {
+		fmt.Printf("    Получено:   %d пакетов\n", r.TotalPacketsRecv)
+		fmt.Printf("    Потери:     %.2f%%\n", r.PacketLossRate)
+	}
 	fmt.Printf("    Скорость:   %.1f пакетов/сек\n", r.PacketsPerSec)
 	fmt.Printf("    Скорость:   %.2f Мбит/с\n", r.MbitsPerSec)
 	fmt.Println()

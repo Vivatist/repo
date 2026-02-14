@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -154,8 +155,13 @@ func (s *VPNServer) Start() error {
 	if err := tunDev.Configure(s.cfg.ServerVPNIP, subnetMask); err != nil {
 		return fmt.Errorf("ошибка настройки TUN: %w", err)
 	}
-	log.Printf("[TUN] Интерфейс %s настроен: %s/%d, MTU: %d",
-		tunDev.Name(), s.cfg.ServerVPNIP, subnetMask, s.cfg.MTU)
+	// Wire MTU = TUN MTU + DataOverhead(14) + UDP(8) + IP(20) = TUN MTU + 42
+	wireMTU := s.cfg.MTU + protocol.DataOverhead + 8 + 20
+	log.Printf("[TUN] Интерфейс %s настроен: %s/%d, MTU: %d (wire: %d)",
+		tunDev.Name(), s.cfg.ServerVPNIP, subnetMask, s.cfg.MTU, wireMTU)
+	if wireMTU > 1420 {
+		log.Printf("[WARN] Wire MTU %d > 1420: возможна фрагментация на PPPoE/LTE. Рекомендуется MTU ≤ 1380", wireMTU)
+	}
 
 	// 2. Настраиваем маршрутизацию
 	if s.cfg.EnableNAT {
@@ -249,6 +255,13 @@ func (s *VPNServer) Stop() {
 // Handshake-пакеты обрабатываются в отдельной горутине (редкие).
 func (s *VPNServer) udpReadLoop() {
 	defer s.wg.Done()
+
+	// Привязываем к OS thread — устраняет goroutine scheduling jitter.
+	// udpReadLoop — hot path: каждый приԽятый пакет обрабатывается здесь.
+	// Без LockOSThread Go runtime может отобрать ось thread,
+	// вызывая задержки до сотен мс (источник p99 spikes).
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 
 	log.Println("[UDP] Запущен цикл приёма пакетов")
 
@@ -376,7 +389,9 @@ func (s *VPNServer) processUDPPacket(origData []byte, remoteAddr *net.UDPAddr, d
 		// Address migration: обновляем адрес клиента при смене IP/порта (0-RTT resume, NAT rebind)
 		if session.ClientAddr.String() != remoteAddr.String() {
 			log.Printf("[KEEPALIVE] Address migration #%d: %s -> %s", session.ID, session.ClientAddr, remoteAddr)
-			s.sessions.UpdateClientAddr(session, remoteAddr)
+			// Копируем remoteAddr: UpdateClientAddr сохраняет указатель в сессии,
+			// а pre-allocated UDPAddr из batchReceiver будет перезаписан при следующем Recv().
+			s.sessions.UpdateClientAddr(session, copyUDPAddr(remoteAddr))
 		}
 		if s.cfg.LogLevel == "debug" {
 			log.Printf("[KEEPALIVE] Получен от сессии #%d", session.ID)
@@ -407,7 +422,9 @@ func (s *VPNServer) processUDPPacket(origData []byte, remoteAddr *net.UDPAddr, d
 		// batchReceiver будет переиспользован при следующем Recv().
 		packet := make([]byte, len(origData))
 		copy(packet, origData)
-		go s.handlePacket(packet, remoteAddr)
+		// Копируем remoteAddr: handlePacket выполняется в горутине,
+		// а pre-allocated UDPAddr из batchReceiver будет перезаписан при следующем Recv().
+		go s.handlePacket(packet, copyUDPAddr(remoteAddr))
 
 	default:
 		if s.cfg.LogLevel == "debug" {
@@ -418,11 +435,27 @@ func (s *VPNServer) processUDPPacket(origData []byte, remoteAddr *net.UDPAddr, d
 	return decryptBuf
 }
 
+// copyUDPAddr создаёт глубокую копию net.UDPAddr.
+// Используется когда адрес нужно сохранить за пределами текущего цикла обработки:
+// - горутины (handlePacket) — адрес живёт дольше, чем слот batchReceiver
+// - persistent storage (UpdateClientAddr) — адрес хранится в сессии
+// На hot path (data-пакеты) НЕ вызывается — zero-alloc.
+func copyUDPAddr(addr *net.UDPAddr) *net.UDPAddr {
+	ip := make(net.IP, len(addr.IP))
+	copy(ip, addr.IP)
+	return &net.UDPAddr{IP: ip, Port: addr.Port}
+}
+
 // tunReadLoop — цикл чтения пакетов из TUN-интерфейса.
 // Использует batch sender (sendmmsg) для пакетной отправки, если доступен.
 // Fallback на обычный WriteToUDP если batch sender не инициализирован.
 func (s *VPNServer) tunReadLoop() {
 	defer s.wg.Done()
+
+	// Привязываем к OS thread — устраняет goroutine scheduling jitter.
+	// tunReadLoop — hot path: все пакеты из TUN обрабатываются здесь.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 
 	log.Println("[TUN] Запущен цикл чтения из TUN")
 
