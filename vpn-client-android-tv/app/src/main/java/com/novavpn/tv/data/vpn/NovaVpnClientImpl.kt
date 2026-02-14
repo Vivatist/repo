@@ -89,6 +89,7 @@ class NovaVpnClientImpl : VpnClient {
     // Колбэки
     var onNewPsk: ((String) -> Unit)? = null
     var onTunRequired: ((HandshakeResult) -> FileDescriptor?)? = null
+    var onProtectSocket: ((DatagramSocket) -> Boolean)? = null
 
     override fun getState(): ConnectionState = _stateFlow.value
 
@@ -125,6 +126,9 @@ class NovaVpnClientImpl : VpnClient {
             sock.receiveBufferSize = 4 * 1024 * 1024
             sock.sendBufferSize = 4 * 1024 * 1024
             socket = sock
+
+            // Защищаем сокет от маршрутизации через TUN
+            onProtectSocket?.invoke(sock)
 
             Log.i(TAG, "UDP: ${sock.localAddress}:${sock.localPort} -> ${params.serverAddr}")
 
@@ -432,6 +436,9 @@ class NovaVpnClientImpl : VpnClient {
                     params.serverAddr.substringAfter(":").toIntOrNull() ?: 443
                 ))
                 socket = sock
+
+                // Защищаем сокет от маршрутизации через TUN
+                onProtectSocket?.invoke(sock)
 
                 // Пробуем 0-RTT resume
                 if (resumeSessionId != 0L && resumeKeys != null) {

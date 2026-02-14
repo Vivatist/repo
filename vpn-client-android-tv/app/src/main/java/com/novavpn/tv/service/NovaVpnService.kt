@@ -72,6 +72,10 @@ class NovaVpnService : VpnService() {
             setupTunInterface(result)
         }
 
+        vpnClient.onProtectSocket = { socket ->
+            protect(socket)
+        }
+
         // Следим за состоянием для обновления уведомления
         scope.launch {
             vpnClient.stateFlow.collectLatest { state ->
@@ -160,14 +164,7 @@ class NovaVpnService : VpnService() {
                 .addDnsServer(dns2)
                 // Маршрутизация всего трафика через VPN
                 .addRoute("0.0.0.0", 0)
-                // Исключаем серверный адрес из VPN
                 .setBlocking(true)
-
-            // Защищаем UDP-сокет от маршрутизации через TUN
-            val socket = (vpnClient as? NovaVpnClientImpl)?.let {
-                // Доступ к сокету через reflection не нужен — protect() вызывается ниже
-                null
-            }
 
             val pfd = builder.establish()
                 ?: throw Exception("Failed to establish VPN interface")
@@ -180,13 +177,6 @@ class NovaVpnService : VpnService() {
             Log.e(TAG, "TUN setup failed: ${e.message}")
             return null
         }
-    }
-
-    /**
-     * Защищает сокет от маршрутизации через TUN (вызывается из VPN-клиента).
-     */
-    fun protectSocket(socket: java.net.DatagramSocket): Boolean {
-        return protect(socket)
     }
 
     // ============ Уведомления ============

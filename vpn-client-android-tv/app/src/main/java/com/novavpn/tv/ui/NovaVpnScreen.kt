@@ -250,7 +250,6 @@ fun TvButton(
 
     val bgColor = if (isFocused) backgroundColor.copy(alpha = 1f) else backgroundColor.copy(alpha = 0.7f)
     val borderColor = if (isFocused) NovaTextPrimary else Color.Transparent
-    val scale = if (isFocused) 1.05f else 1f
 
     Box(
         modifier = modifier

@@ -5,6 +5,9 @@ import com.novavpn.tv.data.crypto.NovaCryptoSession
 import com.novavpn.tv.data.crypto.NovaKeyExchange
 import com.novavpn.tv.data.protocol.NovaProtocol
 import com.novavpn.tv.domain.model.HandshakeResult
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.nio.ByteBuffer
@@ -47,13 +50,13 @@ class HandshakePerformer(
             socket.soTimeout = oldTimeout
 
             // 4. Отправляем HandshakeComplete (fire-and-forget)
-            Thread {
+            CoroutineScope(Dispatchers.IO).launch {
                 try {
                     sendHandshakeComplete(result)
                 } catch (e: Exception) {
                     Log.w(TAG, "HandshakeComplete error (non-critical): ${e.message}")
                 }
-            }.start()
+            }
 
             Log.i(TAG, "Handshake completed (1-RTT)")
             return result

@@ -65,6 +65,7 @@ dependencies {
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.ui:ui-tooling-preview")
+    // Jetpack Compose for TV (alpha — стабильных релизов TV Compose пока нет)
     implementation("androidx.tv:tv-foundation:1.0.0-alpha10")
     implementation("androidx.tv:tv-material:1.0.0-alpha10")
     implementation("androidx.compose.material3:material3:1.1.2")
