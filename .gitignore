@@ -2,6 +2,8 @@
 *.exe
 *.dll
 *.syso
+novavpn-server
+novavpn-server-*
 
 # Артефакты сборки
 **/dist/
