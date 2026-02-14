@@ -1,8 +1,8 @@
 package main
 
 import (
-	crand "crypto/rand"
 	"crypto/hmac"
+	crand "crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
