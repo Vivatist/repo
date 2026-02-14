@@ -60,8 +60,44 @@ type Statistics struct {
 	PacketsRecv uint64
 }
 
+// ConnectionHealth — уровень здоровья VPN-соединения.
+// Определяется пассивным мониторингом: сколько прошло с момента последнего
+// полученного пакета от сервера (data или keepalive).
+type ConnectionHealth int32
+
+const (
+	// HealthGood — связь стабильна (< 35 сек без пакетов от сервера).
+	HealthGood ConnectionHealth = iota
+
+	// HealthDegraded — возможна потеря пакетов (35-60 сек).
+	// Макс. серверный keepalive = 32 сек, порог = 35 сек.
+	HealthDegraded
+
+	// HealthLost — связь потеряна (> 60 сек).
+	// ≈ 2 пропущенных keepalive-цикла сервера, инициируется reconnect.
+	HealthLost
+)
+
+func (h ConnectionHealth) String() string {
+	switch h {
+	case HealthGood:
+		return "Стабильно"
+	case HealthDegraded:
+		return "Нестабильно"
+	case HealthLost:
+		return "Потеряно"
+	default:
+		return "Неизвестно"
+	}
+}
+
 // StatusCallback — колбэк для уведомлений об изменении состояния.
 type StatusCallback func(state ConnectionState, info string)
+
+// HealthCallback — колбэк для уведомлений об изменении здоровья соединения.
+// Вызывается только при смене уровня (не при каждой проверке).
+// Может быть nil — тогда мониторинг работает, но без оповещений.
+type HealthCallback func(health ConnectionHealth)
 
 // PSKCallback — колбэк для сохранения полученного PSK.
 type PSKCallback func(pskHex string)

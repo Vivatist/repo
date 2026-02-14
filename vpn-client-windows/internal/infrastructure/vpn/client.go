@@ -22,6 +22,8 @@ import (
 	"github.com/novavpn/vpn-client-windows/internal/protocol"
 )
 
+// Интервалы keepalive определяются в health.go (randomKeepaliveInterval).
+
 // NovaVPNClient реализует интерфейс VPN-клиента.
 type NovaVPNClient struct {
 	// Зависимости
@@ -61,6 +63,10 @@ type NovaVPNClient struct {
 	// Колбэки
 	onStatus domainvpn.StatusCallback
 	onPSK    domainvpn.PSKCallback
+	onHealth domainvpn.HealthCallback
+
+	// Мониторинг здоровья соединения (пассивный, lock-free)
+	healthMonitor *connectionMonitor
 
 	// 0-RTT resume data
 	resumeSessionID   uint32
@@ -77,22 +83,25 @@ type NovaVPNClient struct {
 	reconnecting  atomic.Bool   // флаг: идёт переподключение
 	stopCh        chan struct{} // закрывается при Disconnect
 
-	// Dead-peer detection: время последнего полученного пакета от сервера
-	lastRecvTime atomic.Int64 // UnixNano
 }
 
 // NewNovaVPNClient создаёт новый VPN-клиент.
+//
+// onHealth — колбэк уведомления о смене здоровья соединения (может быть nil).
+// При nil мониторинг работает (для reconnect), но без оповещений.
 func NewNovaVPNClient(
 	tunnelDevice domainnet.TunnelDevice,
 	netConfig domainnet.NetworkConfigurator,
 	onStatus domainvpn.StatusCallback,
 	onPSK domainvpn.PSKCallback,
+	onHealth domainvpn.HealthCallback,
 ) domainvpn.Client {
 	return &NovaVPNClient{
 		tunnelDevice: tunnelDevice,
 		netConfig:    netConfig,
 		onStatus:     onStatus,
 		onPSK:        onPSK,
+		onHealth:     onHealth,
 	}
 }
 
@@ -211,6 +220,17 @@ func (c *NovaVPNClient) Connect(params domainvpn.ConnectParams) error {
 	// Запускаем циклы обработки ДО настройки сети (UDP read/keepalive работают сразу)
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 	c.stopped.Store(false)
+
+	// Создаём пассивный монитор здоровья соединения.
+	// onLost инициирует reconnect через закрытие conn (udpReadLoop → reconnect).
+	c.healthMonitor = newConnectionMonitor(c.onHealth, func() {
+		log.Println("[HEALTH] Связь потеряна, инициируем переподключение...")
+		if conn := c.conn; conn != nil {
+			conn.Close()
+		}
+	})
+	c.healthMonitor.Start()
+
 	c.wg.Add(4)
 	go c.udpReadLoop()
 	go c.tunReadLoop()
@@ -235,7 +255,6 @@ func (c *NovaVPNClient) Connect(params domainvpn.ConnectParams) error {
 	}
 
 	c.setState(domainvpn.StateConnected)
-	c.lastRecvTime.Store(time.Now().UnixNano())
 	log.Println("[VPN] Подключено к VPN")
 	return nil
 }
@@ -252,6 +271,11 @@ func (c *NovaVPNClient) Disconnect() error {
 	c.setState(domainvpn.StateDisconnecting)
 	c.stopped.Store(true)
 	log.Println("[VPN] Отключение...")
+
+	// Останавливаем health monitor
+	if c.healthMonitor != nil {
+		c.healthMonitor.Stop()
+	}
 
 	// Сигнализируем остановку через канал (для keepaliveLoop и reconnect)
 	select {
@@ -423,8 +447,11 @@ func (c *NovaVPNClient) udpReadLoop() {
 
 // handleUDPPacket обрабатывает входящий пакет от сервера.
 func (c *NovaVPNClient) handleUDPPacket(data []byte) {
-	// Обновляем время последнего полученного пакета (dead-peer detection)
-	c.lastRecvTime.Store(time.Now().UnixNano())
+	// Фиксируем активность для пассивного мониторинга здоровья.
+	// Atomic store — ~1 нс, zero-alloc, вызывается на каждый входящий пакет.
+	if c.healthMonitor != nil {
+		c.healthMonitor.RecordActivity()
+	}
 
 	// Быстрый inline-парсинг без аллокаций
 	raw := data
@@ -562,40 +589,32 @@ func (c *NovaVPNClient) tunReadLoop() {
 	}
 }
 
-// keepaliveLoop отправляет keepalive пакеты и проверяет доступность сервера.
-// Если сервер не отвечает дольше deadPeerTimeout, инициирует переподключение.
+// keepaliveLoop отправляет keepalive пакеты с рандомизированным интервалом.
+// Интервал 10-20 секунд (crypto/rand) — защита от DPI-детектирования
+// регулярных паттернов отправки.
+//
+// Dead-peer detection вынесен в connectionMonitor (health.go) —
+// он пассивно отслеживает lastActivity и инициирует reconnect при HealthLost.
 func (c *NovaVPNClient) keepaliveLoop() {
 	defer c.wg.Done()
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
-
-	const deadPeerTimeout = 20 * time.Second // keepalive шлётся каждые 15с; 20с ≈ 1 пропуск + запас
 
 	for {
+		// Рандомизированный интервал: 10-20 секунд (crypto/rand).
+		// Каждый raз новое значение — нет паттерна для DPI.
+		interval := randomKeepaliveInterval()
+
 		select {
 		case <-c.ctx.Done():
 			return
 		case <-c.stopCh:
 			return
-		case <-ticker.C:
+		case <-time.After(interval):
 			if c.reconnecting.Load() {
 				continue
 			}
 			conn := c.conn
 			if conn == nil {
 				continue
-			}
-
-			// Dead-peer detection: проверяем время последнего пакета от сервера
-			lastRecv := c.lastRecvTime.Load()
-			if lastRecv != 0 && c.GetState() == domainvpn.StateConnected {
-				elapsed := time.Since(time.Unix(0, lastRecv))
-				if elapsed > deadPeerTimeout {
-					log.Printf("[VPN] Dead peer detected: нет данных от сервера %v, переподключение...", elapsed.Round(time.Second))
-					// Закрываем соединение — udpReadLoop получит ошибку и вызовет reconnect
-					conn.Close()
-					return
-				}
 			}
 
 			// Строим keepalive inline — sessionID может измениться после reconnect
@@ -665,7 +684,6 @@ func (c *NovaVPNClient) tryResume() bool {
 	c.mtu = c.resumeMTU
 	c.subnetMask = c.resumeSubnetMask
 	c.connectedAt = time.Now()
-	c.lastRecvTime.Store(time.Now().UnixNano())
 
 	log.Printf("[VPN] 0-RTT resume: сессия #%d восстановлена (VPN IP: %s)", c.sessionID, c.assignedIP)
 	return true
@@ -691,9 +709,12 @@ func (c *NovaVPNClient) reconnect() {
 	c.setState(domainvpn.StateConnecting)
 	log.Println("[VPN] Соединение потеряно. Автоматическое переподключение...")
 
-	// Останавливаем keepaliveLoop
+	// Останавливаем keepaliveLoop и health monitor
 	if c.cancel != nil {
 		c.cancel()
+	}
+	if c.healthMonitor != nil {
+		c.healthMonitor.Stop()
 	}
 
 	// Сохраняем данные для 0-RTT resume
@@ -851,6 +872,16 @@ func (c *NovaVPNClient) reconnect() {
 		// Успех! Запускаем новые UDP + keepalive циклы
 		// (tunReadLoop продолжает работать — он не останавливался)
 		c.ctx, c.cancel = context.WithCancel(context.Background())
+
+		// Создаём новый health monitor для нового соединения
+		c.healthMonitor = newConnectionMonitor(c.onHealth, func() {
+			log.Println("[HEALTH] Связь потеряна, инициируем переподключение...")
+			if conn := c.conn; conn != nil {
+				conn.Close()
+			}
+		})
+		c.healthMonitor.Start()
+
 		c.wg.Add(2)
 		go c.udpReadLoop()
 		go c.keepaliveLoop()
@@ -861,7 +892,6 @@ func (c *NovaVPNClient) reconnect() {
 		}
 
 		c.connectedAt = time.Now()
-		c.lastRecvTime.Store(time.Now().UnixNano())
 		c.setState(domainvpn.StateConnected)
 		log.Printf("[VPN] Переподключено успешно (попытка %d)", attempt)
 		return
