@@ -145,6 +145,9 @@ func (c *NamedPipeClient) GetStatus() (*domainipc.StatusResponse, error) {
 	if stateFloat, ok := payload["state"].(float64); ok {
 		status.State = domainvpn.ConnectionState(int32(stateFloat))
 	}
+	if ip, ok := payload["assigned_ip"].(string); ok {
+		status.AssignedIP = ip
+	}
 	if bytes, ok := payload["bytes_sent"].(float64); ok {
 		status.BytesSent = uint64(bytes)
 	}
