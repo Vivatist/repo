@@ -131,10 +131,10 @@ func (bs *batchSender) GetBuffer() []byte {
 // dataLen — фактическая длина данных в буфере.
 //
 // Стратегия flush:
-// - Батч полон (64 пакета) → немедленный flush
-// - Одиночный пакет после idle period (> flushInterval) → немедленный flush
-//   (устраняет задержку для ping, keepalive, одиночных HTTP-запросов)
-// - Burst-трафик (пакеты приходят чаще flushInterval) → батчатся, flushLoop flush'ит
+//   - Батч полон (64 пакета) → немедленный flush
+//   - Одиночный пакет после idle period (> flushInterval) → немедленный flush
+//     (устраняет задержку для ping, keepalive, одиночных HTTP-запросов)
+//   - Burst-трафик (пакеты приходят чаще flushInterval) → батчатся, flushLoop flush'ит
 func (bs *batchSender) Enqueue(addr *net.UDPAddr, dataLen int) {
 	bs.mu.Lock()
 
