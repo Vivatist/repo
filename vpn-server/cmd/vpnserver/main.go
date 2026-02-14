@@ -17,6 +17,8 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"runtime"
+	"runtime/debug"
 	"syscall"
 
 	"github.com/novavpn/vpn-server/config"
@@ -299,6 +301,19 @@ func runServer() {
 	if os.Geteuid() != 0 {
 		log.Fatal("NovaVPN сервер требует запуска от root (sudo)")
 	}
+
+	// --- Runtime tuning для снижения хвостовых задержек (p99) ---
+	//
+	// GOGC=200: увеличиваем порог GC до 200% (по умолчанию 100%).
+	// Это удваивает допустимый объём мусора перед GC-циклом,
+	// снижая частоту STW-пауз (stop-the-world) в 2 раза.
+	// Для VPN-сервера с pre-allocated буферами аллокаций мало,
+	// поэтому GC-паузы — основной источник p99 спайков.
+	prevGOGC := debug.SetGCPercent(200)
+	log.Printf("[RUNTIME] GOGC: %d → 200 (снижение частоты GC для latency)", prevGOGC)
+
+	// Логируем GOMAXPROCS для диагностики
+	log.Printf("[RUNTIME] GOMAXPROCS: %d, NumCPU: %d", runtime.GOMAXPROCS(0), runtime.NumCPU())
 
 	// Загружаем конфигурацию
 	log.Printf("Загружаем конфигурацию из %s...", *configPath)

@@ -170,21 +170,41 @@ EXT_IF=$(ip route | grep default | awk '{print $5}' | head -1)
 [ -z "$EXT_IF" ] && EXT_IF="eth0"
 echo "[OK] Внешний интерфейс: $EXT_IF"
 
+# --- Определяем поддержку GRO/GSO ---
+KERNEL_VERSION=$(uname -r | cut -d- -f1)
+KERNEL_MAJOR=$(echo $KERNEL_VERSION | cut -d. -f1)
+KERNEL_MINOR=$(echo $KERNEL_VERSION | cut -d. -f2)
+GRO_GSO="false"
+
+if [ "$KERNEL_MAJOR" -gt 4 ] 2>/dev/null || ([ "$KERNEL_MAJOR" -eq 4 ] && [ "$KERNEL_MINOR" -ge 19 ]) 2>/dev/null; then
+    GRO_GSO="auto"
+    echo "[OK] GRO/GSO: поддерживается (kernel $KERNEL_VERSION >= 4.19)"
+    if [ "$KERNEL_MAJOR" -gt 6 ] 2>/dev/null || ([ "$KERNEL_MAJOR" -eq 6 ] && [ "$KERNEL_MINOR" -ge 2 ]) 2>/dev/null; then
+        echo "[OK] USO (UDP Segmentation Offload): поддерживается (kernel $KERNEL_VERSION >= 6.2)"
+    else
+        echo "[INFO] USO: не поддерживается (kernel < 6.2), только TCP GRO"
+    fi
+else
+    echo "[WARN] GRO/GSO: не поддерживается (kernel $KERNEL_VERSION < 4.19), отключаем"
+fi
+
 # --- Создаём конфиг сервера ---
 cat > $CONFIG << CFGEND
 listen_addr: "0.0.0.0"
 listen_port: $VPN_PORT
-vpn_subnet: "10.8.0.0/24"
+vpn_subnet: "10.8.0.0/16"
 server_vpn_ip: "10.8.0.1"
-mtu: 1400
+mtu: 1380
 tun_name: "nova0"
 enable_nat: true
 external_interface: "$EXT_IF"
 pre_shared_key: "$PSK"
 users_file: "$CONFIG_DIR/users.yaml"
-max_clients: 256
+max_clients: 65534
 session_timeout: 120
 keepalive_interval: 25
+max_parallel_handshakes: 64
+enable_gro_gso: "$GRO_GSO"
 log_level: "info"
 dns:
   - "1.1.1.1"

@@ -7,12 +7,12 @@ listen_addr: "0.0.0.0"
 listen_port: 443  # HTTPS порт для маскировки под TLS/QUIC трафик
 
 # VPN подсеть и IP сервера
-vpn_subnet: "10.8.0.0/24"
+vpn_subnet: "10.8.0.0/16"
 server_vpn_ip: "10.8.0.1"
 
 # TUN-интерфейс
 tun_name: "nova0"
-mtu: 1400
+mtu: 1380  # Wire MTU = 1380 + 42 = 1422 (безопасно для PPPoE/LTE)
 
 # DNS-серверы для клиентов
 dns:
@@ -26,9 +26,20 @@ pre_shared_key: "ЗАМЕНИТЕ_НА_СГЕНЕРИРОВАННЫЙ_КЛЮЧ_6
 users_file: "/etc/novavpn/users.yaml"
 
 # Лимиты
-max_clients: 256
+max_clients: 65534
 keepalive_interval: 25
 session_timeout: 120
+
+# Максимум параллельных handshake (Argon2id: ~4МБ RAM × N)
+# Рекомендуется: 32 для VPS 1ГБ, 64 для 2ГБ+, 128 для 4ГБ+
+max_parallel_handshakes: 64
+
+# GRO/GSO для TUN-устройства (снижает syscall overhead для TCP-трафика)
+# auto — пытается включить, при неудаче работает без него
+# true  — то же что auto (попытка + fallback)
+# false — отключить принудительно
+# Требуется Linux >= 4.19 для TSO, >= 6.2 для USO
+enable_gro_gso: "auto"
 
 # NAT (masquerade) для выхода клиентов в интернет
 enable_nat: true

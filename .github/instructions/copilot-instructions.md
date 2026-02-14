@@ -41,13 +41,17 @@ NOVAVPN_PROTOCOL.md  (корень репозитория)
 |--------|------|-----------|
 | Сервер | `vpn-server/` | Go, Linux, systemd, монолитная архитектура |
 | Клиент | `vpn-client-windows/` | Go, Windows, Walk GUI + Windows Service, Clean Architecture |
+| Бенчмарк | `vpn-server/cmd/vpnbench/` | Нагрузочный тест сервера (N клиентов, метрики RTT/throughput/потерь) |
 | Протокол | `NOVAVPN_PROTOCOL.md` | **Единственный** источник истины по wire format |
 | Взаимодействие | `CLIENT_SERVER_INTERACTION.md` | Логика взаимодействия клиента и сервера: жизненный цикл, машина состояний, reconnect, обработка ошибок |
 | Контекст | `CONTEXT.md` | Общие принципы и требования ко всем клиентам |
+| Дорожная карта | `Docs/Дорожная карта оптимизации производительности.md` | Этапы оптимизации, базовые метрики, результаты бенчмарков |
 
 **Правила синхронизации:**
 - После КАЖДОГО изменения в протоколе (код клиента или сервера) — обновляй `NOVAVPN_PROTOCOL.md`.
 - После КАЖДОГО изменения логики взаимодействия клиента и сервера (машина состояний, handshake, reconnect, keepalive, обработка ошибок, жизненный цикл соединения) — обновляй `CLIENT_SERVER_INTERACTION.md`.
+- После КАЖДОГО изменения производительности сервера — обновляй `Docs/Дорожная карта оптимизации производительности.md` и прогоняй бенчмарк для фиксации новых базовых метрик.
+- После КАЖДОГО изменения в протоколе (wire format, типы пакетов, шифрование, handshake) — **обновляй бенчмарк** (`vpn-server/cmd/vpnbench/`), т.к. он реализует собственный VPN-клиент и должен соответствовать текущему протоколу. Иначе бенчмарк перестанет подключаться к серверу.
 
 ## 3.1. Руководство по разработке клиентов
 
@@ -79,10 +83,10 @@ service/        → Windows Service (SCM), IPC-сервер
 ## 5. Сервер — плоская архитектура
 
 ```
-internal/server/   — VPNServer, SessionManager, IPPool, handler
+internal/server/   — VPNServer, SessionManager, IPPool, handler, batch_linux (sendmmsg/recvmmsg)
 internal/protocol/ — wire format, crypto operations, handshake structs
-internal/auth/     — UserStore (YAML, Argon2id)
-internal/tun/      — Linux TUN device (ioctl)
+internal/auth/     — UserStore (YAML, Argon2id, кеш аутентификации)
+internal/tun/      — Linux TUN device (ioctl), GRO/GSO (IFF_VNET_HDR, TCP-сегментация)
 config/            — ServerConfig (YAML)
 ```
 
@@ -155,3 +159,93 @@ config/            — ServerConfig (YAML)
 - При потере сети (network monitor) — мгновенный переход из зелёного в жёлтый
 - Все визуальные элементы (иконка трея, текст статуса, тултип, кнопки, пункты контекстного меню) обновляются **атомарно** в одном synchronize-блоке
 - Поллинг статуса от сервиса используется только для подтверждения/коррекции состояния, но не как основной механизм обновления UI
+
+---
+
+## 9. Нагрузочное тестирование (vpnbench)
+
+Утилита `vpn-server/cmd/vpnbench/` — инструмент для нагрузочного тестирования VPN-сервера.
+
+### 9.1. Что измеряет
+
+| Метрика | Описание |
+|---------|----------|
+| Handshake latency | min / avg / p50 / p95 / p99 / max — время полного 1-RTT рукопожатия |
+| RTT (keepalive) | min / avg / p50 / p95 / p99 / max — round-trip time keepalive пакетов |
+| Throughput | пакетов/сек, Мбит/с |
+| Потери | % потерь keepalive пакетов (request-response) |
+| Макс. клиентов | stress-режим: ступенчатое наращивание до деградации |
+| Ошибки | handshake failures, send errors, recv timeouts |
+
+### 9.2. Как запускать
+
+Бенчмарк — полноценный VPN-клиент без TUN. Выполняет настоящий handshake (ECDH, Argon2id аутентификация) и обмен данными. Три режима: `rtt` (keepalive ping-pong), `throughput` (data flood), `stress` (ступенчатое наращивание клиентов). Рекомендуется запускать **на самом сервере** (localhost) для исключения сетевых артефактов.
+
+**Ручной запуск на сервере:**
+
+```bash
+# Кросс-компиляция
+GOOS=linux GOARCH=amd64 go build -o vpnbench ./cmd/vpnbench/
+
+# RTT (keepalive ping-pong)
+./vpnbench -server 127.0.0.1:443 -psk <hex64> \
+  -email test@novavpn.app -password NovaVPN2026! \
+  -clients 10 -duration 15s -interval 100ms \
+  -mode rtt -json результат.json
+
+# Throughput (data flood)
+./vpnbench -server 127.0.0.1:443 -psk <hex64> \
+  -email test@novavpn.app -password NovaVPN2026! \
+  -clients 1 -duration 15s \
+  -mode throughput -json результат.json
+
+# Stress (ступенчатое наращивание клиентов)
+./vpnbench -server 127.0.0.1:443 -psk <hex64> \
+  -email test@novavpn.app -password NovaVPN2026! \
+  -mode stress -stress-start 10 -stress-step 25 -stress-max 500 \
+  -stress-step-duration 15s -json результат.json
+```
+
+**Автоматический запуск с ноутбука (bench.ps1):**
+
+Скрипт `vpn-server/deploy/bench.ps1` автоматически компилирует, деплоит и запускает серию из 5 тестов (throughput×1, throughput×10, rtt×1, rtt×10, rtt×50) с итоговой сводкой и сравнением с другими VPN-протоколами.
+
+```powershell
+# Полный набор (5 тестов)
+.\bench.ps1
+
+# Быстрый режим (3 теста: throughput×1, rtt×1, rtt×10)
+.\bench.ps1 -quick
+
+# С другой длительностью
+.\bench.ps1 -duration 30s
+```
+
+**Сравнение GRO ON vs OFF (bench-gro.ps1):**
+
+Скрипт `vpn-server/deploy/bench-gro.ps1` переключает `enable_gro_gso` на сервере, перезапускает и прогоняет сравнительный бенчмарк (3 теста для OFF, 3 для ON) с таблицей дельт.
+
+```powershell
+.\bench-gro.ps1
+.\bench-gro.ps1 -duration 30s
+```
+
+**Stress-тест (bench-stress.ps1):**
+
+Скрипт `vpn-server/deploy/bench-stress.ps1` ступенчато наращивает клиентов, каждый генерирует реалистичный трафик (keepalive + data burst). Останавливается при деградации. Результат: «сервер стабильно тянет N клиентов».
+
+```powershell
+.\bench-stress.ps1                              # По умолчанию: 10→200, шаг 25
+.\.bench-stress.ps1 -maxClients 500 -step 10      # Расширенный тест
+.\bench-stress.ps1 -stepDuration 30s            # Более длительные ступени
+```
+
+### 9.3. Когда прогонять
+
+- **После каждой оптимизации** сервера — для фиксации новых базовых метрик
+- **После рефакторинга** hot path (udpReadLoop, tunReadLoop, processUDPPacket)
+- **Перед релизом** — для регрессионного тестирования производительности
+
+### 9.4. Базовые результаты
+
+Текущие метрики зафиксированы в `Docs/Дорожная карта оптимизации производительности.md`. При прогоне бенчмарка после изменений — **обязательно сравнивай** с базовыми и обновляй дорожную карту.

@@ -14,7 +14,7 @@ type ServerConfig struct {
 	ListenAddr string `yaml:"listen_addr"`
 	ListenPort int    `yaml:"listen_port"`
 
-	// Подсеть VPN (например, 10.8.0.0/24)
+	// Подсеть VPN (например, 10.8.0.0/16)
 	VPNSubnet string `yaml:"vpn_subnet"`
 
 	// IP-адрес сервера внутри VPN-подсети
@@ -50,6 +50,15 @@ type ServerConfig struct {
 	// Внешний сетевой интерфейс (для NAT)
 	ExternalInterface string `yaml:"external_interface"`
 
+	// Максимальное количество параллельных handshake (Argon2id, ~4МБ RAM каждый)
+	MaxParallelHandshakes int `yaml:"max_parallel_handshakes"`
+
+	// GRO/GSO для TUN-устройства: "auto", "true", "false"
+	// auto — пробует включить, при неудаче отключает
+	// true — пробует включить, при неудаче отключает
+	// false — не пытается включать
+	EnableGROGSO string `yaml:"enable_gro_gso"`
+
 	// Логирование
 	LogLevel string `yaml:"log_level"` // debug, info, warn, error
 }
@@ -57,21 +66,23 @@ type ServerConfig struct {
 // DefaultConfig возвращает конфигурацию по умолчанию.
 func DefaultConfig() *ServerConfig {
 	return &ServerConfig{
-		ListenAddr:        "0.0.0.0",
-		ListenPort:        443,
-		VPNSubnet:         "10.8.0.0/24",
-		ServerVPNIP:       "10.8.0.1",
-		TunName:           "nova0",
-		MTU:               1400,
-		DNS:               []string{"1.1.1.1", "8.8.8.8"},
-		PreSharedKey:      "",
-		UsersFile:         "/etc/novavpn/users.yaml",
-		MaxClients:        256,
-		KeepaliveInterval: 25,
-		SessionTimeout:    120,
-		EnableNAT:         true,
-		ExternalInterface: "eth0",
-		LogLevel:          "info",
+		ListenAddr:            "0.0.0.0",
+		ListenPort:            443,
+		VPNSubnet:             "10.8.0.0/16",
+		ServerVPNIP:           "10.8.0.1",
+		TunName:               "nova0",
+		MTU:                   1380,
+		DNS:                   []string{"1.1.1.1", "8.8.8.8"},
+		PreSharedKey:          "",
+		UsersFile:             "/etc/novavpn/users.yaml",
+		MaxClients:            65534,
+		KeepaliveInterval:     25,
+		SessionTimeout:        120,
+		EnableNAT:             true,
+		ExternalInterface:     "eth0",
+		MaxParallelHandshakes: 64,
+		EnableGROGSO:          "auto",
+		LogLevel:              "info",
 	}
 }
 
@@ -111,10 +122,14 @@ func (c *ServerConfig) Validate() error {
 	if c.MaxClients < 1 || c.MaxClients > 65534 {
 		return fmt.Errorf("max_clients должен быть от 1 до 65534")
 	}
+	if c.MaxParallelHandshakes < 1 || c.MaxParallelHandshakes > 256 {
+		return fmt.Errorf("max_parallel_handshakes должен быть от 1 до 256")
+	}
+	if c.EnableGROGSO != "auto" && c.EnableGROGSO != "true" && c.EnableGROGSO != "false" {
+		return fmt.Errorf("enable_gro_gso должен быть auto, true или false (текущее: %q)", c.EnableGROGSO)
+	}
 	return nil
 }
-
-
 
 // SaveConfig сохраняет конфигурацию в YAML-файл.
 func SaveConfig(path string, cfg *ServerConfig) error {

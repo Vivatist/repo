@@ -64,53 +64,68 @@ func (s *novaVPNService) Execute(args []string, r <-chan svc.ChangeRequest, chan
 		}
 	}()
 
+	// Канал для остановки сервиса по IPC-команде stop_service
+	stopFromIPC := make(chan struct{}, 1)
+	ipcServer.SetStopCh(stopFromIPC)
+
 	changes <- svc.Status{State: svc.Running, Accepts: cmdsAccepted}
 	log.Println("[SERVICE] Сервис запущен")
 
-	for c := range r {
-		switch c.Cmd {
-		case svc.Interrogate:
-			changes <- c.CurrentStatus
-		case svc.Stop, svc.Shutdown:
+	for {
+		select {
+		case <-stopFromIPC:
 			changes <- svc.Status{State: svc.StopPending}
-			log.Println("[SERVICE] Останавливаем сервис...")
+			log.Println("[SERVICE] Остановка по IPC-команде stop_service...")
 
-			// Отключаем VPN если подключён
 			if vpnSvc.GetState() == domainvpn.StateConnected {
 				vpnSvc.Disconnect()
 			}
-
-			// Останавливаем IPC
 			ipcServer.Stop()
-
 			return false, 0
-		case svc.PowerEvent:
-			switch c.EventType {
-			case pbtAPMSuspend:
-				log.Println("[SERVICE] Система переходит в спящий режим")
-			case pbtAPMResumeAutomatic, pbtAPMResumeSuspend:
-				log.Println("[SERVICE] Система возобновлена из спящего режима")
-				// Если VPN был подключён, принудительно переподключаем:
-				// после sleep UDP-сокет мёртв, но клиент может этого не знать
+
+		case c := <-r:
+			switch c.Cmd {
+			case svc.Interrogate:
+				changes <- c.CurrentStatus
+			case svc.Stop, svc.Shutdown:
+				changes <- svc.Status{State: svc.StopPending}
+				log.Println("[SERVICE] Останавливаем сервис...")
+
+				// Отключаем VPN если подключён
 				if vpnSvc.GetState() == domainvpn.StateConnected {
-					log.Println("[SERVICE] Переподключение VPN после resume...")
-					go func() {
-						params := vpnSvc.GetConnectParams()
-						if err := vpnSvc.Disconnect(); err != nil {
-							log.Printf("[SERVICE] Ошибка отключения после resume: %v", err)
-						}
-						// Пауза для восстановления сети
-						time.Sleep(networkRecoveryDelay)
-						if err := vpnSvc.Connect(params); err != nil {
-							log.Printf("[SERVICE] Ошибка переподключения после resume: %v", err)
-						}
-					}()
+					vpnSvc.Disconnect()
+				}
+
+				// Останавливаем IPC
+				ipcServer.Stop()
+
+				return false, 0
+			case svc.PowerEvent:
+				switch c.EventType {
+				case pbtAPMSuspend:
+					log.Println("[SERVICE] Система переходит в спящий режим")
+				case pbtAPMResumeAutomatic, pbtAPMResumeSuspend:
+					log.Println("[SERVICE] Система возобновлена из спящего режима")
+					// Если VPN был подключён, принудительно переподключаем:
+					// после sleep UDP-сокет мёртв, но клиент может этого не знать
+					if vpnSvc.GetState() == domainvpn.StateConnected {
+						log.Println("[SERVICE] Переподключение VPN после resume...")
+						go func() {
+							params := vpnSvc.GetConnectParams()
+							if err := vpnSvc.Disconnect(); err != nil {
+								log.Printf("[SERVICE] Ошибка отключения после resume: %v", err)
+							}
+							// Пауза для восстановления сети
+							time.Sleep(networkRecoveryDelay)
+							if err := vpnSvc.Connect(params); err != nil {
+								log.Printf("[SERVICE] Ошибка переподключения после resume: %v", err)
+							}
+						}()
+					}
 				}
 			}
 		}
 	}
-
-	return false, 0
 }
 
 // handleIPCRequest обрабатывает IPC-запросы от GUI.
@@ -140,6 +155,12 @@ func handleIPCRequest(vpnSvc *vpnservice.Service, req map[string]interface{}) ma
 		if err := vpnSvc.Disconnect(); err != nil {
 			return map[string]interface{}{"type": "error", "error": err.Error()}
 		}
+		return map[string]interface{}{"type": "ok"}
+
+	case "stop_service":
+		log.Println("[SERVICE] Получена IPC-команда stop_service")
+		// Сигнализируем основному циклу об остановке.
+		// Ответ "ok" может не дойти — GUI закрывается сразу после отправки.
 		return map[string]interface{}{"type": "ok"}
 
 	case "get_status":
@@ -254,6 +275,8 @@ func Uninstall() error {
 }
 
 // Start запускает Windows-сервис.
+// Если сервис в StopPending — ждёт до 15 секунд, пока он полностью остановится.
+// Если уже запущен — возвращает nil.
 func Start() error {
 	m, err := mgr.Connect()
 	if err != nil {
@@ -267,11 +290,52 @@ func Start() error {
 	}
 	defer s.Close()
 
+	// Проверяем текущее состояние
+	status, err := s.Query()
+	if err != nil {
+		return fmt.Errorf("query service: %w", err)
+	}
+
+	// Уже запущен
+	if status.State == svc.Running {
+		return nil
+	}
+
+	// Ещё останавливается — ждём полной остановки
+	if status.State == svc.StopPending {
+		log.Printf("[SERVICE] Сервис в StopPending, ожидаем остановки...")
+		for i := 0; i < 30; i++ {
+			time.Sleep(500 * time.Millisecond)
+			status, err = s.Query()
+			if err != nil {
+				return fmt.Errorf("query service: %w", err)
+			}
+			if status.State == svc.Stopped {
+				break
+			}
+		}
+		if status.State != svc.Stopped {
+			return fmt.Errorf("сервис завис в StopPending")
+		}
+	}
+
 	if err := s.Start(); err != nil {
 		return fmt.Errorf("start service: %w", err)
 	}
 
-	return nil
+	// Ждём подтверждения запуска
+	for i := 0; i < 20; i++ {
+		time.Sleep(500 * time.Millisecond)
+		status, err = s.Query()
+		if err != nil {
+			return fmt.Errorf("query service: %w", err)
+		}
+		if status.State == svc.Running {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("сервис не перешёл в Running (текущее состояние: %d)", status.State)
 }
 
 // Stop останавливает Windows-сервис.

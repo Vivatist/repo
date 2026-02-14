@@ -19,6 +19,47 @@ import (
 	"github.com/novavpn/vpn-server/internal/protocol"
 )
 
+// --- LRU-1 кеши для hot path (lock-free, single goroutine) ---
+
+// sessionCache — кеш последней сессии по SessionID (LRU-1).
+// Устраняет RWMutex.RLock lookup при повторяющихся пакетах от одного клиента.
+// Используется ТОЛЬКО из одной горутины (udpReadLoop) — синхронизация не требуется.
+type sessionCache struct {
+	id      uint32
+	session *Session
+}
+
+// get возвращает сессию по ID, используя кеш при совпадении.
+// При промахе обращается к SessionManager (RLock) и обновляет кеш.
+func (sc *sessionCache) get(id uint32, sm *SessionManager) *Session {
+	if sc.id == id && sc.session != nil {
+		return sc.session
+	}
+	s := sm.GetSessionByID(id)
+	sc.id = id
+	sc.session = s
+	return s
+}
+
+// ipSessionCache — кеш последней сессии по VPN IP [4]byte (LRU-1).
+// Устраняет RWMutex.RLock lookup при маршрутизации пакетов из TUN.
+// Используется ТОЛЬКО из одной горутины (tunReadLoop) — синхронизация не требуется.
+type ipSessionCache struct {
+	key     [4]byte
+	session *Session
+}
+
+// get возвращает сессию по IP-ключу, используя кеш при совпадении.
+func (sc *ipSessionCache) get(key [4]byte, sm *SessionManager) *Session {
+	if sc.key == key && sc.session != nil {
+		return sc.session
+	}
+	s := sm.GetSessionByIPKey(key)
+	sc.key = key
+	sc.session = s
+	return s
+}
+
 // SessionState — состояние сессии.
 type SessionState int
 
@@ -340,6 +381,14 @@ func (sm *SessionManager) GetSessionByVPNIP(ip net.IP) *Session {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 	return sm.ipToSession[ipToKey(ip)]
+}
+
+// GetSessionByIPKey возвращает сессию по [4]byte ключу IP (zero-alloc hot path).
+// Используется вместо GetSessionByVPNIP на hot path для избежания аллокации net.IP.
+func (sm *SessionManager) GetSessionByIPKey(key [4]byte) *Session {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.ipToSession[key]
 }
 
 // RemoveSession удаляет сессию.

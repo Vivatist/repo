@@ -313,17 +313,11 @@ func (a *App) connect() {
 		return
 	}
 
-	// Проверяем, доступен ли сервис
+	// Автоматически запускаем сервис, если он не работает
 	if !a.ipcClient.IsServiceRunning() {
-		a.mainWindow.Synchronize(func() {
-			result := walk.MsgBox(a.mainWindow, "NovaVPN",
-				"Сервис NovaVPN не запущен.\n\nУстановить и запустить сервис?\n(Потребуется подтверждение UAC)",
-				walk.MsgBoxOKCancel|walk.MsgBoxIconQuestion)
-			if result == walk.DlgCmdOK {
-				go a.installAndStartService()
-			}
-		})
-		return
+		if !a.ensureServiceRunning() {
+			return
+		}
 	}
 
 	// Показываем "Подключение..." сразу — и текст, и иконку трея
@@ -371,16 +365,19 @@ func (a *App) disconnect() {
 }
 
 // onExit — выход из приложения.
+// Безусловно останавливает Windows-сервис, затем завершает GUI.
 func (a *App) onExit() {
 	// Останавливаем поллинг
 	close(a.stopPoll)
 
-	// Если подключён — отключаем через сервис
+	// Сохраняем состояние для автоподключения при следующем запуске
 	if a.lastState == ipc.StateConnected {
 		a.cfg.WasConnected = true
 		a.cfg.Save()
-		a.ipcClient.Disconnect()
 	}
+
+	// Безусловно останавливаем сервис (он сам отключит VPN и завершится)
+	a.ipcClient.StopService()
 
 	a.notifyIcon.Dispose()
 	a.mainWindow.Dispose()
@@ -535,59 +532,73 @@ func (a *App) setFieldsEnabled(enabled bool) {
 	a.passwordEdit.SetEnabled(enabled)
 }
 
-// installAndStartService устанавливает и запускает сервис NovaVPN с UAC elevation.
-func (a *App) installAndStartService() {
-	exe, err := os.Executable()
+// ensureServiceRunning прозрачно запускает сервис NovaVPN.
+// Если сервис установлен, но остановлен — запускает через SCM (UAC).
+// Если не установлен — устанавливает и запускает.
+// Возвращает true если сервис успешно запущен.
+func (a *App) ensureServiceRunning() bool {
+	serviceExe, err := a.serviceExePath()
 	if err != nil {
 		a.mainWindow.Synchronize(func() {
-			walk.MsgBox(a.mainWindow, "Ошибка", "Не удалось определить путь: "+err.Error(), walk.MsgBoxIconError)
+			walk.MsgBox(a.mainWindow, "Ошибка", err.Error(), walk.MsgBoxIconError)
 		})
-		return
+		return false
 	}
 
-	serviceExe := filepath.Join(filepath.Dir(exe), "novavpn-service.exe")
+	log.Println("[GUI] Сервис недоступен. Пробуем запустить...")
 
-	// Проверяем наличие файла сервиса
-	if _, err := os.Stat(serviceExe); os.IsNotExist(err) {
-		a.mainWindow.Synchronize(func() {
-			walk.MsgBox(a.mainWindow, "Ошибка",
-				"Файл novavpn-service.exe не найден.\nУбедитесь, что он находится рядом с NovaVPN.exe",
-				walk.MsgBoxIconError)
-		})
-		return
-	}
-
-	log.Println("[GUI] Запуск установки сервиса с UAC...")
-
-	// Запускаем установку с UAC (одна команда: install + start)
-	if err := elevation.RunElevated(serviceExe, "install"); err != nil {
-		a.mainWindow.Synchronize(func() {
-			walk.MsgBox(a.mainWindow, "Ошибка",
-				"Не удалось установить сервис.\nВозможно, вы отменили запрос UAC.",
-				walk.MsgBoxIconError)
-		})
-		return
-	}
-
-	// Ждём пока сервис станет доступен
-	for i := 0; i < 20; i++ {
-		time.Sleep(500 * time.Millisecond)
-		if a.ipcClient.IsServiceRunning() {
-			log.Println("[GUI] Сервис установлен и запущен")
-			a.mainWindow.Synchronize(func() {
-				walk.MsgBox(a.mainWindow, "NovaVPN",
-					"Сервис NovaVPN установлен и запущен!\nТеперь вы можете подключиться.",
-					walk.MsgBoxIconInformation)
-			})
-			return
+	// Стратегия: пробуем "start" (быстрый путь), если не получилось — "install".
+	// "start" через наш бинарник умеет ждать StopPending и проверять Running.
+	// GUI не имеет прав для SCM API напрямую, поэтому всё делаем через UAC elevation.
+	err = elevation.RunElevated(serviceExe, "start")
+	if err != nil {
+		log.Printf("[GUI] start не удался: %v, пробуем install...", err)
+		err = elevation.RunElevated(serviceExe, "install")
+		if err != nil {
+			log.Printf("[GUI] install не удался: %v", err)
 		}
 	}
 
+	// Ждём пока сервис начнёт отвечать по IPC (до 10 сек)
+	for i := 0; i < 20; i++ {
+		time.Sleep(500 * time.Millisecond)
+		if a.ipcClient.IsServiceRunning() {
+			log.Println("[GUI] Сервис запущен")
+			return true
+		}
+	}
+
+	log.Println("[GUI] Сервис не ответил за 10 секунд")
 	a.mainWindow.Synchronize(func() {
 		walk.MsgBox(a.mainWindow, "Ошибка",
-			"Сервис установлен, но не удалось дождаться его запуска.\nПопробуйте запустить вручную.",
+			"Не удалось запустить сервис NovaVPN.",
 			walk.MsgBoxIconWarning)
 	})
+	return false
+}
+
+// installAndStartService устанавливает и запускает сервис NovaVPN с UAC elevation.
+func (a *App) installAndStartService() {
+	if a.ensureServiceRunning() {
+		a.mainWindow.Synchronize(func() {
+			walk.MsgBox(a.mainWindow, "NovaVPN",
+				"Сервис NovaVPN запущен!\nТеперь вы можете подключиться.",
+				walk.MsgBoxIconInformation)
+		})
+	}
+}
+
+// serviceExePath возвращает путь к novavpn-service.exe рядом с GUI.
+func (a *App) serviceExePath() (string, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("не удалось определить путь: %w", err)
+	}
+	serviceExe := filepath.Join(filepath.Dir(exe), "novavpn-service.exe")
+	if _, err := os.Stat(serviceExe); os.IsNotExist(err) {
+		return "", fmt.Errorf("файл novavpn-service.exe не найден рядом с NovaVPN.exe")
+	}
+	return serviceExe, nil
 }
 
 // pingLoop — периодический ICMP-пинг сервера раз в 10 секунд.

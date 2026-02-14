@@ -37,6 +37,19 @@ func (s *VPNServer) handlePacket(data []byte, remoteAddr *net.UDPAddr) {
 
 // handleHandshakeInit обрабатывает инициацию рукопожатия.
 func (s *VPNServer) handleHandshakeInit(pkt *protocol.Packet, remoteAddr *net.UDPAddr) {
+	// Семафор: ограничиваем параллельные Argon2id (CPU + memory intensive).
+	// Блокируем до 15 секунд — клиент ждёт в очереди вместо мгновенного отказа.
+	handshakeTimeout := time.NewTimer(15 * time.Second)
+	select {
+	case s.handshakeSem <- struct{}{}:
+		handshakeTimeout.Stop()
+		defer func() { <-s.handshakeSem }()
+	case <-handshakeTimeout.C:
+		log.Printf("[HANDSHAKE] Таймаут очереди handshake (15с), отклоняем %s", remoteAddr)
+		s.sendErrorPacket(remoteAddr, 0, "server_busy")
+		return
+	}
+
 	log.Printf("[HANDSHAKE] Получен HandshakeInit от %s", remoteAddr)
 
 	// Парсим данные рукопожатия
