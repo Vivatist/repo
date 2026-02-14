@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="320dp"
+    android:height="180dp"
+    android:viewportWidth="320"
+    android:viewportHeight="180">
+    <!-- Background -->
+    <path
+        android:fillColor="#FF1E88E5"
+        android:pathData="M0,0h320v180H0z" />
+    <!-- Shield -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M100,30L60,48v28c0,25,17.2,48,40,54c22.8,-6,40,-29,40,-54V48L100,30z" />
+    <!-- V -->
+    <path
+        android:fillColor="#FF1E88E5"
+        android:pathData="M85,62l15,24l15,-24l-7,0l-8,14l-8,-14z" />
+    <!-- Text NovaVPN -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M155,80h10v30h-10zM155,80l15,30h8V80h-8l-15,30z" />
+</vector>

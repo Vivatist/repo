@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">NovaVPN</string>
+    <string name="status_disconnected">Отключён</string>
+    <string name="status_connecting">Подключение…</string>
+    <string name="status_connected">Подключён</string>
+    <string name="status_disconnecting">Отключение…</string>
+    <string name="btn_connect">Подключиться</string>
+    <string name="btn_disconnect">Отключиться</string>
+    <string name="label_server">Сервер</string>
+    <string name="label_email">Email</string>
+    <string name="label_password">Пароль</string>
+    <string name="label_settings">Настройки</string>
+    <string name="label_save">Сохранить</string>
+    <string name="label_stats_up">↑ %s</string>
+    <string name="label_stats_down">↓ %s</string>
+    <string name="notification_channel">NovaVPN</string>
+    <string name="notification_connected">VPN подключён</string>
+    <string name="notification_connecting">Подключение к VPN…</string>
+    <string name="notification_disconnected">VPN отключён</string>
+    <string name="vpn_ip_label">VPN IP: %s</string>
+    <string name="error_fill_fields">Заполните все поля</string>
+    <string name="error_connection_failed">Ошибка подключения</string>
+</resources>
