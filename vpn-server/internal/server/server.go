@@ -34,6 +34,12 @@ type VPNServer struct {
 	// Менеджер сессий
 	sessions *SessionManager
 
+	// Batch sender для пакетной отправки UDP через sendmmsg (Linux)
+	batch *batchSender
+
+	// Batch receiver для пакетного приёма UDP через recvmmsg (Linux)
+	batchRecv *batchReceiver
+
 	// Контекст для graceful shutdown
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -94,6 +100,27 @@ func (s *VPNServer) loadUsers() error {
 	return nil
 }
 
+// tuneSocketBuffers увеличивает буферы UDP-сокета.
+// Пытается установить 16 МБ, при неудаче fallback к меньшим значениям.
+// Логирует реальные размеры буферов, установленные ядром.
+func (s *VPNServer) tuneSocketBuffers(conn *net.UDPConn) {
+	// Попытки в порядке убывания: 16MB, 8MB, 4MB
+	targets := []int{16 * 1024 * 1024, 8 * 1024 * 1024, 4 * 1024 * 1024}
+
+	for _, size := range targets {
+		if err := conn.SetReadBuffer(size); err == nil {
+			log.Printf("[UDP] Read buffer установлен: %d МБ", size/1024/1024)
+			break
+		}
+	}
+	for _, size := range targets {
+		if err := conn.SetWriteBuffer(size); err == nil {
+			log.Printf("[UDP] Write buffer установлен: %d МБ", size/1024/1024)
+			break
+		}
+	}
+}
+
 // Start запускает VPN-сервер.
 func (s *VPNServer) Start() error {
 	log.Println("═══════════════════════════════════════════")
@@ -144,11 +171,22 @@ func (s *VPNServer) Start() error {
 	}
 	s.udpConn = conn
 
-	// Увеличиваем буферы сокета
-	_ = conn.SetReadBuffer(4 * 1024 * 1024)
-	_ = conn.SetWriteBuffer(4 * 1024 * 1024)
+	// Увеличиваем буферы сокета до 16 МБ (fallback к 4 МБ если ядро не позволяет)
+	s.tuneSocketBuffers(conn)
 
 	log.Printf("[UDP] Слушаем на %s:%d", s.cfg.ListenAddr, s.cfg.ListenPort)
+
+	// Инициализируем batch I/O (sendmmsg + recvmmsg)
+	maxPktSize := s.cfg.MTU + protocol.TotalOverhead + 100
+	fd, rawConn, err := getUDPSocketFdAndRawConn(conn)
+	if err != nil {
+		log.Printf("[BATCH] Не удалось получить fd/rawConn сокета: %v — используем обычную отправку", err)
+	} else {
+		s.batch = newBatchSender(fd, maxPktSize)
+		s.batch.Start()
+		s.batchRecv = newBatchReceiver(rawConn, maxPktSize)
+		log.Printf("[BATCH] sendmmsg/recvmmsg активированы (batch=%d, flush=%v)", batchSize, flushInterval)
+	}
 
 	// 4. Запускаем горутины
 	s.wg.Add(3)
@@ -172,6 +210,11 @@ func (s *VPNServer) Stop() {
 
 	s.cancel()
 
+	// Останавливаем batch sender (флушит оставшиеся пакеты)
+	if s.batch != nil {
+		s.batch.Stop()
+	}
+
 	// Закрываем UDP-сокет (прерывает ReadFromUDP)
 	if s.udpConn != nil {
 		s.udpConn.Close()
@@ -194,6 +237,8 @@ func (s *VPNServer) Stop() {
 }
 
 // udpReadLoop — основной цикл приёма UDP-пакетов.
+// Использует batch приём (recvmmsg) если batchRecv инициализирован,
+// иначе fallback на обычный ReadFromUDP.
 // Data/Keepalive/Disconnect обрабатываются inline (без горутин и пулов).
 // Handshake-пакеты обрабатываются в отдельной горутине (редкие).
 func (s *VPNServer) udpReadLoop() {
@@ -201,141 +246,191 @@ func (s *VPNServer) udpReadLoop() {
 
 	log.Println("[UDP] Запущен цикл приёма пакетов")
 
-	buf := make([]byte, s.cfg.MTU+protocol.TotalOverhead+100)
-	// Пре-аллоцированный буфер для дешифрования (zero-alloc)
+	// Пре-аллоцированный буфер для дешифрования (zero-alloc, single goroutine — safe)
 	decryptBuf := make([]byte, 0, s.cfg.MTU+100)
+	// LRU-1 кеш сессий — устраняет RWMutex lookup при повторяющихся пакетах
+	cache := &sessionCache{}
 
-	for {
-		n, remoteAddr, err := s.udpConn.ReadFromUDP(buf)
-		if err != nil {
-			select {
-			case <-s.ctx.Done():
-				return
-			default:
-				log.Printf("[UDP] Ошибка чтения: %v", err)
-				continue
-			}
-		}
-
-		if n < protocol.MinPacketSize {
-			continue
-		}
-
-		// Inline-парсинг заголовка без аллокаций
-		raw := buf[:n]
-		if len(raw) >= protocol.TLSHeaderSize && raw[0] == protocol.TLSContentType {
-			raw = raw[protocol.TLSHeaderSize:]
-		}
-		// SessionID(4) + Type(1) = 5 минимум
-		if len(raw) < 5 {
-			continue
-		}
-
-		sessionID := binary.BigEndian.Uint32(raw[0:4])
-		pktType := protocol.PacketType(raw[4])
-
-		switch pktType {
-		case protocol.PacketData:
-			// Hot path: inline обработка без горутины и Unmarshal
-			// Data: SID(4) + Type(1) + Counter(4) + CT (plain ChaCha20, без auth tag)
-			if len(raw) < 9 {
-				continue
-			}
-
-			session := s.sessions.GetSessionByID(sessionID)
-			if session == nil || !session.IsActive() {
-				continue
-			}
-
-			counter := binary.BigEndian.Uint32(raw[5:9])
-			payload := raw[9:]
-
-			// Восстанавливаем полный nonce
-			var nonce [protocol.NonceSize]byte
-			copy(nonce[:4], session.recvNoncePrefix[:])
-			binary.BigEndian.PutUint64(nonce[4:], uint64(counter))
-
-			// Plain ChaCha20 XOR дешифровка (zero-alloc)
-			plaintextLen := len(payload)
-			if cap(decryptBuf) < plaintextLen {
-				decryptBuf = make([]byte, plaintextLen)
-			} else {
-				decryptBuf = decryptBuf[:plaintextLen]
-			}
-			c, err := chacha20.NewUnauthenticatedCipher(session.Keys.RecvKey[:], nonce[:])
+	if s.batchRecv != nil {
+		// Batch path: recvmmsg — до 64 пакетов за 1 syscall
+		log.Println("[UDP] Используется batch приём (recvmmsg)")
+		for {
+			n, err := s.batchRecv.Recv()
 			if err != nil {
-				continue
-			}
-			c.XORKeyStream(decryptBuf, payload)
-			plaintext := decryptBuf
-
-			session.UpdateActivity()
-			session.BytesRecv.Add(uint64(len(plaintext)))
-			session.PacketsRecv.Add(1)
-
-			if _, err := s.tunDev.Write(plaintext); err != nil {
-				if s.cfg.LogLevel == "debug" {
-					log.Printf("[TUN] Ошибка записи в TUN: %v", err)
+				select {
+				case <-s.ctx.Done():
+					return
+				default:
+					log.Printf("[UDP] Ошибка recvmmsg: %v", err)
+					continue
 				}
 			}
 
-		case protocol.PacketKeepalive:
-			session := s.sessions.GetSessionByID(sessionID)
-			if session == nil {
+			for i := 0; i < n; i++ {
+				data, remoteAddr := s.batchRecv.GetPacket(i)
+				decryptBuf = s.processUDPPacket(data, remoteAddr, decryptBuf, cache)
+			}
+		}
+	} else {
+		// Fallback: обычный ReadFromUDP (один пакет за syscall)
+		buf := make([]byte, s.cfg.MTU+protocol.TotalOverhead+100)
+		for {
+			n, remoteAddr, err := s.udpConn.ReadFromUDP(buf)
+			if err != nil {
+				select {
+				case <-s.ctx.Done():
+					return
+				default:
+					log.Printf("[UDP] Ошибка чтения: %v", err)
+					continue
+				}
+			}
+
+			if n < protocol.MinPacketSize {
 				continue
 			}
-			session.UpdateActivity()
-			// Address migration: обновляем адрес клиента при смене IP/порта (0-RTT resume, NAT rebind)
-			if session.ClientAddr.String() != remoteAddr.String() {
-				log.Printf("[KEEPALIVE] Address migration #%d: %s -> %s", session.ID, session.ClientAddr, remoteAddr)
-				s.sessions.UpdateClientAddr(session, remoteAddr)
-			}
-			if s.cfg.LogLevel == "debug" {
-				log.Printf("[KEEPALIVE] Получен от сессии #%d", session.ID)
-			}
-			// Lightweight keepalive response: TLS(5) + SID(4) + Type(1) = 10 bytes, zero-alloc
-			var kaBuf [10]byte
-			kaBuf[0] = protocol.TLSContentType
-			kaBuf[1] = protocol.TLSVersionMajor
-			kaBuf[2] = protocol.TLSVersionMinor
-			binary.BigEndian.PutUint16(kaBuf[3:5], 5)
-			binary.BigEndian.PutUint32(kaBuf[5:9], session.ID)
-			kaBuf[9] = byte(protocol.PacketKeepalive)
-			s.udpConn.WriteToUDP(kaBuf[:], remoteAddr)
 
-		case protocol.PacketDisconnect:
-			session := s.sessions.GetSessionByID(sessionID)
-			if session == nil {
-				continue
-			}
-			// НЕ удаляем сессию — держим для 0-RTT resume.
-			// Истечёт по таймауту (SessionTimeout) в maintenanceLoop.
-			session.UpdateActivity()
-			log.Printf("[DISCONNECT] Клиент отключается: сессия #%d (%s) — сохранена для 0-RTT resume", session.ID, remoteAddr)
-
-		case protocol.PacketHandshakeInit, protocol.PacketHandshakeComplete:
-			// Handshake требует сложной обработки — выносим в горутину
-			packet := make([]byte, n)
-			copy(packet, buf[:n])
-			go s.handlePacket(packet, remoteAddr)
-
-		default:
-			if s.cfg.LogLevel == "debug" {
-				log.Printf("[PROTO] Неизвестный тип пакета 0x%02X от %s", pktType, remoteAddr)
-			}
+			decryptBuf = s.processUDPPacket(buf[:n], remoteAddr, decryptBuf, cache)
 		}
 	}
 }
 
+// processUDPPacket — обработка одного UDP-пакета (inline парсинг, дешифрование, TUN запись).
+// Извлечена из udpReadLoop для переиспользования в batch и fallback путях.
+// Возвращает decryptBuf для переиспользования (zero-alloc pattern).
+// cache — LRU-1 кеш сессий для устранения RWMutex lookup при повторяющихся sessionID.
+func (s *VPNServer) processUDPPacket(origData []byte, remoteAddr *net.UDPAddr, decryptBuf []byte, cache *sessionCache) []byte {
+	if len(origData) < protocol.MinPacketSize {
+		return decryptBuf
+	}
+
+	// Inline-парсинг заголовка без аллокаций
+	raw := origData
+	if len(raw) >= protocol.TLSHeaderSize && raw[0] == protocol.TLSContentType {
+		raw = raw[protocol.TLSHeaderSize:]
+	}
+	// SessionID(4) + Type(1) = 5 минимум
+	if len(raw) < 5 {
+		return decryptBuf
+	}
+
+	sessionID := binary.BigEndian.Uint32(raw[0:4])
+	pktType := protocol.PacketType(raw[4])
+
+	switch pktType {
+	case protocol.PacketData:
+		// Hot path: inline обработка без горутины и Unmarshal
+		// Data: SID(4) + Type(1) + Counter(4) + CT (plain ChaCha20, без auth tag)
+		if len(raw) < 9 {
+			return decryptBuf
+		}
+
+		session := cache.get(sessionID, s.sessions)
+		if session == nil || !session.IsActive() {
+			return decryptBuf
+		}
+
+		counter := binary.BigEndian.Uint32(raw[5:9])
+		payload := raw[9:]
+
+		// Восстанавливаем полный nonce
+		var nonce [protocol.NonceSize]byte
+		copy(nonce[:4], session.recvNoncePrefix[:])
+		binary.BigEndian.PutUint64(nonce[4:], uint64(counter))
+
+		// Plain ChaCha20 XOR дешифровка (zero-alloc)
+		plaintextLen := len(payload)
+		if cap(decryptBuf) < plaintextLen {
+			decryptBuf = make([]byte, plaintextLen)
+		} else {
+			decryptBuf = decryptBuf[:plaintextLen]
+		}
+		c, err := chacha20.NewUnauthenticatedCipher(session.Keys.RecvKey[:], nonce[:])
+		if err != nil {
+			return decryptBuf
+		}
+		c.XORKeyStream(decryptBuf, payload)
+
+		session.UpdateActivity()
+		session.BytesRecv.Add(uint64(len(decryptBuf)))
+		session.PacketsRecv.Add(1)
+
+		if _, err := s.tunDev.Write(decryptBuf); err != nil {
+			if s.cfg.LogLevel == "debug" {
+				log.Printf("[TUN] Ошибка записи в TUN: %v", err)
+			}
+		}
+
+	case protocol.PacketKeepalive:
+		session := cache.get(sessionID, s.sessions)
+		if session == nil {
+			return decryptBuf
+		}
+		session.UpdateActivity()
+		// Address migration: обновляем адрес клиента при смене IP/порта (0-RTT resume, NAT rebind)
+		if session.ClientAddr.String() != remoteAddr.String() {
+			log.Printf("[KEEPALIVE] Address migration #%d: %s -> %s", session.ID, session.ClientAddr, remoteAddr)
+			s.sessions.UpdateClientAddr(session, remoteAddr)
+		}
+		if s.cfg.LogLevel == "debug" {
+			log.Printf("[KEEPALIVE] Получен от сессии #%d", session.ID)
+		}
+		// Lightweight keepalive response: TLS(5) + SID(4) + Type(1) = 10 bytes, zero-alloc
+		var kaBuf [10]byte
+		kaBuf[0] = protocol.TLSContentType
+		kaBuf[1] = protocol.TLSVersionMajor
+		kaBuf[2] = protocol.TLSVersionMinor
+		binary.BigEndian.PutUint16(kaBuf[3:5], 5)
+		binary.BigEndian.PutUint32(kaBuf[5:9], session.ID)
+		kaBuf[9] = byte(protocol.PacketKeepalive)
+		s.udpConn.WriteToUDP(kaBuf[:], remoteAddr)
+
+	case protocol.PacketDisconnect:
+		session := cache.get(sessionID, s.sessions)
+		if session == nil {
+			return decryptBuf
+		}
+		// НЕ удаляем сессию — держим для 0-RTT resume.
+		// Истечёт по таймауту (SessionTimeout) в maintenanceLoop.
+		session.UpdateActivity()
+		log.Printf("[DISCONNECT] Клиент отключается: сессия #%d (%s) — сохранена для 0-RTT resume", session.ID, remoteAddr)
+
+	case protocol.PacketHandshakeInit, protocol.PacketHandshakeComplete:
+		// Handshake требует сложной обработки — выносим в горутину.
+		// Копируем оригинальные данные (с TLS заголовком), т.к. буфер
+		// batchReceiver будет переиспользован при следующем Recv().
+		packet := make([]byte, len(origData))
+		copy(packet, origData)
+		go s.handlePacket(packet, remoteAddr)
+
+	default:
+		if s.cfg.LogLevel == "debug" {
+			log.Printf("[PROTO] Неизвестный тип пакета 0x%02X от %s", pktType, remoteAddr)
+		}
+	}
+
+	return decryptBuf
+}
+
 // tunReadLoop — цикл чтения пакетов из TUN-интерфейса.
+// Использует batch sender (sendmmsg) для пакетной отправки, если доступен.
+// Fallback на обычный WriteToUDP если batch sender не инициализирован.
 func (s *VPNServer) tunReadLoop() {
 	defer s.wg.Done()
 
 	log.Println("[TUN] Запущен цикл чтения из TUN")
 
 	buf := make([]byte, s.cfg.MTU+100)
-	// Пре-аллоцированный буфер для отправки (zero-alloc hot path)
+	// Пре-аллоцированный буфер для fallback отправки (zero-alloc hot path)
 	sendBuf := make([]byte, s.cfg.MTU+protocol.TotalOverhead+100)
+
+	useBatch := s.batch != nil
+	if useBatch {
+		log.Println("[TUN] Используется batch sender (sendmmsg)")
+	}
+
+	// LRU-1 кеш сессий по IP — устраняет RWMutex lookup при повторяющихся dst IP
+	ipCache := &ipSessionCache{}
 
 	for {
 		n, err := s.tunDev.Read(buf)
@@ -359,8 +454,8 @@ func (s *VPNServer) tunReadLoop() {
 			continue
 		}
 
-		// Ищем сессию по VPN IP (zero-alloc lookup)
-		session := s.sessions.GetSessionByIPKey(dstKey)
+		// Ищем сессию по VPN IP (LRU-1 кеш, zero-alloc при cache hit)
+		session := ipCache.get(dstKey, s.sessions)
 		if session == nil {
 			if s.cfg.LogLevel == "debug" {
 				log.Printf("[TUN] Нет сессии для IP %d.%d.%d.%d", dstKey[0], dstKey[1], dstKey[2], dstKey[3])
@@ -372,8 +467,12 @@ func (s *VPNServer) tunReadLoop() {
 			continue
 		}
 
-		// Шифруем и отправляем без промежуточного копирования
-		s.sendToClient(session, buf[:n], sendBuf)
+		// Шифруем и отправляем: batch (sendmmsg) или fallback (WriteToUDP)
+		if useBatch {
+			s.sendToClientBatch(session, buf[:n], s.batch)
+		} else {
+			s.sendToClient(session, buf[:n], sendBuf)
+		}
 	}
 }
 
