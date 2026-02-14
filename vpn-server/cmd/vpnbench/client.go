@@ -352,11 +352,11 @@ func (bc *benchClient) runThroughputTest(duration time.Duration, pktSize int, cl
 	plaintext := make([]byte, pktSize)
 	// Минимальный IPv4 заголовок чтобы сервер мог записать в TUN без ошибки
 	if pktSize >= 20 {
-		plaintext[0] = 0x45 // IPv4, IHL=5
-		plaintext[1] = 0x00 // DSCP
+		plaintext[0] = 0x45                                         // IPv4, IHL=5
+		plaintext[1] = 0x00                                         // DSCP
 		binary.BigEndian.PutUint16(plaintext[2:4], uint16(pktSize)) // Total Length
-		plaintext[8] = 64   // TTL
-		plaintext[9] = 0x11 // UDP protocol
+		plaintext[8] = 64                                           // TTL
+		plaintext[9] = 0x11                                         // UDP protocol
 		// Src IP: 10.8.0.x (наш VPN IP)
 		if bc.assignedIP != nil {
 			ip4 := bc.assignedIP.To4()
