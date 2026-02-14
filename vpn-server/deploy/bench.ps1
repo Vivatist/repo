@@ -604,9 +604,9 @@ if ($overallGrade -eq "ОТЛИЧНО") {
 }
 
 Write-Host ""
-Write-Host "    Примечание: NovaVPN имеет уникальную TLS 1.2 stealth-обёртку для обхода DPI," -ForegroundColor DarkGray
+Write-Host "    Примечание: NovaVPN имеет уникальную QUIC stealth-обёртку для обхода DPI," -ForegroundColor DarkGray
 Write-Host "    которой не обладает ни один из сравниваемых VPN. Это создаёт дополнительный" -ForegroundColor DarkGray
-Write-Host "    overhead, но делает трафик неотличимым от HTTPS для систем фильтрации." -ForegroundColor DarkGray
+Write-Host "    overhead, но делает трафик неотличимым от QUIC/HTTP3 для систем фильтрации." -ForegroundColor DarkGray
 
 # ═══════════════════════════════════════════════════════════
 #  9. Сохранение сводного отчёта

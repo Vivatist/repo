@@ -1,8 +1,9 @@
-// Package protocol реализует протокол NovaVPN v2 (клиентская часть).
-// Stealth-версия с полной маскировкой под TLS.
+// Package protocol реализует протокол NovaVPN v3 (клиентская часть).
+// Stealth-версия с маскировкой под QUIC Short Header (UDP:443).
 package protocol
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -10,13 +11,20 @@ import (
 )
 
 const (
-	ProtocolVersion uint8 = 0x02
+	ProtocolVersion uint8 = 0x03
 
-	// TLS Record Header constants
+	// QUIC Short Header constants (маскировка под QUIC)
+	// Flags byte: Header Form=0 (Short), Fixed Bit=1, остальное — random
+	QUICFixedBitMask byte = 0x40 // bit 6 = 1 (QUIC Fixed Bit, обязателен)
+	QUICHeaderSize        = 5    // flags(1) + obfuscated_pad(4)
+
+	// Обратная совместимость: TLSHeaderSize = QUICHeaderSize (5 байт, все смещения сохраняются)
+	TLSHeaderSize = QUICHeaderSize
+
+	// Устаревшие константы (для поиска в коде, больше не используются при формировании)
 	TLSContentType  byte = 0x17
 	TLSVersionMajor byte = 0x03
 	TLSVersionMinor byte = 0x03
-	TLSHeaderSize        = 5
 
 	SessionIDSize          = 4
 	NonceSize              = 12
@@ -99,8 +107,48 @@ type Packet struct {
 var (
 	ErrPacketTooShort = errors.New("packet too short")
 	ErrDecryptFailed  = errors.New("decrypt failed")
-	ErrInvalidTLS     = errors.New("invalid TLS header")
+	ErrInvalidHeader  = errors.New("invalid header")
 )
+
+// WriteQUICHeader записывает QUIC Short Header (5 байт) в начало buf.
+// Flags byte: 0x40 | random_6bits (имитирует QUIC Short Header).
+// Bytes 1-4: случайные (обфусцированная «DCID-подобная» область).
+// buf должен быть >= QUICHeaderSize.
+func WriteQUICHeader(buf []byte) {
+	var rnd [5]byte
+	rand.Read(rnd[:])
+	buf[0] = QUICFixedBitMask | (rnd[0] & 0x3F) // 0b01XXXXXX
+	buf[1] = rnd[1]
+	buf[2] = rnd[2]
+	buf[3] = rnd[3]
+	buf[4] = rnd[4]
+}
+
+// IsQUICShortHeader проверяет, является ли первый байт валидным QUIC Short Header.
+func IsQUICShortHeader(firstByte byte) bool {
+	return firstByte&0xC0 == 0x40 // bits 7-6 = 01
+}
+
+// AddQUICHeader добавляет QUIC Short Header (5 байт) к данным.
+func AddQUICHeader(data []byte) []byte {
+	result := make([]byte, QUICHeaderSize+len(data))
+	WriteQUICHeader(result)
+	copy(result[QUICHeaderSize:], data)
+	return result
+}
+
+// SkipHeader пропускает 5-байтный заголовок (QUIC Short Header).
+// Не проверяет содержимое заголовка (валидация через header mask).
+func SkipHeader(data []byte) ([]byte, error) {
+	if len(data) < QUICHeaderSize {
+		return nil, ErrPacketTooShort
+	}
+	return data[QUICHeaderSize:], nil
+}
+
+// Устаревшие обёртки для обратной совместимости
+func AddTLSHeader(data []byte) []byte { return AddQUICHeader(data) }
+func ParseTLSHeader(data []byte) ([]byte, error) { return SkipHeader(data) }
 
 func (h *PacketHeader) MarshalEncryptedHeader() []byte {
 	size := 8 + len(h.Padding)
@@ -133,52 +181,22 @@ func UnmarshalEncryptedHeader(data []byte, sessionID uint32) (*PacketHeader, err
 	return h, nil
 }
 
-func AddTLSHeader(data []byte) []byte {
-	length := uint16(len(data))
-	header := make([]byte, TLSHeaderSize)
-	header[0] = TLSContentType
-	header[1] = TLSVersionMajor
-	header[2] = TLSVersionMinor
-	binary.BigEndian.PutUint16(header[3:5], length)
-	result := make([]byte, TLSHeaderSize+len(data))
-	copy(result[0:TLSHeaderSize], header)
-	copy(result[TLSHeaderSize:], data)
-	return result
-}
-
-func ParseTLSHeader(data []byte) ([]byte, error) {
-	if len(data) < TLSHeaderSize {
-		return nil, ErrPacketTooShort
-	}
-	if data[0] != TLSContentType {
-		// Опционально
-	}
-	length := binary.BigEndian.Uint16(data[3:5])
-	if int(length) != len(data)-TLSHeaderSize {
-		return nil, ErrInvalidTLS
-	}
-	return data[TLSHeaderSize:], nil
-}
-
 func (p *Packet) Marshal() ([]byte, error) {
-	// Формат: SessionID(4) + Type(1) + Nonce(12) + Payload
+	// Формат: QUIC_Header(5) + SessionID(4) + Type(1) + Nonce(12) + Payload
 	rawSize := SessionIDSize + 1 + NonceSize + len(p.Payload)
 	raw := make([]byte, rawSize)
 	binary.BigEndian.PutUint32(raw[0:4], p.Header.SessionID)
 	raw[4] = uint8(p.Header.Type)
 	copy(raw[5:17], p.Nonce[:])
 	copy(raw[17:], p.Payload)
-	return AddTLSHeader(raw), nil
+	return AddQUICHeader(raw), nil
 }
 
 func Unmarshal(data []byte) (*Packet, error) {
-	raw := data
-	if len(data) >= TLSHeaderSize && data[0] == TLSContentType {
-		var err error
-		raw, err = ParseTLSHeader(data)
-		if err != nil {
-			return nil, err
-		}
+	// Всегда пропускаем 5-байтный заголовок (QUIC Short Header)
+	raw, err := SkipHeader(data)
+	if err != nil {
+		return nil, err
 	}
 	// SessionID(4) + Type(1) + Nonce(12) = 17 bytes minimum
 	if len(raw) < SessionIDSize+1+NonceSize {

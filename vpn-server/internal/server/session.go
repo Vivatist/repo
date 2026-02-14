@@ -229,23 +229,20 @@ func deriveNoncePrefix(key []byte) [4]byte {
 
 // EncryptAndBuild шифрует plaintext и собирает готовый VPN-пакет в buf.
 // Plain ChaCha20 (XOR) без Poly1305 — нет auth tag.
-// Формат: TLS_Header(5) + SessionID(4) + Type(1) + Counter(4) + Ciphertext(paddedPlaintext)
+// Формат: QUIC_Header(5) + SessionID(4) + Type(1) + Counter(4) + Ciphertext(paddedPlaintext)
 // Padding: plaintext + zeros(padLen) + byte(padLen) — внутри шифротекста.
 func (s *Session) EncryptAndBuild(buf []byte, plaintext []byte) (int, error) {
 	padLen := protocol.ComputeDataPadLen(len(plaintext))
 	paddedLen := len(plaintext) + padLen + 1 // +1 для байта padLen
 	dataLen := 4 + 1 + 4 + paddedLen         // SID + Type + Counter + paddedCT
-	totalLen := protocol.TLSHeaderSize + dataLen
+	totalLen := protocol.QUICHeaderSize + dataLen
 
 	if len(buf) < totalLen {
 		return 0, fmt.Errorf("buffer too small: %d < %d", len(buf), totalLen)
 	}
 
-	// TLS Record Header (имитация TLS 1.2 Application Data)
-	buf[0] = 0x17 // Application Data
-	buf[1] = 0x03
-	buf[2] = 0x03 // TLS 1.2
-	binary.BigEndian.PutUint16(buf[3:5], uint16(dataLen))
+	// QUIC Short Header (имитация QUIC Short Header для обхода DPI)
+	protocol.WriteQUICHeader(buf[:protocol.QUICHeaderSize])
 
 	// SessionID
 	binary.BigEndian.PutUint32(buf[5:9], s.ID)

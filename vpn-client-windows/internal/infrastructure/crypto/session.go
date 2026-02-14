@@ -425,8 +425,8 @@ func DeriveHeaderMask(psk []byte) [HeaderMaskSize]byte {
 	return mask
 }
 
-// ObfuscateHeader применяет XOR-обфускацию к заголовку пакета (после TLS header).
-// buf начинается ПОСЛЕ TLS header: [0:4]=SessionID, [4]=Type, [5:9]=Counter.
+// ObfuscateHeader применяет XOR-обфускацию к заголовку пакета (после QUIC header).
+// buf начинается ПОСЛЕ QUIC header: [0:4]=SessionID, [4]=Type, [5:9]=Counter.
 // isData=true — обфускация Counter (9 байт), иначе только SID+Type (5 байт).
 func ObfuscateHeader(buf []byte, mask [HeaderMaskSize]byte, isData bool) {
 	buf[0] ^= mask[0]

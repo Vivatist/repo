@@ -1,31 +1,39 @@
-// Package protocol реализует собственный VPN-протокол NovaVPN v2 (stealth).
+// Package protocol реализует собственный VPN-протокол NovaVPN v3 (stealth).
 //
-// Формат пакета v2 (с маскировкой под TLS):
-// ┌────────────────────────┬───────────┬──────┬───────┬───────────────────────────┐
-// │   TLS Record Header    │ SessionID │ Type │ Nonce │  ChaCha20-Poly1305 AEAD   │
-// │  0x17 0x03 0x03 + len  │    4B     │  1B  │  12B  │  (Payload + AuthTag 16B)  │
-// └────────────────────────┴───────────┴──────┴───────┴───────────────────────────┘
+// Формат пакета v3 (маскировка под QUIC Short Header):
+// ┌─────────────────────────────┬───────────┬──────┬───────┬───────────────────────────┐
+// │   QUIC Short Header (5B)    │ SessionID │ Type │ Nonce │  ChaCha20-Poly1305 AEAD   │
+// │ Flags(1) + ObfPad(4)        │    4B     │  1B  │  12B  │  (Payload + AuthTag 16B)  │
+// └─────────────────────────────┴───────────┴──────┴───────┴───────────────────────────┘
 //
-// SessionID и Type передаются открыто для маршрутизации.
-// Payload зашифрован ChaCha20-Poly1305.
-// TLS Record Header имитирует TLS 1.2 Application Data для обхода DPI.
+// Пакет маскируется под QUIC Short Header (UDP:443).
+// DPI видит валидный QUIC Short Header byte (0x40 | variable bits).
+// Все поля после заголовка обфусцированы XOR-маской из PSK.
 package protocol
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
 )
 
 const (
-	// ProtocolVersion — версия протокола v2 (stealth)
-	ProtocolVersion uint8 = 0x02
+	// ProtocolVersion — версия протокола v3 (QUIC stealth)
+	ProtocolVersion uint8 = 0x03
 
-	// TLS Record Header constants (для имитации TLS 1.2 Application Data)
-	TLSContentType  byte = 0x17 // Application Data
-	TLSVersionMajor byte = 0x03 // TLS 1.x
-	TLSVersionMinor byte = 0x03 // TLS 1.2
-	TLSHeaderSize        = 5    // type(1) + version(2) + length(2)
+	// QUIC Short Header constants (маскировка под QUIC)
+	// Flags byte: Header Form=0 (Short), Fixed Bit=1, остальное — random
+	QUICFixedBitMask byte = 0x40 // bit 6 = 1 (QUIC Fixed Bit, обязателен)
+	QUICHeaderSize        = 5    // flags(1) + obfuscated_pad(4)
+
+	// Обратная совместимость: TLSHeaderSize = QUICHeaderSize (5 байт, все смещения сохраняются)
+	TLSHeaderSize = QUICHeaderSize
+
+	// Устаревшие константы (для поиска в коде, значения не используются при формировании)
+	TLSContentType  byte = 0x17
+	TLSVersionMajor byte = 0x03
+	TLSVersionMinor byte = 0x03
 
 	// SessionIDSize — размер SessionID (единственное открытое поле)
 	SessionIDSize = 4
@@ -130,50 +138,57 @@ var (
 	ErrInvalidChecksum = errors.New("неверная контрольная сумма")
 	ErrInvalidType     = errors.New("неизвестный тип пакета")
 	ErrDecryptFailed   = errors.New("ошибка расшифровки")
-	ErrInvalidTLS      = errors.New("неверный TLS заголовок")
+	ErrInvalidHeader   = errors.New("неверный заголовок")
 )
 
-// AddTLSHeader добавляет TLS Record Header к данным.
-// Имитирует TLS 1.2 Application Data для обхода DPI.
-func AddTLSHeader(data []byte) []byte {
-	length := uint16(len(data))
-	header := make([]byte, TLSHeaderSize)
-	header[0] = TLSContentType  // 0x17 = Application Data
-	header[1] = TLSVersionMajor // 0x03
-	header[2] = TLSVersionMinor // 0x03 = TLS 1.2
-	binary.BigEndian.PutUint16(header[3:5], length)
+// WriteQUICHeader записывает QUIC Short Header (5 байт) в начало buf.
+// Flags byte: 0x40 | random_6bits (имитирует QUIC Short Header).
+// Bytes 1-4: случайные (обфусцированная «DCID-подобная» область).
+// buf должен быть >= QUICHeaderSize.
+func WriteQUICHeader(buf []byte) {
+	// Flags: Header Form=0 (Short Header), Fixed Bit=1, остальное — random
+	var rnd [5]byte
+	rand.Read(rnd[:])
+	buf[0] = QUICFixedBitMask | (rnd[0] & 0x3F) // 0b01XXXXXX
+	buf[1] = rnd[1]
+	buf[2] = rnd[2]
+	buf[3] = rnd[3]
+	buf[4] = rnd[4]
+}
 
-	result := make([]byte, TLSHeaderSize+len(data))
-	copy(result[0:TLSHeaderSize], header)
-	copy(result[TLSHeaderSize:], data)
+// IsQUICShortHeader проверяет, является ли первый байт валидным QUIC Short Header.
+// QUIC Short Header: Header Form=0 (bit 7), Fixed Bit=1 (bit 6) → 0b01XXXXXX.
+func IsQUICShortHeader(firstByte byte) bool {
+	return firstByte&0xC0 == 0x40 // bits 7-6 = 01
+}
+
+// AddQUICHeader добавляет QUIC Short Header (5 байт) к данным.
+// Обратная совместимость: все смещения после заголовка сохраняются.
+func AddQUICHeader(data []byte) []byte {
+	result := make([]byte, QUICHeaderSize+len(data))
+	WriteQUICHeader(result)
+	copy(result[QUICHeaderSize:], data)
 	return result
 }
 
-// ParseTLSHeader проверяет и удаляет TLS Record Header.
-func ParseTLSHeader(data []byte) ([]byte, error) {
-	if len(data) < TLSHeaderSize {
+// SkipHeader пропускает 5-байтный заголовок (QUIC Short Header).
+// Не проверяет содержимое заголовка (валидация через header mask).
+func SkipHeader(data []byte) ([]byte, error) {
+	if len(data) < QUICHeaderSize {
 		return nil, ErrPacketTooShort
 	}
-
-	// Опциональная проверка TLS заголовка (для дополнительной валидации)
-	if data[0] != TLSContentType {
-		// Не критично - можем пропустить пакеты без TLS обёртки
-	}
-
-	// Извлекаем длину из TLS заголовка
-	length := binary.BigEndian.Uint16(data[3:5])
-	if int(length) != len(data)-TLSHeaderSize {
-		return nil, ErrInvalidTLS
-	}
-
-	return data[TLSHeaderSize:], nil
+	return data[QUICHeaderSize:], nil
 }
+
+// Устаревшие обёртки для обратной совместимости
+var AddTLSHeader = AddQUICHeader
+var ParseTLSHeader = SkipHeader
 
 // Marshal сериализует пакет в байты для отправки по сети.
 // Внимание: Payload должен быть уже зашифрован!
-// Формат: TLS_Header(5) + SessionID(4) + Type(1) + Nonce(12) + EncryptedData
+// Формат: QUIC_Header(5) + SessionID(4) + Type(1) + Nonce(12) + EncryptedData
 func (p *Packet) Marshal() ([]byte, error) {
-	// Собираем пакет без TLS заголовка
+	// Собираем пакет без QUIC заголовка
 	rawSize := SessionIDSize + 1 + NonceSize + len(p.Payload)
 	raw := make([]byte, rawSize)
 
@@ -189,19 +204,19 @@ func (p *Packet) Marshal() ([]byte, error) {
 	// Payload (уже зашифрованный)
 	copy(raw[17:], p.Payload)
 
-	// Добавляем TLS обёртку
-	return AddTLSHeader(raw), nil
+	// Добавляем QUIC Short Header обёртку
+	return AddQUICHeader(raw), nil
 }
 
 // Unmarshal десериализует пакет из сетевых байтов.
 // Внимание: Payload остаётся зашифрованным!
 // Возвращает только SessionID, Nonce и зашифрованные данные.
 func Unmarshal(data []byte) (*Packet, error) {
-	// Удаляем TLS обёртку (если есть)
+	// Пропускаем QUIC Short Header (5 байт)
 	raw := data
-	if len(data) >= TLSHeaderSize && data[0] == TLSContentType {
+	if len(data) >= QUICHeaderSize {
 		var err error
-		raw, err = ParseTLSHeader(data)
+		raw, err = SkipHeader(data)
 		if err != nil {
 			return nil, err
 		}

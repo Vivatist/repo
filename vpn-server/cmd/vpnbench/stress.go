@@ -377,15 +377,14 @@ func (sc *stressClient) runStressTraffic(cfg *StressConfig) {
 				continue
 			}
 
-			// Парсим пакет: TLS(5) + SID(4) + Type(1)
+			// Парсим пакет: QUIC(5) + SID(4) + Type(1)
 			raw := buf[:n]
-			if raw[0] != protocol.TLSContentType {
+			if n < protocol.QUICHeaderSize+protocol.SessionIDSize+protocol.PacketTypeSize {
 				continue
 			}
-			if n < protocol.TLSHeaderSize+protocol.SessionIDSize+protocol.PacketTypeSize {
-				continue
-			}
-			pktType := protocol.PacketType(raw[protocol.TLSHeaderSize+protocol.SessionIDSize])
+			// Деобфускация заголовка (SID + Type)
+			protocol.ObfuscateHeader(raw[protocol.QUICHeaderSize:], sc.client.headerMask, false)
+			pktType := protocol.PacketType(raw[protocol.QUICHeaderSize+protocol.SessionIDSize])
 
 			if pktType == protocol.PacketKeepalive {
 				recvTime := time.Now()

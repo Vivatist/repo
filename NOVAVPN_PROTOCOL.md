@@ -1,20 +1,20 @@
-# NovaVPN Protocol Specification v2
+# NovaVPN Protocol Specification v3
 
-> Версия документа: 2.0  
+> Версия документа: 3.0  
 > Назначение: спецификация для создания клиентов на любой платформе
 
 ---
 
 ## 1. Обзор
 
-NovaVPN — собственный VPN-протокол поверх **UDP** с маскировкой под TLS 1.2 (stealth).
+NovaVPN — собственный VPN-протокол поверх **UDP** с маскировкой под QUIC (stealth).
 
 **Ключевые характеристики:**
 - Транспорт: UDP
 - Шифрование: ChaCha20 (data) / ChaCha20-Poly1305 AEAD (handshake)
 - Обмен ключами: ECDH Curve25519 (ephemeral)
 - Аутентификация: email + пароль (Argon2id на сервере)
-- Маскировка: пакеты обёрнуты в TLS 1.2 Application Data Record Header (обход DPI)
+- Маскировка: пакеты обёрнуты в QUIC Short Header (обход DPI)
 - PSK: автоматически получается при первом подключении (bootstrap)
 
 **Сервер по умолчанию:** `212.118.41.227:443` (UDP), systemd-сервис `novavpn`.
@@ -23,15 +23,15 @@ NovaVPN — собственный VPN-протокол поверх **UDP** с 
 
 ## 2. Формат пакета (Wire Format)
 
-Каждый пакет оборачивается в TLS Record Header для имитации HTTPS-трафика.
+Каждый пакет начинается с QUIC Short Header (5 байт) для имитации QUIC-трафика на UDP:443.
 
 ### 2.1. Формат Handshake-пакетов (0x01, 0x02, 0x03)
 
 ```
-┌─────────────────────────────┬───────────┬──────┬───────┬───────────────────┐
-│    TLS Record Header (5B)   │ SessionID │ Type │ Nonce │ Encrypted Payload │
-│ 0x17 0x03 0x03 [len: 2B]   │    4B     │  1B  │  12B  │     variable      │
-└─────────────────────────────┴───────────┴──────┴───────┴───────────────────┘
+┌─────────────────────────────────┬───────────┬──────┬───────┬───────────────────┐
+│   QUIC Short Header (5B)        │ SessionID │ Type │ Nonce │ Encrypted Payload │
+│ Flags(1) + Random(4)            │    4B     │  1B  │  12B  │     variable      │
+└─────────────────────────────────┴───────────┴──────┴───────┴───────────────────┘
 ```
 
 > Формат с Nonce(12B) и AEAD используется **только** для handshake-пакетов.
@@ -39,10 +39,10 @@ NovaVPN — собственный VPN-протокол поверх **UDP** с 
 ### 2.1.1. Формат Data-пакетов (0x10)
 
 ```
-┌─────────────────────────────┬───────────┬──────┬─────────┬────────────────────┬─────────────────────┬────────┐
-│    TLS Record Header (5B)   │ SessionID │ Type │ Counter │ ChaCha20 XOR data  │ ChaCha20 XOR padding│ PadLen │
-│ 0x17 0x03 0x03 [len: 2B]   │    4B     │  1B  │   4B    │     IP packet      │    zeros → random   │  1B    │
-└─────────────────────────────┴───────────┴──────┴─────────┴────────────────────┴─────────────────────┴────────┘
+┌─────────────────────────────────┬───────────┬──────┬─────────┬────────────────────┬─────────────────────┬────────┐
+│   QUIC Short Header (5B)        │ SessionID │ Type │ Counter │ ChaCha20 XOR data  │ ChaCha20 XOR padding│ PadLen │
+│ Flags(1) + Random(4)            │    4B     │  1B  │   4B    │     IP packet      │    zeros → random   │  1B    │
+└─────────────────────────────────┴───────────┴──────┴─────────┴────────────────────┴─────────────────────┴────────┘
 ```
 
 - **Counter** (4 байта): младшие 4 байта атомарного счётчика пакетов (Big-Endian uint32)
@@ -50,36 +50,36 @@ NovaVPN — собственный VPN-протокол поверх **UDP** с 
 - **Шифрование**: plain ChaCha20 XOR (без Poly1305, без auth tag)
 - **Padding**: нулевые байты + 1 байт padLen, зашифрованные продолжением того же ChaCha20 keystream. Нули → сырой keystream (выглядит случайно на wire). Последний байт после расшифровки = padLen → получатель обрезает `padLen + 1` байт с конца.
 - **padLen**: `DataPadAlign - (plaintextLen % DataPadAlign) + random(0, DataPadRandomMax)`, cap 255
-- **Data overhead**: TLS(5) + SID(4) + Type(1) + Counter(4) + Padding(1-97) = **15-111 байт**
+- **Data overhead**: QUIC(5) + SID(4) + Type(1) + Counter(4) + Padding(1-97) = **15-111 байт**
 
 ### 2.1.2. Формат Keepalive/Disconnect-пакетов (0x20, 0x30)
 
 Lightweight-формат с random padding:
 
 ```
-┌─────────────────────────────┬───────────┬──────┬──────────────────┐
-│    TLS Record Header (5B)   │ SessionID │ Type │  Random Padding  │
-│ 0x17 0x03 0x03 [len: 2B]   │    4B     │  1B  │   40-150 bytes   │
-└─────────────────────────────┴───────────┴──────┴──────────────────┘
+┌─────────────────────────────────┬───────────┬──────┬──────────────────┐
+│   QUIC Short Header (5B)        │ SessionID │ Type │  Random Padding  │
+│ Flags(1) + Random(4)            │    4B     │  1B  │   40-150 bytes   │
+└─────────────────────────────────┴───────────┴──────┴──────────────────┘
 ```
 
-- **Общий размер**: 50-160 байт (TLS(5) + SID(4) + Type(1) + Padding(40-150))
+- **Общий размер**: 50-160 байт (QUIC(5) + SID(4) + Type(1) + Padding(40-150))
 - **Padding**: случайные байты (`crypto/rand`), получатель игнорирует всё после SID+Type
 - **Nonce/Payload**: отсутствуют (не нужны — keepalive/disconnect не несут данных)
-- len в TLS header = 5 + padLen
 
-### 2.2. TLS Record Header (5 байт)
+### 2.2. QUIC Short Header (5 байт)
 
 | Смещение | Размер | Значение | Описание |
 |----------|--------|----------|----------|
-| 0 | 1 | `0x17` | Content Type = Application Data |
-| 1 | 1 | `0x03` | TLS Major Version |
-| 2 | 1 | `0x03` | TLS Minor Version (1.2) |
-| 3-4 | 2 | Big-Endian uint16 | Длина данных **после** этого заголовка |
+| 0 | 1 | `0x40 \| random_6bits` | Flags: Header Form=0 (Short), Fixed Bit=1, остальные 6 бит случайные |
+| 1-4 | 4 | random | Обфусцированная область (имитирует DCID) |
 
-### 2.3. Обфусцированные поля (после TLS Header)
+**Важно:** QUIC Short Header не содержит поля длины — UDP-датаграмма = точный размер пакета.
+Каждый пакет генерирует **новые случайные** flags и pad bytes (нет статического паттерна).
 
-Поля после TLS Header **обфусцированы** XOR-маской, производной от PSK.
+### 2.3. Обфусцированные поля (после QUIC Header)
+
+Поля после QUIC Header **обфусцированы** XOR-маской, производной от PSK.
 
 #### 2.3.1. Вычисление маски
 
@@ -93,7 +93,7 @@ header_mask = HMAC-SHA256(PSK, "nova-header-mask")[:9]   // 9 байт
 #### 2.3.2. Применение (XOR обратим — одна операция для отправки и приёма)
 
 ```
-// После TLS header (5B):
+// После QUIC header (5B):
 raw[0:4] ^= header_mask[0:4]   // SessionID
 raw[4]   ^= header_mask[4]     // PacketType
 raw[5:9] ^= header_mask[5:9]   // Counter (только для data-пакетов)
@@ -147,7 +147,7 @@ raw[5:9] ^= header_mask[5:9]   // Counter (только для data-пакето
 
 | Константа | Значение | Формула |
 |-----------|----------|---------|
-| TLSHeaderSize | 5 | type(1) + version(2) + length(2) |
+| QUICHeaderSize | 5 | flags(1) + random(4) |
 | SessionIDSize | 4 | — |
 | PacketTypeSize | 1 | — |
 | NonceSize | 12 | ChaCha20-Poly1305 (только handshake) |
@@ -568,13 +568,13 @@ Lightweight-формат: **10 байт**, zero-alloc.
 
 ### 6.5. Disconnect
 
-Lightweight-формат: **10 байт**, аналогичен keepalive.
+Lightweight-формат с random padding, аналогичен keepalive.
 
 ```
-┌─────────────────────────────┬───────────┬──────┐
-│ 0x17 0x03 0x03 [0x00 0x05]  │ SessionID │ 0x30 │
-│         5 байт              │    4B     │  1B  │
-└─────────────────────────────┴───────────┴──────┘
+┌─────────────────────────────────┬───────────┬──────┬──────────────────┐
+│   QUIC Short Header (5B)        │ SessionID │ 0x30 │  Random Padding  │
+│ Flags(1) + Random(4)            │    4B     │  1B  │   40-150 bytes   │
+└─────────────────────────────────┴───────────┴──────┴──────────────────┘
 ```
 
 - Отправляется клиентом перед закрытием соединения
@@ -1054,9 +1054,9 @@ WantedBy=multi-user.target
 
 ## 15. Известные особенности и ограничения
 
-1. **DPI обход**: все пакеты обёрнуты в TLS 1.2 Application Data header. Для DPI трафик выглядит как обычный HTTPS. Порт 443 усиливает маскировку.
+1. **DPI обход**: все пакеты начинаются с QUIC Short Header (UDP:443). Для DPI трафик выглядит как обычный QUIC/HTTP3. Порт 443 усиливает маскировку.
 
-2. **Нет Client Hello / Server Hello**: TCP handshake TLS не имитируется (транспорт — UDP). При глубоком анализе DPI может обнаружить отсутствие TLS handshake на TCP.
+2. **Нет QUIC Initial/Handshake**: настоящий QUIC Long Header handshake не имитируется. При глубоком анализе DPI может обнаружить отсутствие QUIC Initial packet.
 
 3. **SessionID открыт**: необходим для маршрутизации пакетов к правильной сессии на сервере до расшифровки.
 

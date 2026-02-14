@@ -124,7 +124,7 @@ func (bc *benchClient) doHandshake(cfg *BenchConfig) error {
 	}
 
 	// Обфускация заголовка (SID + Type)
-	protocol.ObfuscateHeader(initBytes[protocol.TLSHeaderSize:], bc.headerMask, false)
+	protocol.ObfuscateHeader(initBytes[protocol.QUICHeaderSize:], bc.headerMask, false)
 
 	// 5. Отправляем
 	bc.conn.SetWriteDeadline(time.Now().Add(cfg.HandshakeTimeout))
@@ -142,8 +142,8 @@ func (bc *benchClient) doHandshake(cfg *BenchConfig) error {
 	respBuf = respBuf[:n]
 
 	// Деобфускация заголовка перед Unmarshal
-	if n >= protocol.TLSHeaderSize+5 && respBuf[0] == protocol.TLSContentType {
-		protocol.ObfuscateHeader(respBuf[protocol.TLSHeaderSize:], bc.headerMask, false)
+	if n >= protocol.QUICHeaderSize+5 {
+		protocol.ObfuscateHeader(respBuf[protocol.QUICHeaderSize:], bc.headerMask, false)
 	}
 
 	// 7. Парсим пакет
@@ -232,7 +232,7 @@ func (bc *benchClient) doHandshake(cfg *BenchConfig) error {
 	}
 
 	// Обфускация заголовка (SID + Type)
-	protocol.ObfuscateHeader(completeBytes[protocol.TLSHeaderSize:], bc.headerMask, false)
+	protocol.ObfuscateHeader(completeBytes[protocol.QUICHeaderSize:], bc.headerMask, false)
 
 	bc.conn.SetWriteDeadline(time.Now().Add(cfg.HandshakeTimeout))
 	if _, err := bc.conn.Write(completeBytes); err != nil {
@@ -319,8 +319,8 @@ func (bc *benchClient) runDataExchange(duration time.Duration, pktSize int, inte
 
 			// Inline-парсинг
 			raw := rp.data
-			if len(raw) >= protocol.TLSHeaderSize && raw[0] == protocol.TLSContentType {
-				raw = raw[protocol.TLSHeaderSize:]
+			if len(raw) >= protocol.QUICHeaderSize {
+				raw = raw[protocol.QUICHeaderSize:]
 			}
 			if len(raw) < 5 {
 				continue
@@ -359,21 +359,54 @@ func (bc *benchClient) runDataExchange(duration time.Duration, pktSize int, inte
 		}
 	}
 
+	// Drain-фаза: собираем ответы на in-flight keepalive (до 500мс).
+	// Без этого последние ~1 keepalive на клиент теряются при подсчёте.
+	if len(sendTimes) > 0 {
+		drainDeadline := time.After(500 * time.Millisecond)
+	drainLoop:
+		for len(sendTimes) > 0 {
+			select {
+			case rp := <-recvCh:
+				if len(rp.data) < protocol.MinPacketSize {
+					continue
+				}
+				raw := rp.data
+				if len(raw) >= protocol.QUICHeaderSize {
+					raw = raw[protocol.QUICHeaderSize:]
+				}
+				if len(raw) < 5 {
+					continue
+				}
+				protocol.ObfuscateHeader(raw, bc.headerMask, false)
+				pktType := protocol.PacketType(raw[4])
+				if pktType == protocol.PacketKeepalive {
+					result.packetsRecv++
+					if len(sendTimes) > 0 {
+						rtt := rp.at.Sub(sendTimes[0])
+						if rtt >= 0 {
+							result.rttSamples = append(result.rttSamples, rtt)
+						}
+						sendTimes = sendTimes[1:]
+					}
+				}
+			case <-drainDeadline:
+				break drainLoop
+			}
+		}
+	}
+
 	close(stopCh)
 	return result
 }
 
 // buildKeepalive создаёт keepalive пакет с padding.
-// Формат: TLS(5) + SID(4) + Type(1) + Padding(40-150)
+// Формат: QUIC(5) + SID(4) + Type(1) + Padding(40-150)
 func (bc *benchClient) buildKeepalive() ([]byte, error) {
 	bc.sendCounter++
 
 	padLen := protocol.RandomPadLen(protocol.KeepalivePadMin, protocol.KeepalivePadMax)
-	var buf [protocol.TLSHeaderSize + 5 + protocol.KeepalivePadMax]byte
-	buf[0] = protocol.TLSContentType
-	buf[1] = protocol.TLSVersionMajor
-	buf[2] = protocol.TLSVersionMinor
-	binary.BigEndian.PutUint16(buf[3:5], uint16(5+padLen))
+	var buf [protocol.QUICHeaderSize + 5 + protocol.KeepalivePadMax]byte
+	protocol.WriteQUICHeader(buf[:protocol.QUICHeaderSize])
 	binary.BigEndian.PutUint32(buf[5:9], bc.sessionID)
 	buf[9] = byte(protocol.PacketKeepalive)
 	// Случайный padding после SID+Type
@@ -381,7 +414,7 @@ func (bc *benchClient) buildKeepalive() ([]byte, error) {
 	// Обфускация заголовка (SID + Type)
 	protocol.ObfuscateHeader(buf[5:], bc.headerMask, false)
 
-	return buf[:protocol.TLSHeaderSize+5+padLen], nil
+	return buf[:protocol.QUICHeaderSize+5+padLen], nil
 }
 
 // runThroughputTest — режим максимальной пропускной способности.
@@ -418,7 +451,7 @@ func (bc *benchClient) runThroughputTest(duration time.Duration, pktSize int, cl
 	maxPadLen := protocol.ComputeDataPadLen(pktSize) + 1 // +1 для padLen byte
 	ciphertextLen := pktSize + maxPadLen
 	dataLen := 4 + 1 + 4 + ciphertextLen // SID + Type + Counter + CT+padding
-	totalLen := protocol.TLSHeaderSize + dataLen
+	totalLen := protocol.QUICHeaderSize + dataLen
 	sendBuf := make([]byte, totalLen+256) // запас для вариации padding
 
 	// Предвычисляем обфусцированные SID и Type (не меняются между пакетами)
@@ -463,13 +496,10 @@ func (bc *benchClient) runThroughputTest(duration time.Duration, pktSize int, cl
 		curPadLen := protocol.ComputeDataPadLen(pktSize)
 		paddedLen := pktSize + curPadLen + 1
 		curDataLen := 4 + 1 + 4 + paddedLen
-		curTotalLen := protocol.TLSHeaderSize + curDataLen
+		curTotalLen := protocol.QUICHeaderSize + curDataLen
 
-		// TLS Record Header (только длина меняется)
-		sendBuf[0] = protocol.TLSContentType
-		sendBuf[1] = protocol.TLSVersionMajor
-		sendBuf[2] = protocol.TLSVersionMinor
-		binary.BigEndian.PutUint16(sendBuf[3:5], uint16(curDataLen))
+		// QUIC Short Header (случайные 5 байт)
+		protocol.WriteQUICHeader(sendBuf[:protocol.QUICHeaderSize])
 
 		// Предвычисленные обфусцированные SID + Type
 		copy(sendBuf[5:9], obfSID[:])
@@ -516,7 +546,7 @@ func (bc *benchClient) runThroughputTest(duration time.Duration, pktSize int, cl
 }
 
 // buildDataPacket создаёт data-пакет с plain ChaCha20 XOR и padding.
-// Формат: TLS(5) + SID(4) + Type(1) + Counter(4) + Ciphertext(plaintext + padding + padLen)
+// Формат: QUIC(5) + SID(4) + Type(1) + Counter(4) + Ciphertext(plaintext + padding + padLen)
 func (bc *benchClient) buildDataPacket(plaintext []byte) ([]byte, error) {
 	bc.sendCounter++
 	wireCtr := uint32(bc.sendCounter)
@@ -524,15 +554,12 @@ func (bc *benchClient) buildDataPacket(plaintext []byte) ([]byte, error) {
 	padLen := protocol.ComputeDataPadLen(len(plaintext))
 	paddedLen := len(plaintext) + padLen + 1 // +1 для байта padLen
 	dataLen := 4 + 1 + 4 + paddedLen
-	totalLen := protocol.TLSHeaderSize + dataLen
+	totalLen := protocol.QUICHeaderSize + dataLen
 
 	buf := make([]byte, totalLen)
 
-	// TLS Record Header
-	buf[0] = protocol.TLSContentType
-	buf[1] = protocol.TLSVersionMajor
-	buf[2] = protocol.TLSVersionMinor
-	binary.BigEndian.PutUint16(buf[3:5], uint16(dataLen))
+	// QUIC Short Header
+	protocol.WriteQUICHeader(buf[:protocol.QUICHeaderSize])
 
 	// SessionID
 	binary.BigEndian.PutUint32(buf[5:9], bc.sessionID)
@@ -571,11 +598,8 @@ func (bc *benchClient) buildDataPacket(plaintext []byte) ([]byte, error) {
 // disconnect отправляет пакет отключения серверу с padding.
 func (bc *benchClient) disconnect() {
 	padLen := protocol.RandomPadLen(protocol.KeepalivePadMin, protocol.KeepalivePadMax)
-	var buf [protocol.TLSHeaderSize + 5 + protocol.KeepalivePadMax]byte
-	buf[0] = protocol.TLSContentType
-	buf[1] = protocol.TLSVersionMajor
-	buf[2] = protocol.TLSVersionMinor
-	binary.BigEndian.PutUint16(buf[3:5], uint16(5+padLen))
+	var buf [protocol.QUICHeaderSize + 5 + protocol.KeepalivePadMax]byte
+	protocol.WriteQUICHeader(buf[:protocol.QUICHeaderSize])
 	binary.BigEndian.PutUint32(buf[5:9], bc.sessionID)
 	buf[9] = byte(protocol.PacketDisconnect)
 	// Случайный padding после SID+Type
@@ -584,7 +608,7 @@ func (bc *benchClient) disconnect() {
 	protocol.ObfuscateHeader(buf[5:], bc.headerMask, false)
 
 	bc.conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
-	bc.conn.Write(buf[:protocol.TLSHeaderSize+5+padLen])
+	bc.conn.Write(buf[:protocol.QUICHeaderSize+5+padLen])
 	bc.conn.Close()
 }
 

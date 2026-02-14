@@ -1,51 +1,51 @@
 {
   "server": "212.118.41.227:443",
   "duration_per_test": "15s",
-  "timestamp": "2026-02-15 00:20:00",
-  "overall_grade": "ХОРОШО",
+  "timestamp": "2026-02-15 01:04:24",
+  "overall_grade": "ОТЛИЧНО",
   "tests": [
     {
-      "packets_per_sec": 64857.8,
+      "packets_per_sec": 59487.0,
       "rtt_p50_ns": 0,
       "mode": "throughput",
       "clients_connected": 1,
-      "throughput_mbps": 518.9,
+      "throughput_mbps": 475.9,
       "clients": 1,
       "rtt_p95_ns": 0,
-      "handshake_avg_ns": 8066663,
+      "handshake_avg_ns": 7307571,
       "name": "Throughput 1x клиент",
       "packet_loss_pct": 0
     },
     {
-      "packets_per_sec": 20.0,
-      "rtt_p50_ns": 195434,
+      "packets_per_sec": 20.1,
+      "rtt_p50_ns": 197950,
       "mode": "rtt",
       "clients_connected": 1,
       "throughput_mbps": 0.2,
       "clients": 1,
-      "rtt_p95_ns": 339744,
-      "handshake_avg_ns": 1229983,
+      "rtt_p95_ns": 361965,
+      "handshake_avg_ns": 2265653,
       "name": "RTT 1x клиент",
       "packet_loss_pct": 0
     },
     {
-      "packets_per_sec": 99.3,
-      "rtt_p50_ns": 139880,
+      "packets_per_sec": 100.7,
+      "rtt_p50_ns": 118561,
       "mode": "rtt",
       "clients_connected": 10,
       "throughput_mbps": 0.8,
       "clients": 10,
-      "rtt_p95_ns": 308645,
-      "handshake_avg_ns": 2288928,
+      "rtt_p95_ns": 276355,
+      "handshake_avg_ns": 2142757,
       "name": "RTT 10x клиентов",
-      "packet_loss_pct": 0.6666666666666667
+      "packet_loss_pct": 0
     }
   ],
-  "worst_loss_pct": 0.67,
-  "best_throughput_mbps": 518.9,
-  "best_rtt_p50_us": 140.0,
+  "worst_loss_pct": 0.0,
+  "best_throughput_mbps": 475.9,
+  "best_rtt_p50_us": 119.0,
   "mode": "quick",
   "max_clients_tested": 10,
   "max_clients_connected": 10,
-  "best_handshake_ms": 1.0
+  "best_handshake_ms": 2.0
 }

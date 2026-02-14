@@ -149,7 +149,7 @@ func (p *Performer) sendHandshakeInit(clientPubKey []byte) error {
 	}
 
 	// Обфускация заголовка (SID + Type)
-	infracrypto.ObfuscateHeader(pktBytes[protocol.TLSHeaderSize:], p.headerMask, false)
+	infracrypto.ObfuscateHeader(pktBytes[protocol.QUICHeaderSize:], p.headerMask, false)
 
 	if _, err := p.conn.Write(pktBytes); err != nil {
 		return fmt.Errorf("write packet: %w", err)
@@ -168,8 +168,8 @@ func (p *Performer) receiveHandshakeResp(clientPrivKey []byte) (*Result, error) 
 	}
 
 	// Деобфускация заголовка перед Unmarshal
-	if n >= protocol.TLSHeaderSize+5 && buf[0] == protocol.TLSContentType {
-		infracrypto.ObfuscateHeader(buf[protocol.TLSHeaderSize:n], p.headerMask, false)
+	if n >= protocol.QUICHeaderSize+5 {
+		infracrypto.ObfuscateHeader(buf[protocol.QUICHeaderSize:n], p.headerMask, false)
 	}
 
 	respPkt, err := protocol.Unmarshal(buf[:n])
@@ -295,7 +295,7 @@ func (p *Performer) sendHandshakeComplete(result *Result) error {
 	}
 
 	// Обфускация заголовка (SID + Type)
-	infracrypto.ObfuscateHeader(completeBytes[protocol.TLSHeaderSize:], p.headerMask, false)
+	infracrypto.ObfuscateHeader(completeBytes[protocol.QUICHeaderSize:], p.headerMask, false)
 
 	if _, err := p.conn.Write(completeBytes); err != nil {
 		return fmt.Errorf("write packet: %w", err)

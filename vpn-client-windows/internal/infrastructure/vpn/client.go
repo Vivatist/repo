@@ -319,18 +319,15 @@ func (c *NovaVPNClient) Disconnect() error {
 	// Уведомляем сервер об отключении (lightweight, без аллокаций)
 	if c.conn != nil && c.sessionID != 0 {
 		padLen := infracrypto.RandomPadLen(infracrypto.KeepalivePadMin, infracrypto.KeepalivePadMax)
-		var disconnBuf [protocol.TLSHeaderSize + 5 + infracrypto.KeepalivePadMax]byte
-		disconnBuf[0] = protocol.TLSContentType
-		disconnBuf[1] = protocol.TLSVersionMajor
-		disconnBuf[2] = protocol.TLSVersionMinor
-		binary.BigEndian.PutUint16(disconnBuf[3:5], uint16(5+padLen))
+		var disconnBuf [protocol.QUICHeaderSize + 5 + infracrypto.KeepalivePadMax]byte
+		protocol.WriteQUICHeader(disconnBuf[:protocol.QUICHeaderSize])
 		binary.BigEndian.PutUint32(disconnBuf[5:9], c.sessionID)
 		disconnBuf[9] = byte(protocol.PacketDisconnect)
 		// Случайный padding после SID+Type
 		rand.Read(disconnBuf[10 : 10+padLen])
 		// Обфускация заголовка (SID + Type)
 		infracrypto.ObfuscateHeader(disconnBuf[5:], c.headerMask, false)
-		c.conn.Write(disconnBuf[:protocol.TLSHeaderSize+5+padLen])
+		c.conn.Write(disconnBuf[:protocol.QUICHeaderSize+5+padLen])
 	}
 
 	// Останавливаем циклы
@@ -478,9 +475,9 @@ func (c *NovaVPNClient) handleUDPPacket(data []byte) {
 
 	// Быстрый inline-парсинг без аллокаций
 	raw := data
-	// Удаляем TLS заголовок
-	if len(raw) >= protocol.TLSHeaderSize && raw[0] == protocol.TLSContentType {
-		raw = raw[protocol.TLSHeaderSize:]
+	// Пропускаем QUIC заголовок (5 байт)
+	if len(raw) >= protocol.QUICHeaderSize {
+		raw = raw[protocol.QUICHeaderSize:]
 	}
 	// SessionID(4) + Type(1) = 5 минимум
 	if len(raw) < 5 {
@@ -550,8 +547,8 @@ func (c *NovaVPNClient) tunReadLoop() {
 	tunBuf := make([]byte, mtu+100)
 
 	// Пре-аллоцируем буфер для исходящих пакетов
-	// TLS(5) + SessionID(4) + Type(1) + Counter(4) + MaxPayload (без AuthTag)
-	sendBuf := make([]byte, protocol.TLSHeaderSize+4+1+4+mtu+100)
+	// QUIC(5) + SessionID(4) + Type(1) + Counter(4) + MaxPayload (без AuthTag)
+	sendBuf := make([]byte, protocol.QUICHeaderSize+4+1+4+mtu+100)
 
 	for {
 		if c.stopped.Load() {
@@ -586,16 +583,12 @@ func (c *NovaVPNClient) tunReadLoop() {
 		}
 
 		// Собираем пакет inline без аллокаций
-		// Формат: TLS_Header(5) + SessionID(4) + Type(1) + Counter(4) + Ciphertext + Tag
+		// Формат: QUIC_Header(5) + SessionID(4) + Type(1) + Counter(4) + Ciphertext + Tag
 		dataLen := 4 + 1 + encLen
 		sessionID := c.sessionID
 
-		// TLS Record Header
-		sendBuf[0] = protocol.TLSContentType
-		sendBuf[1] = protocol.TLSVersionMajor
-		sendBuf[2] = protocol.TLSVersionMinor
-		sendBuf[3] = byte(dataLen >> 8)
-		sendBuf[4] = byte(dataLen)
+		// QUIC Short Header (случайные 5 байт)
+		protocol.WriteQUICHeader(sendBuf[:protocol.QUICHeaderSize])
 
 		// SessionID
 		sendBuf[5] = byte(sessionID >> 24)
@@ -611,7 +604,7 @@ func (c *NovaVPNClient) tunReadLoop() {
 		// Обфускация заголовка (SID + Type + Counter)
 		infracrypto.ObfuscateHeader(sendBuf[5:], c.headerMask, true)
 
-		totalLen := protocol.TLSHeaderSize + dataLen
+		totalLen := protocol.QUICHeaderSize + dataLen
 
 		if _, err := conn.Write(sendBuf[:totalLen]); err != nil {
 			if c.stopped.Load() {
@@ -659,18 +652,15 @@ func (c *NovaVPNClient) keepaliveLoop() {
 
 			// Строим keepalive inline — sessionID может измениться после reconnect
 			padLen := infracrypto.RandomPadLen(infracrypto.KeepalivePadMin, infracrypto.KeepalivePadMax)
-			var kaBuf [protocol.TLSHeaderSize + 5 + infracrypto.KeepalivePadMax]byte
-			kaBuf[0] = protocol.TLSContentType
-			kaBuf[1] = protocol.TLSVersionMajor
-			kaBuf[2] = protocol.TLSVersionMinor
-			binary.BigEndian.PutUint16(kaBuf[3:5], uint16(5+padLen))
+			var kaBuf [protocol.QUICHeaderSize + 5 + infracrypto.KeepalivePadMax]byte
+			protocol.WriteQUICHeader(kaBuf[:protocol.QUICHeaderSize])
 			binary.BigEndian.PutUint32(kaBuf[5:9], c.sessionID)
 			kaBuf[9] = byte(protocol.PacketKeepalive)
 			// Случайный padding после SID+Type
 			rand.Read(kaBuf[10 : 10+padLen])
 			// Обфускация заголовка (SID + Type)
 			infracrypto.ObfuscateHeader(kaBuf[5:], c.headerMask, false)
-			conn.Write(kaBuf[:protocol.TLSHeaderSize+5+padLen])
+			conn.Write(kaBuf[:protocol.QUICHeaderSize+5+padLen])
 
 			// Рандомизированный интервал: 10-20 секунд — нет паттерна для DPI
 			timer.Reset(randomKeepaliveInterval())
@@ -682,20 +672,17 @@ func (c *NovaVPNClient) keepaliveLoop() {
 func (c *NovaVPNClient) tryResume() bool {
 	log.Printf("[VPN] 0-RTT resume: пробуем сессию #%d", c.resumeSessionID)
 
-	// Lightweight keepalive probe с padding: TLS(5) + SID(4) + Type(1) + Padding
+	// Lightweight keepalive probe с padding: QUIC(5) + SID(4) + Type(1) + Padding
 	padLen := infracrypto.RandomPadLen(infracrypto.KeepalivePadMin, infracrypto.KeepalivePadMax)
-	var kaBuf [protocol.TLSHeaderSize + 5 + infracrypto.KeepalivePadMax]byte
-	kaBuf[0] = protocol.TLSContentType
-	kaBuf[1] = protocol.TLSVersionMajor
-	kaBuf[2] = protocol.TLSVersionMinor
-	binary.BigEndian.PutUint16(kaBuf[3:5], uint16(5+padLen))
+	var kaBuf [protocol.QUICHeaderSize + 5 + infracrypto.KeepalivePadMax]byte
+	protocol.WriteQUICHeader(kaBuf[:protocol.QUICHeaderSize])
 	binary.BigEndian.PutUint32(kaBuf[5:9], c.resumeSessionID)
 	kaBuf[9] = byte(protocol.PacketKeepalive)
 	// Случайный padding после SID+Type
 	rand.Read(kaBuf[10 : 10+padLen])
 	// Обфускация заголовка (SID + Type)
 	infracrypto.ObfuscateHeader(kaBuf[5:], c.headerMask, false)
-	if _, err := c.conn.Write(kaBuf[:protocol.TLSHeaderSize+5+padLen]); err != nil {
+	if _, err := c.conn.Write(kaBuf[:protocol.QUICHeaderSize+5+padLen]); err != nil {
 		log.Printf("[VPN] 0-RTT resume: ошибка отправки keepalive: %v", err)
 		return false
 	}
@@ -712,8 +699,8 @@ func (c *NovaVPNClient) tryResume() bool {
 
 	// Проверяем что это keepalive-ответ
 	raw := buf[:n]
-	if len(raw) >= protocol.TLSHeaderSize && raw[0] == protocol.TLSContentType {
-		raw = raw[protocol.TLSHeaderSize:]
+	if len(raw) >= protocol.QUICHeaderSize {
+		raw = raw[protocol.QUICHeaderSize:]
 	}
 	// Деобфускация заголовка (SID + Type)
 	if len(raw) >= 5 {

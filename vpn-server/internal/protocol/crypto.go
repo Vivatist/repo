@@ -180,7 +180,7 @@ func DecodePSK(hexKey string) ([KeySize]byte, error) {
 const HeaderMaskSize = 9
 
 // DeriveHeaderMask выводит 9-байтную маску для обфускации заголовков пакетов.
-// Маска XOR'ится с SessionID(4) + PacketType(1) + Counter(4) после TLS header.
+// Маска XOR'ится с SessionID(4) + PacketType(1) + Counter(4) после QUIC header.
 // Вычисляется ОДИН раз при инициализации (не на каждый пакет).
 func DeriveHeaderMask(psk [KeySize]byte) [HeaderMaskSize]byte {
 	mac := hmac.New(sha256.New, psk[:])
@@ -191,8 +191,8 @@ func DeriveHeaderMask(psk [KeySize]byte) [HeaderMaskSize]byte {
 	return mask
 }
 
-// ObfuscateHeader применяет XOR-обфускацию к заголовку пакета (после TLS header).
-// buf начинается ПОСЛЕ TLS header: [0:4]=SessionID, [4]=Type, [5:9]=Counter.
+// ObfuscateHeader применяет XOR-обфускацию к заголовку пакета (после QUIC header).
+// buf начинается ПОСЛЕ QUIC header: [0:4]=SessionID, [4]=Type, [5:9]=Counter.
 // isData=true — обфускация Counter (9 байт), иначе только SID+Type (5 байт).
 func ObfuscateHeader(buf []byte, mask [HeaderMaskSize]byte, isData bool) {
 	// SessionID(4) + Type(1) = 5 байт всегда
