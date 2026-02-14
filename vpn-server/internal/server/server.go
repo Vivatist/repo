@@ -273,6 +273,12 @@ func (s *VPNServer) udpReadLoop() {
 	if s.batchRecv != nil {
 		// Batch path: recvmmsg — до 64 пакетов за 1 syscall
 		log.Println("[UDP] Используется batch приём (recvmmsg) с приоритизацией handshake")
+
+		// Пре-аллоцированный массив индексов handshake-пакетов.
+		// Избегаем двойного сканирования batch: один проход определяет тип,
+		// затем обрабатываем handshake первыми, data — вторыми. Zero-alloc.
+		var hsIndices [batchSize]int
+
 		for {
 			n, err := s.batchRecv.Recv()
 			if err != nil {
@@ -285,23 +291,38 @@ func (s *VPNServer) udpReadLoop() {
 				}
 			}
 
-			// Двухпроходная обработка: handshake-пакеты ПЕРВЫМИ.
-			// При data flood от существующих клиентов handshake новых клиентов
-			// получает приоритет — горутины стартуют раньше, попадают в очередь семафора быстрее.
-
-			// Проход 1: только handshake (редкие, но критичные для подключения)
+			// Один проход: классифицируем пакеты, handshake обрабатываем сразу.
+			// Data-пакеты запоминаем в массив "остальные" (все кроме handshake).
+			// Handshake-пакеты редки (~0.01% трафика), поэтому почти всегда hsCount=0
+			// и цикл вырождается в простой for без overhead.
+			hsCount := 0
 			for i := 0; i < n; i++ {
 				data, _ := s.batchRecv.GetPacket(i)
 				if isHandshakePacket(data) {
+					// Handshake — обрабатываем немедленно (приоритет)
 					data, remoteAddr := s.batchRecv.GetPacket(i)
 					decryptBuf = s.processUDPPacket(data, remoteAddr, decryptBuf, cache)
+					hsIndices[hsCount] = i
+					hsCount++
 				}
 			}
 
-			// Проход 2: data/keepalive/disconnect (основной трафик)
-			for i := 0; i < n; i++ {
-				data, _ := s.batchRecv.GetPacket(i)
-				if !isHandshakePacket(data) {
+			// Data/keepalive/disconnect — основной трафик.
+			// Если handshake-пакетов не было (99.99% batch'ей), пропускаем без проверок.
+			if hsCount == 0 {
+				// Быстрый путь: весь batch — data-пакеты, без дополнительных проверок
+				for i := 0; i < n; i++ {
+					data, remoteAddr := s.batchRecv.GetPacket(i)
+					decryptBuf = s.processUDPPacket(data, remoteAddr, decryptBuf, cache)
+				}
+			} else {
+				// Редкий путь: пропускаем уже обработанные handshake-пакеты
+				hsIdx := 0
+				for i := 0; i < n; i++ {
+					if hsIdx < hsCount && i == hsIndices[hsIdx] {
+						hsIdx++ // пропускаем — уже обработан
+						continue
+					}
 					data, remoteAddr := s.batchRecv.GetPacket(i)
 					decryptBuf = s.processUDPPacket(data, remoteAddr, decryptBuf, cache)
 				}
