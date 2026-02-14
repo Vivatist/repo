@@ -1,0 +1,37 @@
+{
+    "folders": [
+        {
+            "path": "vpn-client-windows",
+            "name": "VPN Client (Windows)"
+        },
+        {
+            "path": "vpn-client-android-tv",
+            "name": "VPN Client (Android TV)"
+        },
+        {
+            "path": "vpn-server",
+            "name": "VPN Server (Linux)"
+        },
+        {
+            "path": ".",
+            "name": "Root (Docs)"
+        }
+    ],
+    "settings": {
+        "gopls": {
+            "build.env": {
+                "GOWORK": "off"
+            }
+        },
+        "chat.tools.terminal.autoApprove": {
+            "go": true,
+            "c:\\Users\\andre\\repo\\vpn-server\\deploy\\deploy.ps1": true,
+            "c:\\Users\\andre\\repo\\vpn-server\\deploy\\bench.ps1": true,
+            ".\\bench.ps1": true,
+            ".\\deploy.ps1": true,
+            "gopls": true,
+            ".\\bench-gro.ps1": true,
+            ".\\bench-stress.ps1": true
+        }
+    }
+}

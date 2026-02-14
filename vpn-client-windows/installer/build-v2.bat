@@ -91,28 +91,21 @@ if "%ISCC%"=="" (
     set CREATE_INSTALLER=1
 )
 
-:: Проверяем wintun.dll (автокопирование из репо если есть)
-if not exist "wintun.dll" (
-    if exist "wintun\wintun\bin\amd64\wintun.dll" (
-        copy /Y "wintun\wintun\bin\amd64\wintun.dll" . >nul
-        echo [✓] wintun.dll скопирован из wintun\bin\amd64\
-        set HAS_WINTUN=1
-    ) else (
-        echo [!] wintun.dll не найден
-        echo     Скачайте с https://www.wintun.net/ ^(amd64^)
-        echo     Положите в корень проекта
-        echo.
-        echo [!] Сборка продолжится, но для работы потребуется wintun.dll
-        echo.
-        set HAS_WINTUN=0
-    )
-) else (
-    echo [✓] wintun.dll найден
+:: Проверяем наличие wintun.dll
+if exist "wintun\wintun\bin\amd64\wintun.dll" (
+    echo [✓] wintun.dll найден в wintun\wintun\bin\amd64\
     set HAS_WINTUN=1
+) else (
+    echo [!] wintun.dll не найден
+    echo     Скачайте с https://www.wintun.net/ ^(amd64^)
+    echo     Положите в wintun\wintun\bin\amd64\
+    echo.
+    echo [!] Сборка продолжится, но для работы потребуется wintun.dll
+    echo.
+    set HAS_WINTUN=0
 )
 
 echo.
-pause
 
 :: ═══════════════════════════════════════════════════════════════
 ::   ШАГ 2: Загрузка зависимостей Go
@@ -209,8 +202,8 @@ echo [ШАГ 7/8] Подготовка дистрибутива...
 echo.
 
 if %HAS_WINTUN%==1 (
-    copy /Y wintun.dll dist\NovaVPN\ >nul
-    echo   [✓] wintun.dll скопирован
+    copy /Y "wintun\wintun\bin\amd64\wintun.dll" dist\NovaVPN\ >nul
+    echo   [✓] wintun.dll скопирован в dist\NovaVPN\
 ) else (
     echo   [!] wintun.dll отсутствует — добавьте вручную
 )
@@ -302,23 +295,23 @@ if %CREATE_INSTALLER%==1 (
 
 echo.
 echo ┌───────────────────────────────────────────────────────────────┐
-echo │ Следующие шаги:                                              │
-echo │                                                              │
+echo │ Следующие шаги:                                               │
+echo │                                                               │
 if %HAS_WINTUN%==0 (
-    echo │ 1. Скачайте wintun.dll с https://www.wintun.net/         │
-    echo │    и положите в dist\NovaVPN\                            │
-    echo │                                                              │
+    echo │ 1. Скачайте wintun.dll с https://www.wintun.net/                │
+    echo │    и положите в dist\NovaVPN\                                   │
+    echo │                                                                 │
 )
 if %CREATE_INSTALLER%==1 (
-    echo │ 2. Запустите инсталлятор:                                │
-    echo │    dist\NovaVPN-Setup-%VERSION%.exe                       │
+    echo │ 2. Запустите инсталлятор:                                     │
+    echo │    dist\NovaVPN-Setup-%VERSION%.exe                               │
 ) else (
-    echo │ 2. Скопируйте папку dist\NovaVPN\ на целевой компьютер   │
-    echo │    и запустите NovaVPN.exe                               │
+    echo │ 2. Скопируйте папку dist\NovaVPN\ на целевой компьютер          │
+    echo │    и запустите NovaVPN.exe                                      │
 )
-echo │                                                              │
-echo │ 3. Протестируйте подключение к серверу                      │
-echo │                                                              │
+echo │                                                               │
+echo │ 3. Протестируйте подключение к серверу                        │
+echo │                                                               │
 echo └───────────────────────────────────────────────────────────────┘
 echo.
 
@@ -327,4 +320,3 @@ if %HAS_WINTUN%==0 (
     echo.
 )
 
-pause

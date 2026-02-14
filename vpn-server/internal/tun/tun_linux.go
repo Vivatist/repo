@@ -7,6 +7,7 @@ package tun
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -28,6 +29,22 @@ const (
 
 	// IFF_NO_PI — не добавлять заголовок packet information
 	iffNO_PI = 0x1000
+
+	// IFF_VNET_HDR — включить virtio_net_hdr перед каждым пакетом (GRO/GSO)
+	iffVNET_HDR = 0x4000
+
+	// ioctl команды для GRO/GSO
+	// TUNSETVNETHDRSZ = _IOW('T', 216, int) — устанавливает размер virtio заголовка
+	tunSetVNetHdrSz = 0x400454D8
+	// TUNSETOFFLOAD = _IOW('T', 208, unsigned int) — включает offload features
+	tunSetOffload = 0x400454D0
+
+	// TUN offload features (TUNSETOFFLOAD)
+	tunFCsum = 0x01 // Checksum offload
+	tunFTSO4 = 0x02 // TCP Segmentation Offload (IPv4)
+	tunFTSO6 = 0x04 // TCP Segmentation Offload (IPv6)
+	tunFUSO4 = 0x20 // UDP Segmentation Offload (IPv4, Linux 6.2+)
+	tunFUSO6 = 0x40 // UDP Segmentation Offload (IPv6, Linux 6.2+)
 )
 
 // ifreq — структура для ioctl запросов к сетевому интерфейсу.
@@ -39,13 +56,18 @@ type ifreq struct {
 
 // TUNDevice представляет TUN-интерфейс.
 type TUNDevice struct {
-	file *os.File
-	name string
-	mtu  int
+	file       *os.File
+	name       string
+	mtu        int
+	groEnabled bool   // GRO/GSO активен (IFF_VNET_HDR + offload)
+	usoEnabled bool   // UDP Segmentation Offload (Linux 6.2+)
+	writeBuf   []byte // Пре-аллоцированный буфер для записи с virtio header (zero-alloc)
 }
 
 // NewTUN создаёт новый TUN-интерфейс.
-func NewTUN(name string, mtu int) (*TUNDevice, error) {
+// enableGRO: если true, пытается включить GRO/GSO через IFF_VNET_HDR + TUNSETOFFLOAD.
+// При неудаче автоматически отключает GRO и работает в обычном режиме.
+func NewTUN(name string, mtu int, enableGRO bool) (*TUNDevice, error) {
 	// Открываем /dev/net/tun
 	fd, err := unix.Open(tunDevice, unix.O_RDWR|unix.O_CLOEXEC, 0)
 	if err != nil {
@@ -55,6 +77,9 @@ func NewTUN(name string, mtu int) (*TUNDevice, error) {
 	// Настраиваем TUN-интерфейс через ioctl
 	var req ifreq
 	req.Flags = iffTUN | iffNO_PI
+	if enableGRO {
+		req.Flags |= iffVNET_HDR
+	}
 
 	// Копируем имя интерфейса
 	if len(name) >= ifnamsiz {
@@ -71,8 +96,31 @@ func NewTUN(name string, mtu int) (*TUNDevice, error) {
 		uintptr(unsafe.Pointer(&req)),
 	)
 	if errno != 0 {
-		unix.Close(fd)
-		return nil, fmt.Errorf("ioctl TUNSETIFF ошибка: %v", errno)
+		if enableGRO {
+			// TUNSETIFF с IFF_VNET_HDR не удался — пробуем без GRO
+			log.Printf("[TUN] IFF_VNET_HDR не поддерживается, GRO/GSO отключён")
+			req.Flags = iffTUN | iffNO_PI
+			_, _, errno = unix.Syscall(
+				unix.SYS_IOCTL,
+				uintptr(fd),
+				uintptr(unix.TUNSETIFF),
+				uintptr(unsafe.Pointer(&req)),
+			)
+			if errno != 0 {
+				unix.Close(fd)
+				return nil, fmt.Errorf("ioctl TUNSETIFF ошибка: %v", errno)
+			}
+			enableGRO = false
+		} else {
+			unix.Close(fd)
+			return nil, fmt.Errorf("ioctl TUNSETIFF ошибка: %v", errno)
+		}
+	}
+
+	// Настраиваем GRO/GSO
+	usoEnabled := false
+	if enableGRO {
+		enableGRO, usoEnabled = setupGRO(fd)
 	}
 
 	// Получаем фактическое имя интерфейса
@@ -88,12 +136,68 @@ func NewTUN(name string, mtu int) (*TUNDevice, error) {
 	}
 
 	tun := &TUNDevice{
-		file: file,
-		name: actualName,
-		mtu:  mtu,
+		file:       file,
+		name:       actualName,
+		mtu:        mtu,
+		groEnabled: enableGRO,
+		usoEnabled: usoEnabled,
+	}
+
+	// Пре-аллоцируем буфер для записи с virtio header (zero-alloc Write)
+	if enableGRO {
+		tun.writeBuf = make([]byte, VirtioNetHdrLen+mtu+100)
+		// Первые VirtioNetHdrLen байт = 0 (GSO_NONE) — Go нулевая инициализация
 	}
 
 	return tun, nil
+}
+
+// setupGRO настраивает GRO/GSO через ioctl на открытом fd TUN-устройства.
+// Возвращает: (groEnabled, usoEnabled).
+func setupGRO(fd int) (bool, bool) {
+	// 1. Устанавливаем размер virtio заголовка
+	sz := int32(VirtioNetHdrLen)
+	_, _, errno := unix.Syscall(
+		unix.SYS_IOCTL,
+		uintptr(fd),
+		tunSetVNetHdrSz,
+		uintptr(unsafe.Pointer(&sz)),
+	)
+	if errno != 0 {
+		log.Printf("[TUN] TUNSETVNETHDRSZ не удался: %v — GRO/GSO отключён", errno)
+		return false, false
+	}
+
+	// 2. Включаем базовые offload features (TSO4 + TSO6)
+	_, _, errno = unix.Syscall(
+		unix.SYS_IOCTL,
+		uintptr(fd),
+		tunSetOffload,
+		uintptr(tunFCsum|tunFTSO4|tunFTSO6),
+	)
+	if errno != 0 {
+		log.Printf("[TUN] TUNSETOFFLOAD (TSO) не удался: %v — GRO/GSO отключён", errno)
+		return false, false
+	}
+
+	log.Println("[TUN] GRO/GSO активирован (IFF_VNET_HDR + TSO4/TSO6)")
+
+	// 3. Пробуем USO (UDP Segmentation Offload, Linux 6.2+)
+	usoEnabled := false
+	_, _, errno = unix.Syscall(
+		unix.SYS_IOCTL,
+		uintptr(fd),
+		tunSetOffload,
+		uintptr(tunFCsum|tunFTSO4|tunFTSO6|tunFUSO4|tunFUSO6),
+	)
+	if errno == 0 {
+		usoEnabled = true
+		log.Println("[TUN] USO активирован (UDP Segmentation Offload, Linux 6.2+)")
+	} else {
+		log.Println("[TUN] USO не поддерживается (Linux < 6.2) — только TCP GRO")
+	}
+
+	return true, usoEnabled
 }
 
 // Configure настраивает IP-адрес и другие параметры TUN-интерфейса.
@@ -117,14 +221,37 @@ func (t *TUNDevice) Configure(ipAddr string, subnetMask int) error {
 	return nil
 }
 
-// Read читает IP-пакет из TUN-интерфейса.
+// Read читает пакет из TUN-интерфейса.
+// При GRO: возвращает данные с virtio_net_hdr (10 байт) — используй ParseGROHeader.
+// Без GRO: возвращает чистый IP-пакет.
 func (t *TUNDevice) Read(buf []byte) (int, error) {
 	return t.file.Read(buf)
 }
 
 // Write записывает IP-пакет в TUN-интерфейс.
+// При GRO: автоматически добавляет virtio header (GSO_NONE) — zero-alloc.
+// Без GRO: прямая запись.
 func (t *TUNDevice) Write(buf []byte) (int, error) {
-	return t.file.Write(buf)
+	if !t.groEnabled {
+		return t.file.Write(buf)
+	}
+
+	// Пишем: virtio_hdr(10 нулей, GSO_NONE) + IP-пакет
+	total := VirtioNetHdrLen + len(buf)
+	if total > len(t.writeBuf) {
+		// Не должно происходить при нормальных MTU, но обработаем
+		t.writeBuf = make([]byte, total+1024)
+	}
+	// writeBuf[:VirtioNetHdrLen] всегда нули (GSO_NONE) — Go zero-init
+	copy(t.writeBuf[VirtioNetHdrLen:], buf)
+	n, err := t.file.Write(t.writeBuf[:total])
+	if err != nil {
+		return 0, err
+	}
+	if n < VirtioNetHdrLen {
+		return 0, fmt.Errorf("short write в TUN: %d байт", n)
+	}
+	return n - VirtioNetHdrLen, nil
 }
 
 // Close закрывает TUN-интерфейс.
@@ -143,6 +270,16 @@ func (t *TUNDevice) Name() string {
 // MTU возвращает MTU интерфейса.
 func (t *TUNDevice) MTU() int {
 	return t.mtu
+}
+
+// GROEnabled возвращает true, если GRO/GSO активен.
+func (t *TUNDevice) GROEnabled() bool {
+	return t.groEnabled
+}
+
+// USOEnabled возвращает true, если UDP Segmentation Offload активен (Linux 6.2+).
+func (t *TUNDevice) USOEnabled() bool {
+	return t.usoEnabled
 }
 
 // File возвращает файловый дескриптор.
@@ -205,6 +342,17 @@ func ExtractDstIP(packet []byte) net.IP {
 	}
 	// Destination IP: байты 16-19 (IPv4)
 	return net.IPv4(packet[16], packet[17], packet[18], packet[19])
+}
+
+// ExtractDstIPKey извлекает IP-адрес назначения как [4]byte ключ (zero-alloc).
+// Используется на hot path вместо ExtractDstIP, чтобы избежать аллокации net.IP.
+func ExtractDstIPKey(packet []byte) ([4]byte, bool) {
+	var key [4]byte
+	if len(packet) < 20 || packet[0]>>4 != 4 {
+		return key, false
+	}
+	copy(key[:], packet[16:20])
+	return key, true
 }
 
 // ExtractSrcIP извлекает IP-адрес источника из IPv4-пакета.

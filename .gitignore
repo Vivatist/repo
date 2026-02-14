@@ -2,6 +2,12 @@
 *.exe
 *.dll
 *.syso
+novavpn-server
+novavpn-server-*
+
+# Исключение: WinTUN SDK (нужен для сборки)
+!vpn-client-windows/wintun/wintun/bin/**/*.dll
+!vpn-client-windows/wintun/wintun/include/*
 
 # Артефакты сборки
 **/dist/

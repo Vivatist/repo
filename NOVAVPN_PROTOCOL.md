@@ -17,7 +17,7 @@ NovaVPN — собственный VPN-протокол поверх **UDP** с 
 - Маскировка: пакеты обёрнуты в TLS 1.2 Application Data Record Header (обход DPI)
 - PSK: автоматически получается при первом подключении (bootstrap)
 
-**Сервер по умолчанию:** `212.118.54.76:443` (UDP), systemd-сервис `novavpn`.
+**Сервер по умолчанию:** `212.118.41.227:443` (UDP), systemd-сервис `novavpn`.
 
 ---
 
@@ -132,7 +132,7 @@ Lightweight-формат без nonce и payload:
 | Шифрование (data) | ChaCha20 (XOR) | 4B counter на wire, nonce = HMAC-prefix + counter |
 | Шифрование (handshake) | ChaCha20-Poly1305 (AEAD) | 12B nonce на wire, 16B auth tag |
 | Целостность | HMAC-SHA256 | Проверка при handshake |
-| Пароли (сервер) | Argon2id | time=3, memory=64MB, threads=4, keyLen=32 |
+| Пароли (сервер) | Argon2id | time=1, memory=4MB, threads=4, keyLen=32 |
 
 ### 3.2. Сессионные ключи
 
@@ -304,7 +304,7 @@ Plaintext Credentials:
 | SubnetMask | 40 | 1 | uint8 | Маска подсети (CIDR, напр. 24) |
 | DNS1 | 41 | 4 | IPv4 bytes | Первый DNS-сервер |
 | DNS2 | 45 | 4 | IPv4 bytes | Второй DNS-сервер |
-| MTU | 49 | 2 | BE uint16 | MTU туннеля (напр. 1400) |
+| MTU | 49 | 2 | BE uint16 | MTU туннеля (напр. 1380) |
 | ServerHMAC | 51 | 32 | raw | HMAC-SHA256(HMACKey, respData[:51]) |
 | HasPSK | 83 | 1 | 0 или 1 | Флаг наличия PSK |
 | PSK | 84 | 32 | raw | Настоящий PSK сервера (только при bootstrap) |
@@ -596,7 +596,7 @@ Lightweight-формат: **10 байт**, аналогичен keepalive.
 ```
 
 Где:
-- `vpnGateway` = первый IP подсети (напр. `10.8.0.1` для `10.8.0.0/24`)
+- `vpnGateway` = первый IP подсети (напр. `10.8.0.1` для `10.8.0.0/16`)
 - `physicalGateway` = гейтвей физического адаптера
 
 ### 9.3. DNS
@@ -618,18 +618,20 @@ Lightweight-формат: **10 байт**, аналогичен keepalive.
 ```yaml
 listen_addr: "0.0.0.0"
 listen_port: 443
-vpn_subnet: "10.8.0.0/24"
+vpn_subnet: "10.8.0.0/16"
 server_vpn_ip: "10.8.0.1"
 tun_name: "nova0"
-mtu: 1400
+mtu: 1380
 dns: ["1.1.1.1", "8.8.8.8"]
 pre_shared_key: "<64 hex chars>"
 users_file: "/etc/novavpn/users.yaml"
-max_clients: 256
+max_clients: 65534
 keepalive_interval: 25
 session_timeout: 120
 enable_nat: true
 external_interface: "eth0"
+max_parallel_handshakes: 64  # 1-256, макс. параллельных Argon2id (64 × 4МБ = 256МБ)
+enable_gro_gso: "auto"      # "auto"/"true"/"false" — GRO/GSO для TUN (IFF_VNET_HDR)
 log_level: "info"           # debug, info, warn, error
 ```
 
@@ -637,7 +639,7 @@ log_level: "info"           # debug, info, warn, error
 
 ```json
 {
-  "server_addr": "212.118.54.76:443",
+  "server_addr": "212.118.41.227:443",
   "psk": "",
   "email": "user@example.com",
   "password": "secret",

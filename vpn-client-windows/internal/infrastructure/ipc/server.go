@@ -20,11 +20,18 @@ type NamedPipeServer struct {
 	handler  func(req map[string]interface{}) map[string]interface{}
 	mu       sync.Mutex
 	stopped  bool
+	stopCh   chan struct{} // канал для остановки сервиса по IPC-команде stop_service
 }
 
 // NewNamedPipeServer создаёт новый IPC-сервер.
 func NewNamedPipeServer() *NamedPipeServer {
 	return &NamedPipeServer{}
+}
+
+// SetStopCh устанавливает канал для сигнала остановки сервиса.
+// Сигнал отправляется при получении IPC-команды "stop_service".
+func (s *NamedPipeServer) SetStopCh(ch chan struct{}) {
+	s.stopCh = ch
 }
 
 // SetHandler устанавливает обработчик запросов.
@@ -127,6 +134,15 @@ func (s *NamedPipeServer) handleConnection(conn net.Conn) {
 		// Отправляем ответ
 		if err := s.writeResponse(conn, response); err != nil {
 			log.Printf("[IPC] Ошибка записи ответа: %v", err)
+			return
+		}
+
+		// После отправки ответа на stop_service — сигнализируем остановку сервиса
+		if reqType, _ := request["type"].(string); reqType == "stop_service" && s.stopCh != nil {
+			select {
+			case s.stopCh <- struct{}{}:
+			default:
+			}
 			return
 		}
 	}

@@ -68,9 +68,14 @@ func RunElevated(exe string, args string) error {
 		return fmt.Errorf("ShellExecuteEx: %w", errCall)
 	}
 
-	// Ожидаем завершения запущенного процесса
+	// Ожидаем завершения запущенного процесса и проверяем exit code
 	if sei.hProcess != 0 {
 		windows.WaitForSingleObject(sei.hProcess, windows.INFINITE)
+		var exitCode uint32
+		if err := windows.GetExitCodeProcess(sei.hProcess, &exitCode); err == nil && exitCode != 0 {
+			windows.CloseHandle(sei.hProcess)
+			return fmt.Errorf("процесс завершился с кодом %d", exitCode)
+		}
 		windows.CloseHandle(sei.hProcess)
 	}
 
