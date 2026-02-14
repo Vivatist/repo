@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	mathrand "math/rand/v2"
 	"sync/atomic"
 
 	"golang.org/x/crypto/chacha20"
@@ -152,11 +153,13 @@ func (s *ChaCha20Session) DecryptWithNonce(nonce []byte, ciphertext []byte, addi
 	return plaintext, nil
 }
 
-// EncryptInto шифрует plaintext прямо в dst буфер (counter(4) + ciphertext).
+// EncryptInto шифрует plaintext прямо в dst буфер (counter(4) + ciphertext с padding).
 // Plain ChaCha20 (XOR) без Poly1305 — нет auth tag.
+// Padding: plaintext + zeros(padLen) + byte(padLen) — внутри шифротекста.
 func (s *ChaCha20Session) EncryptInto(dst []byte, plaintext []byte, additionalData []byte) (int, error) {
-	// counter(4) + ciphertext (same size as plaintext, no tag)
-	totalLen := 4 + len(plaintext)
+	padLen := ComputeDataPadLen(len(plaintext))
+	paddedLen := len(plaintext) + padLen + 1 // +1 для байта padLen
+	totalLen := 4 + paddedLen                // counter(4) + paddedCT
 	if len(dst) < totalLen {
 		return 0, fmt.Errorf("dst too small: %d < %d", len(dst), totalLen)
 	}
@@ -172,18 +175,26 @@ func (s *ChaCha20Session) EncryptInto(dst []byte, plaintext []byte, additionalDa
 	// На wire только counter (4 байта)
 	binary.BigEndian.PutUint32(dst[0:4], wireCtr)
 
-	// Plain ChaCha20 XOR
+	// Plain ChaCha20 XOR: шифруем plaintext, затем padding + padLen
 	cipher, err := chacha20.NewUnauthenticatedCipher(s.keys.SendKey, nonce[:])
 	if err != nil {
 		return 0, fmt.Errorf("chacha20 init: %w", err)
 	}
+	// Шифруем plaintext
 	cipher.XORKeyStream(dst[4:4+len(plaintext)], plaintext)
-	// Обфускация не применяется здесь — вызывающий код обфусцирует весь заголовок (SID+Type+Counter) после сборки пакета
+	// Шифруем padding (нули → raw keystream, выглядит случайно) + padLen байт
+	for i := 0; i < padLen; i++ {
+		dst[4+len(plaintext)+i] = 0
+	}
+	dst[4+len(plaintext)+padLen] = byte(padLen)
+	cipher.XORKeyStream(dst[4+len(plaintext):4+paddedLen], dst[4+len(plaintext):4+paddedLen])
+
 	return totalLen, nil
 }
 
-// DecryptWithCounter дешифрует ciphertext с plain ChaCha20 (XOR).
+// DecryptWithCounter дешифрует ciphertext с plain ChaCha20 (XOR) и снимает padding.
 // Nonce = recvNoncePrefix(4) + uint64(counter) big-endian(8).
+// Padding формат: plaintext + zeros(padLen) + byte(padLen) — последний расшифрованный байт = padLen.
 func (s *ChaCha20Session) DecryptWithCounter(counter uint32, ciphertext []byte, additionalData []byte) ([]byte, error) {
 	if len(ciphertext) == 0 {
 		return nil, fmt.Errorf("empty ciphertext")
@@ -206,7 +217,14 @@ func (s *ChaCha20Session) DecryptWithCounter(counter uint32, ciphertext []byte, 
 	}
 	cipher.XORKeyStream(s.recvBuf, ciphertext)
 
-	return s.recvBuf, nil
+	// Снимаем padding: последний байт = padLen
+	padLen := int(s.recvBuf[plaintextLen-1])
+	actualLen := plaintextLen - 1 - padLen
+	if actualLen < 20 { // минимальный IP-пакет
+		return nil, fmt.Errorf("invalid padding: padLen=%d, totalLen=%d, actualLen=%d", padLen, plaintextLen, actualLen)
+	}
+
+	return s.recvBuf[:actualLen], nil
 }
 
 // ComputeHMAC вычисляет HMAC для данных.
@@ -353,6 +371,49 @@ func zeroBytes(b []byte) {
 
 // HeaderMaskSize — размер маски обфускации заголовка (9 байт).
 const HeaderMaskSize = 9
+
+// Padding constants (Этап 2 маскировки)
+const (
+	// KeepalivePadMin — минимальный padding для keepalive/disconnect (байт)
+	KeepalivePadMin = 40
+	// KeepalivePadMax — максимальный padding для keepalive/disconnect (байт)
+	KeepalivePadMax = 150
+	// DataPadAlign — выравнивание data-пакетов (байт)
+	DataPadAlign = 64
+	// DataPadRandomMax — максимальный случайный добавочный padding для data (байт)
+	DataPadRandomMax = 32
+	// HandshakePadMin — минимальный padding для handshake-пакетов (байт)
+	HandshakePadMin = 100
+	// HandshakePadMax — максимальный padding для handshake-пакетов (байт)
+	HandshakePadMax = 400
+)
+
+// RandomPadLen возвращает случайную длину padding в диапазоне [min, max].
+func RandomPadLen(min, max int) int {
+	if max <= min {
+		return min
+	}
+	var b [2]byte
+	_, _ = rand.Read(b[:])
+	return min + int(binary.BigEndian.Uint16(b[:]))%(max-min+1)
+}
+
+// ComputeDataPadLen вычисляет длину padding для data-пакета.
+func ComputeDataPadLen(plaintextLen int) int {
+	minPadded := plaintextLen + 1
+	alignedTarget := ((minPadded + DataPadAlign - 1) / DataPadAlign) * DataPadAlign
+	padLen := alignedTarget - minPadded
+
+	// math/rand — достаточно для длины padding (не security-critical),
+	// auto-seeded от crypto/rand. Без syscall — критично для hot path.
+	extra := mathrand.IntN(DataPadRandomMax + 1) // 0..32
+	padLen += extra
+
+	if padLen > 255 {
+		padLen = 255
+	}
+	return padLen
+}
 
 // DeriveHeaderMask выводит 9-байтную маску для обфускации заголовков пакетов из PSK.
 func DeriveHeaderMask(psk []byte) [HeaderMaskSize]byte {

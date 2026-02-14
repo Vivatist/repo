@@ -4,6 +4,7 @@
 package handshake
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -132,7 +133,15 @@ func (p *Performer) sendHandshakeInit(clientPubKey []byte) error {
 	}
 
 	initPayload := protocol.MarshalHandshakeInit(hsInit)
-	pkt := protocol.NewPacket(protocol.PacketHandshakeInit, 0, 0, [protocol.NonceSize]byte{}, initPayload)
+
+	// Handshake padding: добавляем случайные байты (100-400)
+	// UnmarshalHandshakeInit использует credsLen и игнорирует лишние байты
+	hsPadLen := infracrypto.RandomPadLen(infracrypto.HandshakePadMin, infracrypto.HandshakePadMax)
+	paddedPayload := make([]byte, len(initPayload)+hsPadLen)
+	copy(paddedPayload, initPayload)
+	rand.Read(paddedPayload[len(initPayload):])
+
+	pkt := protocol.NewPacket(protocol.PacketHandshakeInit, 0, 0, [protocol.NonceSize]byte{}, paddedPayload)
 
 	pktBytes, err := pkt.Marshal()
 	if err != nil {
@@ -263,7 +272,14 @@ func (p *Performer) sendHandshakeComplete(result *Result) error {
 	hsComplete := &protocol.HandshakeComplete{ConfirmHMAC: hmac32}
 	completePayload := protocol.MarshalHandshakeComplete(hsComplete)
 
-	encrypted, err := session.Encrypt(completePayload, nil)
+	// Handshake padding: добавляем случайные байты (100-400)
+	// UnmarshalHandshakeComplete читает первые 32 байта, игнорирует лишние
+	hsPadLen := infracrypto.RandomPadLen(infracrypto.HandshakePadMin, infracrypto.HandshakePadMax)
+	paddedComplete := make([]byte, len(completePayload)+hsPadLen)
+	copy(paddedComplete, completePayload)
+	rand.Read(paddedComplete[len(completePayload):])
+
+	encrypted, err := session.Encrypt(paddedComplete, nil)
 	if err != nil {
 		return fmt.Errorf("encrypt HandshakeComplete: %w", err)
 	}

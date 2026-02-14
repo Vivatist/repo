@@ -1,6 +1,7 @@
 package server
 
 import (
+	crand "crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"log"
@@ -229,8 +230,15 @@ func (s *VPNServer) handleHandshakeInit(pkt *protocol.Packet, remoteAddr *net.UD
 	hsResp.ServerHMAC = protocol.ComputeHMAC(sessionKeys.HMACKey, respData[:51]) // до ServerHMAC
 	respData = protocol.MarshalHandshakeResp(hsResp)
 
+	// Handshake padding: добавляем случайные байты (100-400) к respData перед шифрованием.
+	// UnmarshalHandshakeResp использует фиксированные смещения и игнорирует лишние байты.
+	hsPadLen := protocol.RandomPadLen(protocol.HandshakePadMin, protocol.HandshakePadMax)
+	paddedResp := make([]byte, len(respData)+hsPadLen)
+	copy(paddedResp, respData)
+	crand.Read(paddedResp[len(respData):])
+
 	// Шифруем payload (БЕЗ ServerPublicKey — он пойдёт открыто для ECDH на клиенте)
-	nonce, encrypted, err := protocol.Encrypt(sessionKeys.SendKey, respData, nil)
+	nonce, encrypted, err := protocol.Encrypt(sessionKeys.SendKey, paddedResp, nil)
 	if err != nil {
 		log.Printf("[HANDSHAKE] Ошибка шифрования ответа: %v", err)
 		s.sessions.RemoveSession(session)

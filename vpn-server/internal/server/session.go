@@ -229,10 +229,12 @@ func deriveNoncePrefix(key []byte) [4]byte {
 
 // EncryptAndBuild шифрует plaintext и собирает готовый VPN-пакет в buf.
 // Plain ChaCha20 (XOR) без Poly1305 — нет auth tag.
-// Формат: TLS_Header(5) + SessionID(4) + Type(1) + Counter(4) + Ciphertext
+// Формат: TLS_Header(5) + SessionID(4) + Type(1) + Counter(4) + Ciphertext(paddedPlaintext)
+// Padding: plaintext + zeros(padLen) + byte(padLen) — внутри шифротекста.
 func (s *Session) EncryptAndBuild(buf []byte, plaintext []byte) (int, error) {
-	ciphertextLen := len(plaintext)      // без overhead: plain XOR
-	dataLen := 4 + 1 + 4 + ciphertextLen // SID + Type + Counter + CT
+	padLen := protocol.ComputeDataPadLen(len(plaintext))
+	paddedLen := len(plaintext) + padLen + 1 // +1 для байта padLen
+	dataLen := 4 + 1 + 4 + paddedLen         // SID + Type + Counter + paddedCT
 	totalLen := protocol.TLSHeaderSize + dataLen
 
 	if len(buf) < totalLen {
@@ -262,12 +264,19 @@ func (s *Session) EncryptAndBuild(buf []byte, plaintext []byte) (int, error) {
 	// На wire только counter (4 байта)
 	binary.BigEndian.PutUint32(buf[10:14], wireCtr)
 
-	// Plain ChaCha20 XOR прямо в buf[14:]
+	// Plain ChaCha20 XOR: шифруем plaintext + padding + padLen байт
 	c, err := chacha20.NewUnauthenticatedCipher(s.Keys.SendKey[:], nonce[:])
 	if err != nil {
 		return 0, fmt.Errorf("chacha20 init: %w", err)
 	}
+	// Шифруем plaintext
 	c.XORKeyStream(buf[14:14+len(plaintext)], plaintext)
+	// Шифруем padding (нули — результат = raw keystream, выглядит случайно)
+	for i := 0; i < padLen; i++ {
+		buf[14+len(plaintext)+i] = 0
+	}
+	buf[14+len(plaintext)+padLen] = byte(padLen) // padLen байт (перед шифрованием)
+	c.XORKeyStream(buf[14+len(plaintext):14+paddedLen], buf[14+len(plaintext):14+paddedLen])
 
 	// Обфускация заголовка: SID(4) + Type(1) + Counter(4) = 9 байт
 	protocol.ObfuscateHeader(buf[5:], s.headerMask, true)

@@ -462,11 +462,21 @@ func (s *VPNServer) processUDPPacket(origData []byte, remoteAddr *net.UDPAddr, d
 		}
 		c.XORKeyStream(decryptBuf, payload)
 
+		// Снимаем data-padding: последний байт = padLen, затем padLen байт padding
+		if plaintextLen < 1 {
+			return decryptBuf
+		}
+		padLen := int(decryptBuf[plaintextLen-1])
+		actualLen := plaintextLen - 1 - padLen
+		if actualLen < 20 { // минимальный IPv4 заголовок = 20 байт
+			return decryptBuf
+		}
+
 		session.UpdateActivity()
-		session.BytesRecv.Add(uint64(len(decryptBuf)))
+		session.BytesRecv.Add(uint64(actualLen))
 		session.PacketsRecv.Add(1)
 
-		if _, err := s.tunDev.Write(decryptBuf); err != nil {
+		if _, err := s.tunDev.Write(decryptBuf[:actualLen]); err != nil {
 			if s.cfg.LogLevel == "debug" {
 				log.Printf("[TUN] Ошибка записи в TUN: %v", err)
 			}
@@ -488,17 +498,21 @@ func (s *VPNServer) processUDPPacket(origData []byte, remoteAddr *net.UDPAddr, d
 		if s.cfg.LogLevel == "debug" {
 			log.Printf("[KEEPALIVE] Получен от сессии #%d", session.ID)
 		}
-		// Lightweight keepalive response: TLS(5) + SID(4) + Type(1) = 10 bytes, zero-alloc
-		var kaBuf [10]byte
+		// Keepalive response с padding (50-160 байт, типичный TLS record)
+		padLen := protocol.RandomPadLen(protocol.KeepalivePadMin, protocol.KeepalivePadMax)
+		kaSize := 5 + padLen // SID(4) + Type(1) + Padding
+		var kaBuf [protocol.TLSHeaderSize + 5 + protocol.KeepalivePadMax]byte
 		kaBuf[0] = protocol.TLSContentType
 		kaBuf[1] = protocol.TLSVersionMajor
 		kaBuf[2] = protocol.TLSVersionMinor
-		binary.BigEndian.PutUint16(kaBuf[3:5], 5)
+		binary.BigEndian.PutUint16(kaBuf[3:5], uint16(kaSize))
 		binary.BigEndian.PutUint32(kaBuf[5:9], session.ID)
 		kaBuf[9] = byte(protocol.PacketKeepalive)
+		// Заполняем padding случайными данными
+		rand.Read(kaBuf[10 : 10+padLen])
 		// Обфускация заголовка (SID + Type)
 		protocol.ObfuscateHeader(kaBuf[5:], s.headerMask, false)
-		s.udpConn.WriteToUDP(kaBuf[:], remoteAddr)
+		s.udpConn.WriteToUDP(kaBuf[:protocol.TLSHeaderSize+kaSize], remoteAddr)
 
 	case protocol.PacketDisconnect:
 		session := cache.get(sessionID, s.sessions)
@@ -753,19 +767,21 @@ func (s *VPNServer) notifyShutdown() {
 		return
 	}
 	sessions := s.sessions.GetAllSessions()
-	var buf [10]byte
+	var buf [protocol.TLSHeaderSize + 5 + protocol.KeepalivePadMax]byte
 	buf[0] = protocol.TLSContentType
 	buf[1] = protocol.TLSVersionMajor
 	buf[2] = protocol.TLSVersionMinor
-	binary.BigEndian.PutUint16(buf[3:5], 5)
 	count := 0
 	for _, session := range sessions {
 		if session.IsActive() {
+			padLen := protocol.RandomPadLen(protocol.KeepalivePadMin, protocol.KeepalivePadMax)
+			pktSize := 5 + padLen // SID(4) + Type(1) + Padding
+			binary.BigEndian.PutUint16(buf[3:5], uint16(pktSize))
 			binary.BigEndian.PutUint32(buf[5:9], session.ID)
 			buf[9] = byte(protocol.PacketDisconnect)
-			// Обфускация заголовка (SID + Type)
+			rand.Read(buf[10 : 10+padLen])
 			protocol.ObfuscateHeader(buf[5:], s.headerMask, false)
-			if _, err := s.udpConn.WriteToUDP(buf[:], session.ClientAddr); err != nil {
+			if _, err := s.udpConn.WriteToUDP(buf[:protocol.TLSHeaderSize+pktSize], session.ClientAddr); err != nil {
 				log.Printf("[SERVER] Ошибка отправки disconnect сессии #%d: %v", session.ID, err)
 			} else {
 				count++

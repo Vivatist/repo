@@ -1,6 +1,7 @@
 package main
 
 import (
+	crand "crypto/rand"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/binary"
@@ -109,7 +110,14 @@ func (bc *benchClient) doHandshake(cfg *BenchConfig) error {
 
 	// 4. Сериализуем и оборачиваем в пакет
 	initPayload := protocol.MarshalHandshakeInit(hsInit)
-	initPkt := protocol.NewPacket(protocol.PacketHandshakeInit, 0, 0, [protocol.NonceSize]byte{}, initPayload)
+
+	// Handshake padding: добавляем случайные байты (100-400)
+	hsPadLen := protocol.RandomPadLen(protocol.HandshakePadMin, protocol.HandshakePadMax)
+	paddedPayload := make([]byte, len(initPayload)+hsPadLen)
+	copy(paddedPayload, initPayload)
+	crand.Read(paddedPayload[len(initPayload):])
+
+	initPkt := protocol.NewPacket(protocol.PacketHandshakeInit, 0, 0, [protocol.NonceSize]byte{}, paddedPayload)
 	initBytes, err := initPkt.Marshal()
 	if err != nil {
 		return fmt.Errorf("marshal init: %w", err)
@@ -205,8 +213,14 @@ func (bc *benchClient) doHandshake(cfg *BenchConfig) error {
 	hsComplete := &protocol.HandshakeComplete{ConfirmHMAC: confirmHMAC}
 	completePayload := protocol.MarshalHandshakeComplete(hsComplete)
 
+	// Handshake padding: добавляем случайные байты (100-400)
+	complPadLen := protocol.RandomPadLen(protocol.HandshakePadMin, protocol.HandshakePadMax)
+	paddedComplete := make([]byte, len(completePayload)+complPadLen)
+	copy(paddedComplete, completePayload)
+	crand.Read(paddedComplete[len(completePayload):])
+
 	// Шифруем payload
-	completeNonce, completeCipher, err := protocol.Encrypt(sessionKeys.SendKey, completePayload, nil)
+	completeNonce, completeCipher, err := protocol.Encrypt(sessionKeys.SendKey, paddedComplete, nil)
 	if err != nil {
 		return fmt.Errorf("encrypt complete: %w", err)
 	}
@@ -349,22 +363,25 @@ func (bc *benchClient) runDataExchange(duration time.Duration, pktSize int, inte
 	return result
 }
 
-// buildKeepalive создаёт keepalive пакет.
-// Формат: TLS(5) + SID(4) + Type(1) = 10 bytes
+// buildKeepalive создаёт keepalive пакет с padding.
+// Формат: TLS(5) + SID(4) + Type(1) + Padding(40-150)
 func (bc *benchClient) buildKeepalive() ([]byte, error) {
 	bc.sendCounter++
 
-	var buf [10]byte
+	padLen := protocol.RandomPadLen(protocol.KeepalivePadMin, protocol.KeepalivePadMax)
+	var buf [protocol.TLSHeaderSize + 5 + protocol.KeepalivePadMax]byte
 	buf[0] = protocol.TLSContentType
 	buf[1] = protocol.TLSVersionMajor
 	buf[2] = protocol.TLSVersionMinor
-	binary.BigEndian.PutUint16(buf[3:5], 5) // длина TLS payload = 5 (SID+Type)
+	binary.BigEndian.PutUint16(buf[3:5], uint16(5+padLen))
 	binary.BigEndian.PutUint32(buf[5:9], bc.sessionID)
 	buf[9] = byte(protocol.PacketKeepalive)
+	// Случайный padding после SID+Type
+	crand.Read(buf[10 : 10+padLen])
 	// Обфускация заголовка (SID + Type)
 	protocol.ObfuscateHeader(buf[5:], bc.headerMask, false)
 
-	return buf[:], nil
+	return buf[:protocol.TLSHeaderSize+5+padLen], nil
 }
 
 // runThroughputTest — режим максимальной пропускной способности.
@@ -397,21 +414,21 @@ func (bc *benchClient) runThroughputTest(duration time.Duration, pktSize int, cl
 		plaintext[19] = 1
 	}
 
-	// Пре-аллоцированный буфер для шифрованного пакета
-	ciphertextLen := pktSize
-	dataLen := 4 + 1 + 4 + ciphertextLen // SID + Type + Counter + CT
+	// Пре-аллоцированный буфер для шифрованного пакета (с запасом для padding)
+	maxPadLen := protocol.ComputeDataPadLen(pktSize) + 1 // +1 для padLen byte
+	ciphertextLen := pktSize + maxPadLen
+	dataLen := 4 + 1 + 4 + ciphertextLen // SID + Type + Counter + CT+padding
 	totalLen := protocol.TLSHeaderSize + dataLen
-	sendBuf := make([]byte, totalLen)
+	sendBuf := make([]byte, totalLen+256) // запас для вариации padding
 
-	// Заполняем статическую часть один раз
-	sendBuf[0] = protocol.TLSContentType
-	sendBuf[1] = protocol.TLSVersionMajor
-	sendBuf[2] = protocol.TLSVersionMinor
-	binary.BigEndian.PutUint16(sendBuf[3:5], uint16(dataLen))
-	binary.BigEndian.PutUint32(sendBuf[5:9], bc.sessionID)
-	sendBuf[9] = byte(protocol.PacketData)
-	// Обфускация статической части заголовка (SID + Type)
-	protocol.ObfuscateHeader(sendBuf[5:], bc.headerMask, false)
+	// Предвычисляем обфусцированные SID и Type (не меняются между пакетами)
+	var obfSID [4]byte
+	binary.BigEndian.PutUint32(obfSID[:], bc.sessionID)
+	obfSID[0] ^= bc.headerMask[0]
+	obfSID[1] ^= bc.headerMask[1]
+	obfSID[2] ^= bc.headerMask[2]
+	obfSID[3] ^= bc.headerMask[3]
+	obfType := byte(protocol.PacketData) ^ bc.headerMask[4]
 
 	// Горутина приёма (для drain — иначе буфер UDP переполнится)
 	stopCh := make(chan struct{})
@@ -442,9 +459,24 @@ func (bc *benchClient) runThroughputTest(duration time.Duration, pktSize int, cl
 		bc.sendCounter++
 		wireCtr := uint32(bc.sendCounter)
 
-		// Counter на wire
+		// Вычисляем padding (math/rand — без syscall)
+		curPadLen := protocol.ComputeDataPadLen(pktSize)
+		paddedLen := pktSize + curPadLen + 1
+		curDataLen := 4 + 1 + 4 + paddedLen
+		curTotalLen := protocol.TLSHeaderSize + curDataLen
+
+		// TLS Record Header (только длина меняется)
+		sendBuf[0] = protocol.TLSContentType
+		sendBuf[1] = protocol.TLSVersionMajor
+		sendBuf[2] = protocol.TLSVersionMinor
+		binary.BigEndian.PutUint16(sendBuf[3:5], uint16(curDataLen))
+
+		// Предвычисленные обфусцированные SID + Type
+		copy(sendBuf[5:9], obfSID[:])
+		sendBuf[9] = obfType
+
+		// Counter на wire + обфускация
 		binary.BigEndian.PutUint32(sendBuf[10:14], wireCtr)
-		// Обфускация Counter (статическая часть SID+Type уже обфусцирована)
 		sendBuf[10] ^= bc.headerMask[5]
 		sendBuf[11] ^= bc.headerMask[6]
 		sendBuf[12] ^= bc.headerMask[7]
@@ -455,7 +487,7 @@ func (bc *benchClient) runThroughputTest(duration time.Duration, pktSize int, cl
 		copy(nonce[0:4], bc.noncePrefix[:])
 		binary.BigEndian.PutUint64(nonce[4:12], uint64(wireCtr))
 
-		// Plain ChaCha20 XOR
+		// Plain ChaCha20 XOR: шифруем plaintext + padding единым вызовом
 		c, err := chacha20.NewUnauthenticatedCipher(bc.keys.SendKey[:], nonce[:])
 		if err != nil {
 			result.sendErrors++
@@ -463,8 +495,16 @@ func (bc *benchClient) runThroughputTest(duration time.Duration, pktSize int, cl
 		}
 		c.XORKeyStream(sendBuf[14:14+pktSize], plaintext)
 
+		// Padding: byte(padLen) уже в буфере, обнуляем только padding area
+		sendBuf[14+pktSize+curPadLen] = byte(curPadLen)
+		// Нули для padding (перезаписываем только нужную область)
+		for i := 0; i < curPadLen; i++ {
+			sendBuf[14+pktSize+i] = 0
+		}
+		c.XORKeyStream(sendBuf[14+pktSize:14+paddedLen], sendBuf[14+pktSize:14+paddedLen])
+
 		bc.conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
-		if _, err := bc.conn.Write(sendBuf); err != nil {
+		if _, err := bc.conn.Write(sendBuf[:curTotalLen]); err != nil {
 			result.sendErrors++
 			continue
 		}
@@ -475,14 +515,15 @@ func (bc *benchClient) runThroughputTest(duration time.Duration, pktSize int, cl
 	return result
 }
 
-// buildDataPacket создаёт data-пакет с plain ChaCha20 XOR.
-// Формат: TLS(5) + SID(4) + Type(1) + Counter(4) + Ciphertext
+// buildDataPacket создаёт data-пакет с plain ChaCha20 XOR и padding.
+// Формат: TLS(5) + SID(4) + Type(1) + Counter(4) + Ciphertext(plaintext + padding + padLen)
 func (bc *benchClient) buildDataPacket(plaintext []byte) ([]byte, error) {
 	bc.sendCounter++
 	wireCtr := uint32(bc.sendCounter)
 
-	ciphertextLen := len(plaintext) // plain XOR, без auth tag
-	dataLen := 4 + 1 + 4 + ciphertextLen
+	padLen := protocol.ComputeDataPadLen(len(plaintext))
+	paddedLen := len(plaintext) + padLen + 1 // +1 для байта padLen
+	dataLen := 4 + 1 + 4 + paddedLen
 	totalLen := protocol.TLSHeaderSize + dataLen
 
 	buf := make([]byte, totalLen)
@@ -510,31 +551,40 @@ func (bc *benchClient) buildDataPacket(plaintext []byte) ([]byte, error) {
 	copy(nonce[0:4], bc.noncePrefix[:])
 	binary.BigEndian.PutUint64(nonce[4:12], uint64(wireCtr))
 
-	// Plain ChaCha20 XOR
+	// Plain ChaCha20 XOR: шифруем plaintext
 	c, err := chacha20.NewUnauthenticatedCipher(bc.keys.SendKey[:], nonce[:])
 	if err != nil {
 		return nil, fmt.Errorf("chacha20 init: %w", err)
 	}
 	c.XORKeyStream(buf[14:14+len(plaintext)], plaintext)
 
+	// Padding: нули + padLen byte, продолжаем keystream
+	for i := 0; i < padLen; i++ {
+		buf[14+len(plaintext)+i] = 0
+	}
+	buf[14+len(plaintext)+padLen] = byte(padLen)
+	c.XORKeyStream(buf[14+len(plaintext):14+paddedLen], buf[14+len(plaintext):14+paddedLen])
+
 	return buf, nil
 }
 
-// disconnect отправляет пакет отключения серверу.
+// disconnect отправляет пакет отключения серверу с padding.
 func (bc *benchClient) disconnect() {
-	// Lightweight disconnect: TLS(5) + SID(4) + Type(1) = 10 bytes
-	var buf [10]byte
+	padLen := protocol.RandomPadLen(protocol.KeepalivePadMin, protocol.KeepalivePadMax)
+	var buf [protocol.TLSHeaderSize + 5 + protocol.KeepalivePadMax]byte
 	buf[0] = protocol.TLSContentType
 	buf[1] = protocol.TLSVersionMajor
 	buf[2] = protocol.TLSVersionMinor
-	binary.BigEndian.PutUint16(buf[3:5], 5)
+	binary.BigEndian.PutUint16(buf[3:5], uint16(5+padLen))
 	binary.BigEndian.PutUint32(buf[5:9], bc.sessionID)
 	buf[9] = byte(protocol.PacketDisconnect)
+	// Случайный padding после SID+Type
+	crand.Read(buf[10 : 10+padLen])
 	// Обфускация заголовка (SID + Type)
 	protocol.ObfuscateHeader(buf[5:], bc.headerMask, false)
 
 	bc.conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
-	bc.conn.Write(buf[:])
+	bc.conn.Write(buf[:protocol.TLSHeaderSize+5+padLen])
 	bc.conn.Close()
 }
 

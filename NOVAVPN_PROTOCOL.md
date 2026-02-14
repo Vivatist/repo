@@ -39,31 +39,34 @@ NovaVPN — собственный VPN-протокол поверх **UDP** с 
 ### 2.1.1. Формат Data-пакетов (0x10)
 
 ```
-┌─────────────────────────────┬───────────┬──────┬─────────┬────────────────────┐
-│    TLS Record Header (5B)   │ SessionID │ Type │ Counter │ ChaCha20 XOR data  │
-│ 0x17 0x03 0x03 [len: 2B]   │    4B     │  1B  │   4B    │     IP packet      │
-└─────────────────────────────┴───────────┴──────┴─────────┴────────────────────┘
+┌─────────────────────────────┬───────────┬──────┬─────────┬────────────────────┬─────────────────────┬────────┐
+│    TLS Record Header (5B)   │ SessionID │ Type │ Counter │ ChaCha20 XOR data  │ ChaCha20 XOR padding│ PadLen │
+│ 0x17 0x03 0x03 [len: 2B]   │    4B     │  1B  │   4B    │     IP packet      │    zeros → random   │  1B    │
+└─────────────────────────────┴───────────┴──────┴─────────┴────────────────────┴─────────────────────┴────────┘
 ```
 
 - **Counter** (4 байта): младшие 4 байта атомарного счётчика пакетов (Big-Endian uint32)
 - **Nonce** восстанавливается: `HMAC(key, "nova-nonce-prefix")[:4] + BE_uint64(counter)` = 12 байт
 - **Шифрование**: plain ChaCha20 XOR (без Poly1305, без auth tag)
-- **Data overhead**: TLS(5) + SID(4) + Type(1) + Counter(4) = **14 байт**
+- **Padding**: нулевые байты + 1 байт padLen, зашифрованные продолжением того же ChaCha20 keystream. Нули → сырой keystream (выглядит случайно на wire). Последний байт после расшифровки = padLen → получатель обрезает `padLen + 1` байт с конца.
+- **padLen**: `DataPadAlign - (plaintextLen % DataPadAlign) + random(0, DataPadRandomMax)`, cap 255
+- **Data overhead**: TLS(5) + SID(4) + Type(1) + Counter(4) + Padding(1-97) = **15-111 байт**
 
 ### 2.1.2. Формат Keepalive/Disconnect-пакетов (0x20, 0x30)
 
-Lightweight-формат без nonce и payload:
+Lightweight-формат с random padding:
 
 ```
-┌─────────────────────────────┬───────────┬──────┐
-│    TLS Record Header (5B)   │ SessionID │ Type │
-│ 0x17 0x03 0x03 [len: 2B]   │    4B     │  1B  │
-└─────────────────────────────┴───────────┴──────┘
+┌─────────────────────────────┬───────────┬──────┬──────────────────┐
+│    TLS Record Header (5B)   │ SessionID │ Type │  Random Padding  │
+│ 0x17 0x03 0x03 [len: 2B]   │    4B     │  1B  │   40-150 bytes   │
+└─────────────────────────────┴───────────┴──────┴──────────────────┘
 ```
 
-- **Общий размер**: 10 байт, zero-alloc
+- **Общий размер**: 50-160 байт (TLS(5) + SID(4) + Type(1) + Padding(40-150))
+- **Padding**: случайные байты (`crypto/rand`), получатель игнорирует всё после SID+Type
 - **Nonce/Payload**: отсутствуют (не нужны — keepalive/disconnect не несут данных)
-- len в TLS header = 5 (SID + Type)
+- len в TLS header = 5 + padLen
 
 ### 2.2. TLS Record Header (5 байт)
 
@@ -121,10 +124,10 @@ raw[5:9] ^= header_mask[5:9]   // Counter (только для data-пакето
 
 | Тип | Смещение 5+ | Описание |
 |-----|-------------|----------|
-| Handshake (0x01-0x03) | 5-16: Nonce(12B), 17+: Payload | AEAD-шифрованные данные |
-| Data (0x10) | 5-8: Counter(4B), 9+: Ciphertext | Plain ChaCha20 XOR |
-| Keepalive (0x20) | — | Нет дополнительных полей |
-| Disconnect (0x30) | — | Нет дополнительных полей |
+| Handshake (0x01-0x03) | 5-16: Nonce(12B), 17+: Payload + Padding(100-400B) | AEAD-шифрованные данные + random padding |
+| Data (0x10) | 5-8: Counter(4B), 9+: Ciphertext + EncPadding | Plain ChaCha20 XOR с padding внутри |
+| Keepalive (0x20) | 5+: Random Padding(40-150B) | Случайные байты, игнорируются |
+| Disconnect (0x30) | 5+: Random Padding(40-150B) | Случайные байты, игнорируются |
 
 ### 2.4. Типы пакетов
 
@@ -153,8 +156,49 @@ raw[5:9] ^= header_mask[5:9]   // Counter (только для data-пакето
 | DataCounterSize | 4 | Counter в data-пакетах |
 | HandshakeHeaderSize | 22 | TLS(5) + SessionID(4) + Type(1) + Nonce(12) |
 | DataOverhead | 14 | TLS(5) + SessionID(4) + Type(1) + Counter(4) |
-| MinPacketSize | 10 | TLS(5) + SessionID(4) + Type(1) — keepalive/disconnect |
+| MinPacketSize | 10 | TLS(5) + SessionID(4) + Type(1) — минимум (без padding) |
 | HandshakeOverhead | 38 | TLS(5) + SessionID(4) + Type(1) + Nonce(12) + AuthTag(16) |
+| KeepalivePadMin | 40 | Минимальный padding для keepalive/disconnect |
+| KeepalivePadMax | 150 | Максимальный padding для keepalive/disconnect |
+| DataPadAlign | 64 | Выравнивание data-пакетов (маскировка размера) |
+| DataPadRandomMax | 32 | Случайная добавка к padding data-пакетов |
+| HandshakePadMin | 100 | Минимальный padding для handshake |
+| HandshakePadMax | 400 | Максимальный padding для handshake |
+
+### 2.6. Padding (маскировка размеров пакетов)
+
+Все пакеты дополняются случайным padding для устранения фиксированных размеров, которые могут служить DPI-сигнатурами.
+
+#### 2.6.1. Data-пакеты (внутри шифротекста)
+
+Padding размещается **внутри** шифротекста, после полезных данных:
+
+```
+plaintext:     [IP packet] [zero padding (0-N bytes)] [padLen (1 byte)]
+               ├── ChaCha20 XOR ──────────────────────────────────────┤
+```
+
+- `padLen = DataPadAlign - (plaintextLen % DataPadAlign) + random(0, DataPadRandomMax)`, cap 255
+- Нулевые байты padding → после XOR с ChaCha20 keystream выглядят как случайные данные
+- **Отправка**: `plaintext + zeros(padLen) + byte(padLen)` → XOR единым ChaCha20 keystream
+- **Приём**: дешифруем всё → последний байт = padLen → `actualLen = totalLen - 1 - padLen`
+- Не требует `crypto/rand` в hot path (нули → raw keystream)
+
+#### 2.6.2. Keepalive/Disconnect-пакеты (после SID+Type)
+
+```
+wire: TLS(5) + SID(4) + Type(1) + random_bytes(40-150)
+```
+
+- Длина padding: `RandomPadLen(KeepalivePadMin=40, KeepalivePadMax=150)` с `crypto/rand`
+- Получатель игнорирует всё после SID+Type (определяет по PacketType)
+- TLS length field = 5 + padLen
+
+#### 2.6.3. Handshake-пакеты (внутри payload)
+
+- **HandshakeInit**: random bytes (100-400) после маршализованного payload. `UnmarshalHandshakeInit` использует `credsLen` и игнорирует лишние.
+- **HandshakeResp**: random bytes (100-400) добавлены к `respData` **до** AEAD-шифрования. После расшифровки `UnmarshalHandshakeResp` читает фиксированные смещения и игнорирует хвост.
+- **HandshakeComplete**: random bytes (100-400) добавлены к `completePayload` **до** AEAD-шифрования. После расшифровки `UnmarshalHandshakeComplete` читает первые 32 байта.
 
 ---
 

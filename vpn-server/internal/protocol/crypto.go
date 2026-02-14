@@ -11,9 +11,11 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io"
+	mathrand "math/rand/v2"
 
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
@@ -213,4 +215,54 @@ func ZeroKey(key *[KeySize]byte) {
 	for i := range key {
 		key[i] = 0
 	}
+}
+
+// --- Padding (Этап 2 маскировки) ---
+
+const (
+	// KeepalivePadMin — минимальный padding для keepalive/disconnect (байт)
+	KeepalivePadMin = 40
+	// KeepalivePadMax — максимальный padding для keepalive/disconnect (байт)
+	KeepalivePadMax = 150
+	// DataPadAlign — выравнивание data-пакетов (байт)
+	DataPadAlign = 64
+	// DataPadRandomMax — максимальный случайный добавочный padding для data (байт)
+	DataPadRandomMax = 32
+	// HandshakePadMin — минимальный padding для handshake-пакетов (байт)
+	HandshakePadMin = 100
+	// HandshakePadMax — максимальный padding для handshake-пакетов (байт)
+	HandshakePadMax = 400
+)
+
+// RandomPadLen возвращает случайную длину padding в диапазоне [min, max].
+func RandomPadLen(min, max int) int {
+	if max <= min {
+		return min
+	}
+	var b [2]byte
+	_, _ = rand.Read(b[:])
+	return min + int(binary.BigEndian.Uint16(b[:]))%(max-min+1)
+}
+
+// ComputeDataPadLen вычисляет длину padding для data-пакета.
+// Выравнивает paddedPlaintext (plaintext + padding + 1 byte padLen) до DataPadAlign + random(0, DataPadRandomMax).
+// Возвращает padLen (0-255). PadLen=0 означает, что добавляется только 1 байт padLen.
+func ComputeDataPadLen(plaintextLen int) int {
+	// Минимальный paddedPlaintext: plaintext + 1 byte (padLen)
+	minPadded := plaintextLen + 1
+	// Выравнивание до DataPadAlign
+	alignedTarget := ((minPadded + DataPadAlign - 1) / DataPadAlign) * DataPadAlign
+	padLen := alignedTarget - minPadded
+
+	// Добавляем случайное количество байт (0..DataPadRandomMax).
+	// math/rand — достаточно для длины padding (не security-critical),
+	// auto-seeded от crypto/rand. Без syscall — критично для hot path.
+	extra := mathrand.IntN(DataPadRandomMax + 1) // 0..32
+	padLen += extra
+
+	// Ограничиваем размер (padLen хранится в 1 байте)
+	if padLen > 255 {
+		padLen = 255
+	}
+	return padLen
 }
