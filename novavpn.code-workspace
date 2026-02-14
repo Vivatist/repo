@@ -30,7 +30,8 @@
             ".\\bench.ps1": true,
             ".\\deploy.ps1": true,
             "gopls": true,
-            ".\\bench-gro.ps1": true
+            ".\\bench-gro.ps1": true,
+            ".\\bench-stress.ps1": true
         }
     }
 }

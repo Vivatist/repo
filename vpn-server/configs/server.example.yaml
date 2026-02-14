@@ -7,7 +7,7 @@ listen_addr: "0.0.0.0"
 listen_port: 443  # HTTPS порт для маскировки под TLS/QUIC трафик
 
 # VPN подсеть и IP сервера
-vpn_subnet: "10.8.0.0/24"
+vpn_subnet: "10.8.0.0/16"
 server_vpn_ip: "10.8.0.1"
 
 # TUN-интерфейс
@@ -26,7 +26,7 @@ pre_shared_key: "ЗАМЕНИТЕ_НА_СГЕНЕРИРОВАННЫЙ_КЛЮЧ_6
 users_file: "/etc/novavpn/users.yaml"
 
 # Лимиты
-max_clients: 256
+max_clients: 65534
 keepalive_interval: 25
 session_timeout: 120
 

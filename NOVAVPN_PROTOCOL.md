@@ -596,7 +596,7 @@ Lightweight-формат: **10 байт**, аналогичен keepalive.
 ```
 
 Где:
-- `vpnGateway` = первый IP подсети (напр. `10.8.0.1` для `10.8.0.0/24`)
+- `vpnGateway` = первый IP подсети (напр. `10.8.0.1` для `10.8.0.0/16`)
 - `physicalGateway` = гейтвей физического адаптера
 
 ### 9.3. DNS
@@ -618,14 +618,14 @@ Lightweight-формат: **10 байт**, аналогичен keepalive.
 ```yaml
 listen_addr: "0.0.0.0"
 listen_port: 443
-vpn_subnet: "10.8.0.0/24"
+vpn_subnet: "10.8.0.0/16"
 server_vpn_ip: "10.8.0.1"
 tun_name: "nova0"
 mtu: 1380
 dns: ["1.1.1.1", "8.8.8.8"]
 pre_shared_key: "<64 hex chars>"
 users_file: "/etc/novavpn/users.yaml"
-max_clients: 256
+max_clients: 65534
 keepalive_interval: 25
 session_timeout: 120
 enable_nat: true

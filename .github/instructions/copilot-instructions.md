@@ -173,12 +173,13 @@ config/            — ServerConfig (YAML)
 | Handshake latency | min / avg / p50 / p95 / p99 / max — время полного 1-RTT рукопожатия |
 | RTT (keepalive) | min / avg / p50 / p95 / p99 / max — round-trip time keepalive пакетов |
 | Throughput | пакетов/сек, Мбит/с |
-| Потери | % отправленных vs полученных пакетов |
+| Потери | % потерь keepalive пакетов (request-response) |
+| Макс. клиентов | stress-режим: ступенчатое наращивание до деградации |
 | Ошибки | handshake failures, send errors, recv timeouts |
 
 ### 9.2. Как запускать
 
-Бенчмарк — полноценный VPN-клиент без TUN. Выполняет настоящий handshake (ECDH, Argon2id аутентификация) и обмен данными. Два режима: `rtt` (keepalive ping-pong) и `throughput` (data flood). Рекомендуется запускать **на самом сервере** (localhost) для исключения сетевых артефактов.
+Бенчмарк — полноценный VPN-клиент без TUN. Выполняет настоящий handshake (ECDH, Argon2id аутентификация) и обмен данными. Три режима: `rtt` (keepalive ping-pong), `throughput` (data flood), `stress` (ступенчатое наращивание клиентов). Рекомендуется запускать **на самом сервере** (localhost) для исключения сетевых артефактов.
 
 **Ручной запуск на сервере:**
 
@@ -197,6 +198,12 @@ GOOS=linux GOARCH=amd64 go build -o vpnbench ./cmd/vpnbench/
   -email test@novavpn.app -password NovaVPN2026! \
   -clients 1 -duration 15s \
   -mode throughput -json результат.json
+
+# Stress (ступенчатое наращивание клиентов)
+./vpnbench -server 127.0.0.1:443 -psk <hex64> \
+  -email test@novavpn.app -password NovaVPN2026! \
+  -mode stress -stress-start 10 -stress-step 25 -stress-max 500 \
+  -stress-step-duration 15s -json результат.json
 ```
 
 **Автоматический запуск с ноутбука (bench.ps1):**
@@ -221,6 +228,16 @@ GOOS=linux GOARCH=amd64 go build -o vpnbench ./cmd/vpnbench/
 ```powershell
 .\bench-gro.ps1
 .\bench-gro.ps1 -duration 30s
+```
+
+**Stress-тест (bench-stress.ps1):**
+
+Скрипт `vpn-server/deploy/bench-stress.ps1` ступенчато наращивает клиентов, каждый генерирует реалистичный трафик (keepalive + data burst). Останавливается при деградации. Результат: «сервер стабильно тянет N клиентов».
+
+```powershell
+.\bench-stress.ps1                              # По умолчанию: 10→200, шаг 25
+.\.bench-stress.ps1 -maxClients 500 -step 10      # Расширенный тест
+.\bench-stress.ps1 -stepDuration 30s            # Более длительные ступени
 ```
 
 ### 9.3. Когда прогонять

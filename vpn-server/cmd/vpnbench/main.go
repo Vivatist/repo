@@ -36,8 +36,16 @@ func main() {
 	pktSize := flag.Int("pktsize", 1000, "Размер data-пакета (plaintext, байт)")
 	interval := flag.Duration("interval", 100*time.Millisecond, "Интервал между ping-пакетами на клиента")
 	timeout := flag.Duration("timeout", 30*time.Second, "Таймаут handshake")
-	mode := flag.String("mode", "rtt", "Режим: rtt (keepalive RTT) или throughput (data flood)")
+	mode := flag.String("mode", "rtt", "Режим: rtt | throughput | stress")
 	jsonOutput := flag.String("json", "", "Путь для JSON-отчёта (пусто = только консоль)")
+
+	// Stress-специфичные параметры
+	stressStart := flag.Int("stress-start", 10, "Stress: начальное число клиентов")
+	stressStep := flag.Int("stress-step", 25, "Stress: шаг увеличения клиентов")
+	stressMax := flag.Int("stress-max", 200, "Stress: потолок клиентов")
+	stressStepDur := flag.Duration("stress-step-duration", 15*time.Second, "Stress: длительность каждой ступени")
+	stressBurstInterval := flag.Duration("stress-burst-interval", 300*time.Millisecond, "Stress: интервал между burst'ами")
+	stressBurstSize := flag.Int("stress-burst-size", 5, "Stress: пакетов в burst'е")
 	flag.Parse()
 
 	if *serverAddr == "" || *email == "" || *password == "" {
@@ -49,9 +57,39 @@ func main() {
 
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 
-	if *mode != "rtt" && *mode != "throughput" {
-		fmt.Println("[ОШИБКА] -mode должен быть 'rtt' или 'throughput'")
+	if *mode != "rtt" && *mode != "throughput" && *mode != "stress" {
+		fmt.Println("[ОШИБКА] -mode должен быть 'rtt', 'throughput' или 'stress'")
 		os.Exit(1)
+	}
+
+	// Stress режим — отдельный путь
+	if *mode == "stress" {
+		stressCfg := &StressConfig{
+			ServerAddr:       *serverAddr,
+			PSKHex:           *pskHex,
+			Email:            *email,
+			Password:         *password,
+			HandshakeTimeout: *timeout,
+			PacketSize:       *pktSize,
+			StartClients:     *stressStart,
+			StepSize:         *stressStep,
+			MaxClients:       *stressMax,
+			StepDuration:     *stressStepDur,
+			BurstInterval:    *stressBurstInterval,
+			BurstSize:        *stressBurstSize,
+		}
+
+		stressReport := runStressBenchmark(stressCfg)
+		printStressReport(stressReport)
+
+		if *jsonOutput != "" {
+			if err := saveStressJSONReport(stressReport, *jsonOutput); err != nil {
+				log.Printf("[ОШИБКА] Не удалось сохранить JSON: %v", err)
+			} else {
+				log.Printf("[OK] JSON-отчёт сохранён: %s", *jsonOutput)
+			}
+		}
+		return
 	}
 
 	cfg := &BenchConfig{

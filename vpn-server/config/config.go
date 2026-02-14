@@ -14,7 +14,7 @@ type ServerConfig struct {
 	ListenAddr string `yaml:"listen_addr"`
 	ListenPort int    `yaml:"listen_port"`
 
-	// Подсеть VPN (например, 10.8.0.0/24)
+	// Подсеть VPN (например, 10.8.0.0/16)
 	VPNSubnet string `yaml:"vpn_subnet"`
 
 	// IP-адрес сервера внутри VPN-подсети
@@ -68,14 +68,14 @@ func DefaultConfig() *ServerConfig {
 	return &ServerConfig{
 		ListenAddr:            "0.0.0.0",
 		ListenPort:            443,
-		VPNSubnet:             "10.8.0.0/24",
+		VPNSubnet:             "10.8.0.0/16",
 		ServerVPNIP:           "10.8.0.1",
 		TunName:               "nova0",
 		MTU:                   1380,
 		DNS:                   []string{"1.1.1.1", "8.8.8.8"},
 		PreSharedKey:          "",
 		UsersFile:             "/etc/novavpn/users.yaml",
-		MaxClients:            256,
+		MaxClients:            65534,
 		KeepaliveInterval:     25,
 		SessionTimeout:        120,
 		EnableNAT:             true,
