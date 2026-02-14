@@ -43,6 +43,9 @@ const (
 
 	// HeaderSize — размер заголовка handshake-пакетов
 	HeaderSize = TLSHeaderSize + SessionIDSize + PacketTypeSize + NonceSize
+
+	// HeaderMaskSize — размер маски обфускации заголовка: SID(4) + Type(1) + Counter(4) = 9 байт
+	HeaderMaskSize = 9
 )
 
 type PacketType uint8

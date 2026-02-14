@@ -27,6 +27,9 @@ type benchClient struct {
 	noncePrefix     [4]byte
 	recvNoncePrefix [4]byte
 	sendCounter     uint64
+
+	// Маска обфускации заголовков (из PSK)
+	headerMask [protocol.HeaderMaskSize]byte
 }
 
 // newBenchClient подключается к серверу, выполняет handshake и возвращает готового клиента.
@@ -69,6 +72,9 @@ func (bc *benchClient) doHandshake(cfg *BenchConfig) error {
 		psk = decoded
 	}
 
+	// Вычисляем маску обфускации заголовков из PSK
+	bc.headerMask = protocol.DeriveHeaderMask(psk)
+
 	// 1. Генерируем ephemeral ключевую пару клиента
 	clientKP, err := protocol.GenerateKeyPair()
 	if err != nil {
@@ -109,6 +115,9 @@ func (bc *benchClient) doHandshake(cfg *BenchConfig) error {
 		return fmt.Errorf("marshal init: %w", err)
 	}
 
+	// Обфускация заголовка (SID + Type)
+	protocol.ObfuscateHeader(initBytes[protocol.TLSHeaderSize:], bc.headerMask, false)
+
 	// 5. Отправляем
 	bc.conn.SetWriteDeadline(time.Now().Add(cfg.HandshakeTimeout))
 	if _, err := bc.conn.Write(initBytes); err != nil {
@@ -123,6 +132,11 @@ func (bc *benchClient) doHandshake(cfg *BenchConfig) error {
 		return fmt.Errorf("recv resp: %w", err)
 	}
 	respBuf = respBuf[:n]
+
+	// Деобфускация заголовка перед Unmarshal
+	if n >= protocol.TLSHeaderSize+5 && respBuf[0] == protocol.TLSContentType {
+		protocol.ObfuscateHeader(respBuf[protocol.TLSHeaderSize:], bc.headerMask, false)
+	}
 
 	// 7. Парсим пакет
 	respPkt, err := protocol.Unmarshal(respBuf)
@@ -173,6 +187,10 @@ func (bc *benchClient) doHandshake(cfg *BenchConfig) error {
 
 	// Если получили PSK (bootstrap) — запоминаем (в реальном клиенте сохранили бы)
 	if len(hsResp.PSK) == 32 {
+		// Обновляем маску обфускации при bootstrap (сервер использует маску из настоящего PSK)
+		var newPSK [protocol.KeySize]byte
+		copy(newPSK[:], hsResp.PSK)
+		bc.headerMask = protocol.DeriveHeaderMask(newPSK)
 		log.Printf("[BENCH] Получен PSK через bootstrap")
 	}
 
@@ -198,6 +216,9 @@ func (bc *benchClient) doHandshake(cfg *BenchConfig) error {
 	if err != nil {
 		return fmt.Errorf("marshal complete: %w", err)
 	}
+
+	// Обфускация заголовка (SID + Type)
+	protocol.ObfuscateHeader(completeBytes[protocol.TLSHeaderSize:], bc.headerMask, false)
 
 	bc.conn.SetWriteDeadline(time.Now().Add(cfg.HandshakeTimeout))
 	if _, err := bc.conn.Write(completeBytes); err != nil {
@@ -291,6 +312,9 @@ func (bc *benchClient) runDataExchange(duration time.Duration, pktSize int, inte
 				continue
 			}
 
+			// Деобфускация заголовка (SID + Type)
+			protocol.ObfuscateHeader(raw, bc.headerMask, false)
+
 			pktType := protocol.PacketType(raw[4])
 
 			switch pktType {
@@ -337,6 +361,8 @@ func (bc *benchClient) buildKeepalive() ([]byte, error) {
 	binary.BigEndian.PutUint16(buf[3:5], 5) // длина TLS payload = 5 (SID+Type)
 	binary.BigEndian.PutUint32(buf[5:9], bc.sessionID)
 	buf[9] = byte(protocol.PacketKeepalive)
+	// Обфускация заголовка (SID + Type)
+	protocol.ObfuscateHeader(buf[5:], bc.headerMask, false)
 
 	return buf[:], nil
 }
@@ -384,6 +410,8 @@ func (bc *benchClient) runThroughputTest(duration time.Duration, pktSize int, cl
 	binary.BigEndian.PutUint16(sendBuf[3:5], uint16(dataLen))
 	binary.BigEndian.PutUint32(sendBuf[5:9], bc.sessionID)
 	sendBuf[9] = byte(protocol.PacketData)
+	// Обфускация статической части заголовка (SID + Type)
+	protocol.ObfuscateHeader(sendBuf[5:], bc.headerMask, false)
 
 	// Горутина приёма (для drain — иначе буфер UDP переполнится)
 	stopCh := make(chan struct{})
@@ -416,6 +444,11 @@ func (bc *benchClient) runThroughputTest(duration time.Duration, pktSize int, cl
 
 		// Counter на wire
 		binary.BigEndian.PutUint32(sendBuf[10:14], wireCtr)
+		// Обфускация Counter (статическая часть SID+Type уже обфусцирована)
+		sendBuf[10] ^= bc.headerMask[5]
+		sendBuf[11] ^= bc.headerMask[6]
+		sendBuf[12] ^= bc.headerMask[7]
+		sendBuf[13] ^= bc.headerMask[8]
 
 		// Nonce: prefix(4) + uint64(counter)(8)
 		var nonce [protocol.NonceSize]byte
@@ -469,6 +502,9 @@ func (bc *benchClient) buildDataPacket(plaintext []byte) ([]byte, error) {
 	// Counter (4 bytes on wire)
 	binary.BigEndian.PutUint32(buf[10:14], wireCtr)
 
+	// Обфускация заголовка (SID + Type + Counter)
+	protocol.ObfuscateHeader(buf[5:], bc.headerMask, true)
+
 	// Full nonce: prefix(4) + uint64(counter)(8)
 	var nonce [protocol.NonceSize]byte
 	copy(nonce[0:4], bc.noncePrefix[:])
@@ -494,6 +530,8 @@ func (bc *benchClient) disconnect() {
 	binary.BigEndian.PutUint16(buf[3:5], 5)
 	binary.BigEndian.PutUint32(buf[5:9], bc.sessionID)
 	buf[9] = byte(protocol.PacketDisconnect)
+	// Обфускация заголовка (SID + Type)
+	protocol.ObfuscateHeader(buf[5:], bc.headerMask, false)
 
 	bc.conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
 	bc.conn.Write(buf[:])

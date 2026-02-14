@@ -15,6 +15,24 @@ import (
 // handlePacket обрабатывает входящий пакет (только handshake — вызывается из горутины).
 // Data/Keepalive/Disconnect обрабатываются inline в udpReadLoop.
 func (s *VPNServer) handlePacket(data []byte, remoteAddr *net.UDPAddr) {
+	// Деобфускация заголовка перед Unmarshal.
+	// data — копия (выделена в processUDPPacket), модификация in-place безопасна.
+	// Пробуем серверную маску, при несовпадении — нулевую (bootstrap HandshakeInit).
+	if len(data) >= protocol.TLSHeaderSize+5 {
+		off := 0
+		if data[0] == protocol.TLSContentType {
+			off = protocol.TLSHeaderSize
+		}
+		// Деобфускация SID + Type (5 байт)
+		protocol.ObfuscateHeader(data[off:], s.headerMask, false)
+		pktType := protocol.PacketType(data[off+4])
+		if !isValidPacketType(pktType) {
+			// Откатываем серверную маску и пробуем нулевую
+			protocol.ObfuscateHeader(data[off:], s.headerMask, false)
+			protocol.ObfuscateHeader(data[off:], s.zeroHeaderMask, false)
+		}
+	}
+
 	pkt, err := protocol.Unmarshal(data)
 	if err != nil {
 		if s.cfg.LogLevel == "debug" {
@@ -46,7 +64,7 @@ func (s *VPNServer) handleHandshakeInit(pkt *protocol.Packet, remoteAddr *net.UD
 		defer func() { <-s.handshakeSem }()
 	case <-handshakeTimeout.C:
 		log.Printf("[HANDSHAKE] Таймаут очереди handshake (15с), отклоняем %s", remoteAddr)
-		s.sendErrorPacket(remoteAddr, 0, "server_busy")
+		// Молчаливый drop (не отправляем Error-пакет, чтобы не создавать DPI-сигнатуру)
 		return
 	}
 
@@ -112,7 +130,7 @@ func (s *VPNServer) handleHandshakeInit(pkt *protocol.Packet, remoteAddr *net.UD
 	user, err := s.userStore.Authenticate(email, password)
 	if err != nil {
 		log.Printf("[HANDSHAKE] Аутентификация неудачна для '%s' от %s: %v", email, remoteAddr, err)
-		s.sendErrorPacket(remoteAddr, 0, "auth_failed")
+		// Молчаливый drop (не отправляем Error-пакет, чтобы не создавать DPI-сигнатуру)
 		return
 	}
 
@@ -237,6 +255,14 @@ func (s *VPNServer) handleHandshakeInit(pkt *protocol.Packet, remoteAddr *net.UD
 		return
 	}
 
+	// Обфускация заголовка (SID + Type) в исходящем HandshakeResp.
+	// При bootstrap используем нулевую маску (клиент ещё не знает серверный PSK).
+	respMask := s.headerMask
+	if isBootstrap {
+		respMask = s.zeroHeaderMask
+	}
+	protocol.ObfuscateHeader(respBytes[protocol.TLSHeaderSize:], respMask, false)
+
 	// Отправляем
 	if _, err := s.udpConn.WriteToUDP(respBytes, remoteAddr); err != nil {
 		log.Printf("[HANDSHAKE] Ошибка отправки ответа: %v", err)
@@ -248,6 +274,9 @@ func (s *VPNServer) handleHandshakeInit(pkt *protocol.Packet, remoteAddr *net.UD
 	// Клиент может слать данные сразу после получения Resp.
 	session.SetState(SessionStateActive)
 	session.UpdateActivity()
+
+	// Устанавливаем маску обфускации для исходящих data-пакетов
+	session.headerMask = s.headerMask
 
 	log.Printf("[HANDSHAKE] Отправлен HandshakeResp сессии #%d для %s (VPN IP: %s), сессия активна",
 		session.ID, remoteAddr, session.AssignedIP)
@@ -323,22 +352,17 @@ func (s *VPNServer) sendKeepalives() {
 	kaBuf[1] = protocol.TLSVersionMajor
 	kaBuf[2] = protocol.TLSVersionMinor
 	binary.BigEndian.PutUint16(kaBuf[3:5], 5)
-	kaBuf[9] = byte(protocol.PacketKeepalive)
 	for _, session := range sessions {
 		if session.IsActive() {
 			binary.BigEndian.PutUint32(kaBuf[5:9], session.ID)
+			kaBuf[9] = byte(protocol.PacketKeepalive)
+			// Обфускация заголовка (SID + Type)
+			protocol.ObfuscateHeader(kaBuf[5:], s.headerMask, false)
 			s.udpConn.WriteToUDP(kaBuf[:], session.ClientAddr)
 		}
 	}
 }
 
-// sendErrorPacket отправляет пакет ошибки клиенту.
-func (s *VPNServer) sendErrorPacket(addr *net.UDPAddr, sessionID uint32, message string) {
-	payload := []byte(message)
-	pkt := protocol.NewPacket(protocol.PacketError, sessionID, 0, [protocol.NonceSize]byte{}, payload)
-	data, err := pkt.Marshal()
-	if err != nil {
-		return
-	}
-	s.udpConn.WriteToUDP(data, addr)
-}
+// sendErrorPacket удалён: молчаливый drop вместо отправки открытого текста ошибки (Этап 1.3 маскировки).
+// Error-пакеты содержали открытый ASCII ("auth_failed", "server_busy") —
+// абсолютный fingerprint для DPI. Клиент обрабатывает таймауты.

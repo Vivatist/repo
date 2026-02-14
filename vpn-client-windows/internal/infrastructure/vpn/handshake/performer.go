@@ -30,23 +30,25 @@ type Result struct {
 
 // Performer выполняет рукопожатие с сервером.
 type Performer struct {
-	conn     *net.UDPConn
-	keyEx    domaincrypto.KeyExchange
-	psk      []byte
-	email    string
-	password string
-	onNewPSK func(pskHex string)
+	conn       *net.UDPConn
+	keyEx      domaincrypto.KeyExchange
+	psk        []byte
+	email      string
+	password   string
+	onNewPSK   func(pskHex string)
+	headerMask [infracrypto.HeaderMaskSize]byte // маска обфускации заголовков
 }
 
 // NewPerformer создаёт новый объект для выполнения рукопожатия.
 func NewPerformer(conn *net.UDPConn, psk []byte, email, password string, onNewPSK func(string)) *Performer {
 	return &Performer{
-		conn:     conn,
-		keyEx:    infracrypto.NewCurve25519KeyExchange(),
-		psk:      psk,
-		email:    email,
-		password: password,
-		onNewPSK: onNewPSK,
+		conn:       conn,
+		keyEx:      infracrypto.NewCurve25519KeyExchange(),
+		psk:        psk,
+		email:      email,
+		password:   password,
+		onNewPSK:   onNewPSK,
+		headerMask: infracrypto.DeriveHeaderMask(psk),
 	}
 }
 
@@ -137,6 +139,9 @@ func (p *Performer) sendHandshakeInit(clientPubKey []byte) error {
 		return fmt.Errorf("marshal packet: %w", err)
 	}
 
+	// Обфускация заголовка (SID + Type)
+	infracrypto.ObfuscateHeader(pktBytes[protocol.TLSHeaderSize:], p.headerMask, false)
+
 	if _, err := p.conn.Write(pktBytes); err != nil {
 		return fmt.Errorf("write packet: %w", err)
 	}
@@ -151,6 +156,11 @@ func (p *Performer) receiveHandshakeResp(clientPrivKey []byte) (*Result, error) 
 	n, err := p.conn.Read(buf)
 	if err != nil {
 		return nil, fmt.Errorf("read response: %w", err)
+	}
+
+	// Деобфускация заголовка перед Unmarshal
+	if n >= protocol.TLSHeaderSize+5 && buf[0] == protocol.TLSContentType {
+		infracrypto.ObfuscateHeader(buf[protocol.TLSHeaderSize:n], p.headerMask, false)
 	}
 
 	respPkt, err := protocol.Unmarshal(buf[:n])
@@ -267,6 +277,9 @@ func (p *Performer) sendHandshakeComplete(result *Result) error {
 	if err != nil {
 		return fmt.Errorf("marshal packet: %w", err)
 	}
+
+	// Обфускация заголовка (SID + Type)
+	infracrypto.ObfuscateHeader(completeBytes[protocol.TLSHeaderSize:], p.headerMask, false)
 
 	if _, err := p.conn.Write(completeBytes); err != nil {
 		return fmt.Errorf("write packet: %w", err)

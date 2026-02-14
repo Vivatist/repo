@@ -4,6 +4,7 @@ package server
 import (
 	"crypto/cipher"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
@@ -148,6 +149,9 @@ type Session struct {
 
 	// ClientName — имя клиента (если известно)
 	ClientName string
+
+	// headerMask — маска обфускации заголовка (SID+Type+Counter), устанавливается при handshake
+	headerMask [protocol.HeaderMaskSize]byte
 }
 
 // NewSession создаёт новую сессию.
@@ -265,6 +269,9 @@ func (s *Session) EncryptAndBuild(buf []byte, plaintext []byte) (int, error) {
 	}
 	c.XORKeyStream(buf[14:14+len(plaintext)], plaintext)
 
+	// Обфускация заголовка: SID(4) + Type(1) + Counter(4) = 9 байт
+	protocol.ObfuscateHeader(buf[5:], s.headerMask, true)
+
 	return totalLen, nil
 }
 
@@ -289,9 +296,6 @@ type SessionManager struct {
 
 	// addrToSession — карта: UDP addr -> Session (для приёма пакетов)
 	addrToSession map[string]*Session
-
-	// nextSessionID — следующий доступный ID сессии
-	nextSessionID atomic.Uint32
 
 	// ipPool — пул IP-адресов для клиентов
 	ipPool *IPPool
@@ -319,8 +323,6 @@ func NewSessionManager(vpnSubnet string, serverIP string, maxSessions int, sessi
 		sessionTimeout: sessionTimeout,
 	}
 
-	sm.nextSessionID.Store(1)
-
 	return sm, nil
 }
 
@@ -346,20 +348,35 @@ func (sm *SessionManager) CreateSession(clientAddr *net.UDPAddr) (*Session, erro
 		return nil, fmt.Errorf("не удалось выделить IP: %w", err)
 	}
 
-	sessionID := sm.nextSessionID.Add(1) - 1
-	session := NewSession(sessionID, clientAddr)
-	session.AssignedIP = assignedIP
+	// Генерируем случайный SessionID (crypto/rand) вместо инкрементального.
+	// Инкрементальный ID — утечка количества клиентов для DPI,
+	// случайный — невозможно определить порядок или количество.
+	var sessionIDBuf [4]byte
+	for {
+		if _, err := rand.Read(sessionIDBuf[:]); err != nil {
+			return nil, fmt.Errorf("ошибка генерации SessionID: %w", err)
+		}
+		sessionID := binary.BigEndian.Uint32(sessionIDBuf[:])
+		if sessionID == 0 {
+			continue // 0 зарезервирован для HandshakeInit
+		}
+		if _, exists := sm.sessions[sessionID]; exists {
+			continue // коллизия — перегенерируем
+		}
+		session := NewSession(sessionID, clientAddr)
+		session.AssignedIP = assignedIP
 
-	sm.sessions[sessionID] = session
-	key := ipToKey(assignedIP)
-	session.assignedKey = key
-	sm.ipToSession[key] = session
-	sm.addrToSession[addrKey] = session
+		sm.sessions[sessionID] = session
+		key := ipToKey(assignedIP)
+		session.assignedKey = key
+		sm.ipToSession[key] = session
+		sm.addrToSession[addrKey] = session
 
-	log.Printf("[SESSION] Создана сессия #%d для %s -> VPN IP: %s",
-		sessionID, clientAddr.String(), assignedIP.String())
+		log.Printf("[SESSION] Создана сессия #%d для %s -> VPN IP: %s",
+			sessionID, clientAddr.String(), assignedIP.String())
 
-	return session, nil
+		return session, nil
+	}
 }
 
 // GetSessionByID возвращает сессию по ID.

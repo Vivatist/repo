@@ -83,6 +83,9 @@ type NovaVPNClient struct {
 	reconnecting  atomic.Bool   // флаг: идёт переподключение
 	stopCh        chan struct{} // закрывается при Disconnect
 
+	// Маска обфускации заголовков (из текущего PSK)
+	headerMask [infracrypto.HeaderMaskSize]byte
+
 }
 
 // NewNovaVPNClient создаёт новый VPN-клиент.
@@ -135,6 +138,9 @@ func (c *NovaVPNClient) Connect(params domainvpn.ConnectParams) error {
 		log.Println("[VPN] Bootstrap mode (no PSK)")
 	}
 	c.pskBytes = append([]byte{}, psk...) // сохраняем для reconnect
+
+	// Вычисляем маску обфускации заголовков из PSK
+	c.headerMask = infracrypto.DeriveHeaderMask(psk)
 
 	// Резолвим адрес сервера
 	serverAddr, err := net.ResolveUDPAddr("udp4", params.ServerAddr)
@@ -215,6 +221,12 @@ func (c *NovaVPNClient) Connect(params domainvpn.ConnectParams) error {
 			return fmt.Errorf("create session: %w", err)
 		}
 		c.session = session
+
+		// Обновляем маску обфускации при bootstrap (сервер использует маску из настоящего PSK для data-пакетов)
+		if len(result.NewPSK) == 32 {
+			c.pskBytes = append([]byte{}, result.NewPSK...)
+			c.headerMask = infracrypto.DeriveHeaderMask(result.NewPSK)
+		}
 	}
 
 	// Запускаем циклы обработки ДО настройки сети (UDP read/keepalive работают сразу)
@@ -313,6 +325,8 @@ func (c *NovaVPNClient) Disconnect() error {
 		binary.BigEndian.PutUint16(disconnBuf[3:5], 5)
 		binary.BigEndian.PutUint32(disconnBuf[5:9], c.sessionID)
 		disconnBuf[9] = byte(protocol.PacketDisconnect)
+		// Обфускация заголовка (SID + Type)
+		infracrypto.ObfuscateHeader(disconnBuf[5:], c.headerMask, false)
 		c.conn.Write(disconnBuf[:])
 	}
 
@@ -470,6 +484,13 @@ func (c *NovaVPNClient) handleUDPPacket(data []byte) {
 		return
 	}
 
+	// Деобфускация заголовка (SID + Type)
+	raw[0] ^= c.headerMask[0]
+	raw[1] ^= c.headerMask[1]
+	raw[2] ^= c.headerMask[2]
+	raw[3] ^= c.headerMask[3]
+	raw[4] ^= c.headerMask[4]
+
 	pktType := protocol.PacketType(raw[4])
 
 	switch pktType {
@@ -478,6 +499,11 @@ func (c *NovaVPNClient) handleUDPPacket(data []byte) {
 		if len(raw) < 9 {
 			return
 		}
+		// Деобфускация Counter для data-пакетов
+		raw[5] ^= c.headerMask[5]
+		raw[6] ^= c.headerMask[6]
+		raw[7] ^= c.headerMask[7]
+		raw[8] ^= c.headerMask[8]
 		counter := binary.BigEndian.Uint32(raw[5:9])
 		payload := raw[9:]
 
@@ -579,6 +605,9 @@ func (c *NovaVPNClient) tunReadLoop() {
 
 		// Counter + Ciphertext уже на месте (sendBuf[10:10+encLen])
 
+		// Обфускация заголовка (SID + Type + Counter)
+		infracrypto.ObfuscateHeader(sendBuf[5:], c.headerMask, true)
+
 		totalLen := protocol.TLSHeaderSize + dataLen
 
 		if _, err := conn.Write(sendBuf[:totalLen]); err != nil {
@@ -633,6 +662,8 @@ func (c *NovaVPNClient) keepaliveLoop() {
 			binary.BigEndian.PutUint16(kaBuf[3:5], 5)
 			binary.BigEndian.PutUint32(kaBuf[5:9], c.sessionID)
 			kaBuf[9] = byte(protocol.PacketKeepalive)
+			// Обфускация заголовка (SID + Type)
+			infracrypto.ObfuscateHeader(kaBuf[5:], c.headerMask, false)
 			conn.Write(kaBuf[:])
 
 			// Рандомизированный интервал: 10-20 секунд — нет паттерна для DPI
@@ -653,6 +684,8 @@ func (c *NovaVPNClient) tryResume() bool {
 	binary.BigEndian.PutUint16(kaBuf[3:5], 5)
 	binary.BigEndian.PutUint32(kaBuf[5:9], c.resumeSessionID)
 	kaBuf[9] = byte(protocol.PacketKeepalive)
+	// Обфускация заголовка (SID + Type)
+	infracrypto.ObfuscateHeader(kaBuf[5:], c.headerMask, false)
 	if _, err := c.conn.Write(kaBuf[:]); err != nil {
 		log.Printf("[VPN] 0-RTT resume: ошибка отправки keepalive: %v", err)
 		return false
@@ -672,6 +705,10 @@ func (c *NovaVPNClient) tryResume() bool {
 	raw := buf[:n]
 	if len(raw) >= protocol.TLSHeaderSize && raw[0] == protocol.TLSContentType {
 		raw = raw[protocol.TLSHeaderSize:]
+	}
+	// Деобфускация заголовка (SID + Type)
+	if len(raw) >= 5 {
+		infracrypto.ObfuscateHeader(raw, c.headerMask, false)
 	}
 	if len(raw) < 5 || protocol.PacketType(raw[4]) != protocol.PacketKeepalive {
 		log.Printf("[VPN] 0-RTT resume: получен не keepalive, переход к handshake")
@@ -867,6 +904,12 @@ func (c *NovaVPNClient) reconnect() {
 				continue
 			}
 			c.session = session
+
+			// Обновляем маску обфускации при bootstrap
+			if len(result.NewPSK) == 32 {
+				c.pskBytes = append([]byte{}, result.NewPSK...)
+				c.headerMask = infracrypto.DeriveHeaderMask(result.NewPSK)
+			}
 		}
 
 		if c.stopped.Load() {

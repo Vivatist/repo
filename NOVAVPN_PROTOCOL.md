@@ -74,13 +74,47 @@ Lightweight-формат без nonce и payload:
 | 2 | 1 | `0x03` | TLS Minor Version (1.2) |
 | 3-4 | 2 | Big-Endian uint16 | Длина данных **после** этого заголовка |
 
-### 2.3. Открытые поля (после TLS Header)
+### 2.3. Обфусцированные поля (после TLS Header)
 
-Общие поля для **всех** типов пакетов:
+Поля после TLS Header **обфусцированы** XOR-маской, производной от PSK.
+
+#### 2.3.1. Вычисление маски
+
+```
+header_mask = HMAC-SHA256(PSK, "nova-header-mask")[:9]   // 9 байт
+```
+
+- Маска вычисляется **один раз** при инициализации (не на каждый пакет)
+- При bootstrap (нулевой PSK): `mask = HMAC-SHA256([0×32], "nova-header-mask")[:9]`
+
+#### 2.3.2. Применение (XOR обратим — одна операция для отправки и приёма)
+
+```
+// После TLS header (5B):
+raw[0:4] ^= header_mask[0:4]   // SessionID
+raw[4]   ^= header_mask[4]     // PacketType
+raw[5:9] ^= header_mask[5:9]   // Counter (только для data-пакетов)
+```
+
+- **Handshake, Keepalive, Disconnect**: обфускация SID + Type (5 байт)
+- **Data**: обфускация SID + Type + Counter (9 байт)
+
+#### 2.3.3. Деобфускация на сервере
+
+Сервер хранит две предвычисленные маски:
+1. `serverMask` — из настоящего PSK (для всех пакетов активных сессий)
+2. `zeroMask` — из нулевого PSK (для bootstrap HandshakeInit)
+
+Алгоритм:
+1. Пробуем `serverMask` → проверяем валидность типа пакета
+2. Если тип невалиден — откатываем и пробуем `zeroMask`
+3. Если обе маски не подошли — молчаливый drop
+
+Общие поля для **всех** типов пакетов (после деобфускации):
 
 | Смещение | Размер | Описание |
 |----------|--------|----------|
-| 0-3 | 4 | **SessionID** — идентификатор сессии (Big-Endian uint32). `0` для HandshakeInit. |
+| 0-3 | 4 | **SessionID** — идентификатор сессии (Big-Endian uint32, `crypto/rand`). `0` для HandshakeInit. |
 | 4 | 1 | **Type** — тип пакета (см. ниже) |
 
 Дополнительные поля зависят от типа:
@@ -102,7 +136,9 @@ Lightweight-формат без nonce и payload:
 | `0x10` | Data | Двунаправленный | Зашифрованный IP-пакет |
 | `0x20` | Keepalive | Двунаправленный | Поддержание сессии |
 | `0x30` | Disconnect | Двунаправленный | Завершение сессии |
-| `0xF0` | Error | Сервер → Клиент | Ошибка (auth_failed и т.д.) |
+
+> **Удалён:** тип `0xF0` (Error). Сервер больше не отправляет Error-пакеты (содержали открытый ASCII — DPI-сигнатура).
+> Вместо этого — молчаливый drop. Клиент обрабатывает таймауты.
 
 ### 2.5. Константы
 
@@ -113,6 +149,7 @@ Lightweight-формат без nonce и payload:
 | PacketTypeSize | 1 | — |
 | NonceSize | 12 | ChaCha20-Poly1305 (только handshake) |
 | AuthTagSize | 16 | ChaCha20-Poly1305 (только handshake) |
+| HeaderMaskSize | 9 | SID(4) + Type(1) + Counter(4) |
 | DataCounterSize | 4 | Counter в data-пакетах |
 | HandshakeHeaderSize | 22 | TLS(5) + SessionID(4) + Type(1) + Nonce(12) |
 | DataOverhead | 14 | TLS(5) + SessionID(4) + Type(1) + Counter(4) |
@@ -268,7 +305,7 @@ Plaintext Credentials:
 7. Определить `activePSK` (серверный PSK или нулевой — какой подошёл)
 8. Расшифровать credentials с `activePSK`
 9. Аутентифицировать email + пароль
-10. При ошибке аутентификации — отправить пакет Error (`auth_failed`)
+10. При ошибке аутентификации — молчаливый drop (без Error-пакета)
 
 ### 4.3. Шаг 2: HandshakeResp (Сервер → Клиент)
 

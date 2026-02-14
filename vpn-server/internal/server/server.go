@@ -52,6 +52,10 @@ type VPNServer struct {
 
 	// Хранилище пользователей (email + пароль)
 	userStore *auth.UserStore
+
+	// Маски обфускации заголовков (вычисляются один раз при старте)
+	headerMask     [protocol.HeaderMaskSize]byte // из серверного PSK
+	zeroHeaderMask [protocol.HeaderMaskSize]byte // из нулевого PSK (для bootstrap HandshakeInit)
 }
 
 // NewVPNServer создаёт новый VPN-сервер.
@@ -74,14 +78,21 @@ func NewVPNServer(cfg *config.ServerConfig) (*VPNServer, error) {
 	// Создаём хранилище пользователей
 	userStore := auth.NewUserStore(cfg.UsersFile)
 
+	// Вычисляем маски обфускации заголовков
+	headerMask := protocol.DeriveHeaderMask(psk)
+	var zeroPSK [protocol.KeySize]byte
+	zeroHeaderMask := protocol.DeriveHeaderMask(zeroPSK)
+
 	srv := &VPNServer{
-		cfg:          cfg,
-		psk:          psk,
-		sessions:     sessions,
-		ctx:          ctx,
-		cancel:       cancel,
-		userStore:    userStore,
-		handshakeSem: make(chan struct{}, cfg.MaxParallelHandshakes), // N параллельных Argon2id (N × 4MB RAM)
+		cfg:            cfg,
+		psk:            psk,
+		sessions:       sessions,
+		ctx:            ctx,
+		cancel:         cancel,
+		userStore:      userStore,
+		handshakeSem:   make(chan struct{}, cfg.MaxParallelHandshakes), // N параллельных Argon2id (N × 4MB RAM)
+		headerMask:     headerMask,
+		zeroHeaderMask: zeroHeaderMask,
 	}
 
 	// Загружаем пользователей
@@ -304,7 +315,7 @@ func (s *VPNServer) udpReadLoop() {
 			hsCount := 0
 			for i := 0; i < n; i++ {
 				data, _ := s.batchRecv.GetPacket(i)
-				if isHandshakePacket(data) {
+				if s.isHandshakePacket(data) {
 					// Handshake — обрабатываем немедленно (приоритет)
 					data, remoteAddr := s.batchRecv.GetPacket(i)
 					decryptBuf = s.processUDPPacket(data, remoteAddr, decryptBuf, cache)
@@ -360,8 +371,8 @@ func (s *VPNServer) udpReadLoop() {
 
 // isHandshakePacket быстро определяет, является ли пакет handshake-пакетом.
 // Inline-проверка без аллокаций: TLS header(5) + SessionID(4) + Type(1) = байт 9 (тип).
-// Используется для приоритизации handshake-пакетов в batch-обработке.
-func isHandshakePacket(data []byte) bool {
+// Деобфусцирует Type двумя масками (PSK + zero PSK) для поддержки bootstrap.
+func (s *VPNServer) isHandshakePacket(data []byte) bool {
 	if len(data) < protocol.MinPacketSize {
 		return false
 	}
@@ -372,8 +383,14 @@ func isHandshakePacket(data []byte) bool {
 	if len(raw) < 5 {
 		return false
 	}
-	pktType := protocol.PacketType(raw[4])
-	return pktType == protocol.PacketHandshakeInit || pktType == protocol.PacketHandshakeComplete
+	// Пробуем серверную маску
+	pktType := protocol.PacketType(raw[4] ^ s.headerMask[4])
+	if pktType == protocol.PacketHandshakeInit || pktType == protocol.PacketHandshakeComplete {
+		return true
+	}
+	// Пробуем нулевую маску (bootstrap HandshakeInit)
+	pktType = protocol.PacketType(raw[4] ^ s.zeroHeaderMask[4])
+	return pktType == protocol.PacketHandshakeInit
 }
 
 // processUDPPacket — обработка одного UDP-пакета (inline парсинг, дешифрование, TUN запись).
@@ -395,8 +412,20 @@ func (s *VPNServer) processUDPPacket(origData []byte, remoteAddr *net.UDPAddr, d
 		return decryptBuf
 	}
 
-	sessionID := binary.BigEndian.Uint32(raw[0:4])
-	pktType := protocol.PacketType(raw[4])
+	// Деобфускация заголовка: XOR с маской из PSK (zero-alloc, ~5нс)
+	// Пробуем серверную маску, при несовпадении — нулевую (bootstrap)
+	sessionID := binary.BigEndian.Uint32(raw[0:4]) ^ binary.BigEndian.Uint32(s.headerMask[0:4])
+	pktType := protocol.PacketType(raw[4] ^ s.headerMask[4])
+
+	// Если тип не распознан — пробуем нулевую маску (bootstrap HandshakeInit)
+	if !isValidPacketType(pktType) {
+		sessionID = binary.BigEndian.Uint32(raw[0:4]) ^ binary.BigEndian.Uint32(s.zeroHeaderMask[0:4])
+		pktType = protocol.PacketType(raw[4] ^ s.zeroHeaderMask[4])
+		if pktType != protocol.PacketHandshakeInit {
+			// Ни одна маска не подошла — мусорный пакет
+			return decryptBuf
+		}
+	}
 
 	switch pktType {
 	case protocol.PacketData:
@@ -411,7 +440,8 @@ func (s *VPNServer) processUDPPacket(origData []byte, remoteAddr *net.UDPAddr, d
 			return decryptBuf
 		}
 
-		counter := binary.BigEndian.Uint32(raw[5:9])
+		// Деобфускация counter (XOR с маской [5:9])
+		counter := binary.BigEndian.Uint32(raw[5:9]) ^ binary.BigEndian.Uint32(s.headerMask[5:9])
 		payload := raw[9:]
 
 		// Восстанавливаем полный nonce
@@ -466,6 +496,8 @@ func (s *VPNServer) processUDPPacket(origData []byte, remoteAddr *net.UDPAddr, d
 		binary.BigEndian.PutUint16(kaBuf[3:5], 5)
 		binary.BigEndian.PutUint32(kaBuf[5:9], session.ID)
 		kaBuf[9] = byte(protocol.PacketKeepalive)
+		// Обфускация заголовка (SID + Type)
+		protocol.ObfuscateHeader(kaBuf[5:], s.headerMask, false)
 		s.udpConn.WriteToUDP(kaBuf[:], remoteAddr)
 
 	case protocol.PacketDisconnect:
@@ -495,6 +527,18 @@ func (s *VPNServer) processUDPPacket(origData []byte, remoteAddr *net.UDPAddr, d
 	}
 
 	return decryptBuf
+}
+
+// isValidPacketType проверяет, является ли тип пакета известным.
+func isValidPacketType(pt protocol.PacketType) bool {
+	switch pt {
+	case protocol.PacketHandshakeInit, protocol.PacketHandshakeResp,
+		protocol.PacketHandshakeComplete, protocol.PacketData,
+		protocol.PacketKeepalive, protocol.PacketDisconnect:
+		return true
+	default:
+		return false
+	}
 }
 
 // copyUDPAddr создаёт глубокую копию net.UDPAddr.
@@ -714,11 +758,13 @@ func (s *VPNServer) notifyShutdown() {
 	buf[1] = protocol.TLSVersionMajor
 	buf[2] = protocol.TLSVersionMinor
 	binary.BigEndian.PutUint16(buf[3:5], 5)
-	buf[9] = byte(protocol.PacketDisconnect)
 	count := 0
 	for _, session := range sessions {
 		if session.IsActive() {
 			binary.BigEndian.PutUint32(buf[5:9], session.ID)
+			buf[9] = byte(protocol.PacketDisconnect)
+			// Обфускация заголовка (SID + Type)
+			protocol.ObfuscateHeader(buf[5:], s.headerMask, false)
 			if _, err := s.udpConn.WriteToUDP(buf[:], session.ClientAddr); err != nil {
 				log.Printf("[SERVER] Ошибка отправки disconnect сессии #%d: %v", session.ID, err)
 			} else {

@@ -43,6 +43,9 @@ type ChaCha20Session struct {
 	// Пре-аллоцированные буферы для hot path (используются по одному на горутину)
 	sendBuf []byte // буфер для шифрования (nonce + ciphertext + tag)
 	recvBuf []byte // буфер для дешифрования
+
+	// Маска обфускации заголовка (SID+Type+Counter), устанавливается через SetHeaderMask
+	headerMask [HeaderMaskSize]byte
 }
 
 // NewChaCha20Session создаёт новую криптографическую сессию.
@@ -175,7 +178,7 @@ func (s *ChaCha20Session) EncryptInto(dst []byte, plaintext []byte, additionalDa
 		return 0, fmt.Errorf("chacha20 init: %w", err)
 	}
 	cipher.XORKeyStream(dst[4:4+len(plaintext)], plaintext)
-
+	// Обфускация не применяется здесь — вызывающий код обфусцирует весь заголовок (SID+Type+Counter) после сборки пакета
 	return totalLen, nil
 }
 
@@ -346,4 +349,44 @@ func zeroBytes(b []byte) {
 	for i := range b {
 		b[i] = 0
 	}
+}
+
+// HeaderMaskSize — размер маски обфускации заголовка (9 байт).
+const HeaderMaskSize = 9
+
+// DeriveHeaderMask выводит 9-байтную маску для обфускации заголовков пакетов из PSK.
+func DeriveHeaderMask(psk []byte) [HeaderMaskSize]byte {
+	mac := hmac.New(sha256.New, psk)
+	mac.Write([]byte("nova-header-mask"))
+	sum := mac.Sum(nil)
+	var mask [HeaderMaskSize]byte
+	copy(mask[:], sum[:HeaderMaskSize])
+	return mask
+}
+
+// ObfuscateHeader применяет XOR-обфускацию к заголовку пакета (после TLS header).
+// buf начинается ПОСЛЕ TLS header: [0:4]=SessionID, [4]=Type, [5:9]=Counter.
+// isData=true — обфускация Counter (9 байт), иначе только SID+Type (5 байт).
+func ObfuscateHeader(buf []byte, mask [HeaderMaskSize]byte, isData bool) {
+	buf[0] ^= mask[0]
+	buf[1] ^= mask[1]
+	buf[2] ^= mask[2]
+	buf[3] ^= mask[3]
+	buf[4] ^= mask[4]
+	if isData && len(buf) >= 9 {
+		buf[5] ^= mask[5]
+		buf[6] ^= mask[6]
+		buf[7] ^= mask[7]
+		buf[8] ^= mask[8]
+	}
+}
+
+// SetHeaderMask устанавливает маску обфускации заголовка для исходящих пакетов.
+func (s *ChaCha20Session) SetHeaderMask(mask [HeaderMaskSize]byte) {
+	s.headerMask = mask
+}
+
+// GetHeaderMask возвращает текущую маску обфускации заголовка.
+func (s *ChaCha20Session) GetHeaderMask() [HeaderMaskSize]byte {
+	return s.headerMask
 }

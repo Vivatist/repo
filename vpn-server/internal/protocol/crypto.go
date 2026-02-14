@@ -174,6 +174,40 @@ func DecodePSK(hexKey string) ([KeySize]byte, error) {
 	return key, nil
 }
 
+// HeaderMaskSize — размер маски обфускации заголовка: SID(4) + Type(1) + Counter(4) = 9 байт.
+const HeaderMaskSize = 9
+
+// DeriveHeaderMask выводит 9-байтную маску для обфускации заголовков пакетов.
+// Маска XOR'ится с SessionID(4) + PacketType(1) + Counter(4) после TLS header.
+// Вычисляется ОДИН раз при инициализации (не на каждый пакет).
+func DeriveHeaderMask(psk [KeySize]byte) [HeaderMaskSize]byte {
+	mac := hmac.New(sha256.New, psk[:])
+	mac.Write([]byte("nova-header-mask"))
+	sum := mac.Sum(nil)
+	var mask [HeaderMaskSize]byte
+	copy(mask[:], sum[:HeaderMaskSize])
+	return mask
+}
+
+// ObfuscateHeader применяет XOR-обфускацию к заголовку пакета (после TLS header).
+// buf начинается ПОСЛЕ TLS header: [0:4]=SessionID, [4]=Type, [5:9]=Counter.
+// isData=true — обфускация Counter (9 байт), иначе только SID+Type (5 байт).
+func ObfuscateHeader(buf []byte, mask [HeaderMaskSize]byte, isData bool) {
+	// SessionID(4) + Type(1) = 5 байт всегда
+	buf[0] ^= mask[0]
+	buf[1] ^= mask[1]
+	buf[2] ^= mask[2]
+	buf[3] ^= mask[3]
+	buf[4] ^= mask[4]
+	// Counter(4) — только для data-пакетов
+	if isData && len(buf) >= 9 {
+		buf[5] ^= mask[5]
+		buf[6] ^= mask[6]
+		buf[7] ^= mask[7]
+		buf[8] ^= mask[8]
+	}
+}
+
 // ZeroKey обнуляет ключ (безопасное удаление из памяти).
 func ZeroKey(key *[KeySize]byte) {
 	for i := range key {
