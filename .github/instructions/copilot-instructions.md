@@ -83,10 +83,10 @@ service/        → Windows Service (SCM), IPC-сервер
 ## 5. Сервер — плоская архитектура
 
 ```
-internal/server/   — VPNServer, SessionManager, IPPool, handler
+internal/server/   — VPNServer, SessionManager, IPPool, handler, batch_linux (sendmmsg/recvmmsg)
 internal/protocol/ — wire format, crypto operations, handshake structs
-internal/auth/     — UserStore (YAML, Argon2id)
-internal/tun/      — Linux TUN device (ioctl)
+internal/auth/     — UserStore (YAML, Argon2id, кеш аутентификации)
+internal/tun/      — Linux TUN device (ioctl), GRO/GSO (IFF_VNET_HDR, TCP-сегментация)
 config/            — ServerConfig (YAML)
 ```
 
@@ -212,6 +212,15 @@ GOOS=linux GOARCH=amd64 go build -o vpnbench ./cmd/vpnbench/
 
 # С другой длительностью
 .\bench.ps1 -duration 30s
+```
+
+**Сравнение GRO ON vs OFF (bench-gro.ps1):**
+
+Скрипт `vpn-server/deploy/bench-gro.ps1` переключает `enable_gro_gso` на сервере, перезапускает и прогоняет сравнительный бенчмарк (3 теста для OFF, 3 для ON) с таблицей дельт.
+
+```powershell
+.\bench-gro.ps1
+.\bench-gro.ps1 -duration 30s
 ```
 
 ### 9.3. Когда прогонять

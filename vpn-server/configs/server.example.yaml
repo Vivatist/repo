@@ -34,6 +34,13 @@ session_timeout: 120
 # Рекомендуется: 4 для VPS 1ГБ, 8 для 2ГБ+, 16 для 4ГБ+
 max_parallel_handshakes: 8
 
+# GRO/GSO для TUN-устройства (снижает syscall overhead для TCP-трафика)
+# auto — пытается включить, при неудаче работает без него
+# true  — то же что auto (попытка + fallback)
+# false — отключить принудительно
+# Требуется Linux >= 4.19 для TSO, >= 6.2 для USO
+enable_gro_gso: "auto"
+
 # NAT (masquerade) для выхода клиентов в интернет
 enable_nat: true
 external_interface: "eth0"

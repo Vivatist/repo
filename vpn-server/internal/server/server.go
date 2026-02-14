@@ -137,7 +137,14 @@ func (s *VPNServer) Start() error {
 
 	// 1. Создаём TUN-интерфейс
 	log.Printf("[TUN] Создаём интерфейс %s...", s.cfg.TunName)
-	tunDev, err := tun.NewTUN(s.cfg.TunName, s.cfg.MTU)
+
+	// GRO/GSO: определяем, нужно ли пытаться включить
+	enableGRO := s.cfg.EnableGROGSO == "auto" || s.cfg.EnableGROGSO == "true"
+	if s.cfg.EnableGROGSO == "false" {
+		log.Println("[TUN] GRO/GSO отключён в конфигурации (enable_gro_gso: false)")
+	}
+
+	tunDev, err := tun.NewTUN(s.cfg.TunName, s.cfg.MTU, enableGRO)
 	if err != nil {
 		return fmt.Errorf("ошибка создания TUN: %w", err)
 	}
@@ -504,6 +511,7 @@ func copyUDPAddr(addr *net.UDPAddr) *net.UDPAddr {
 
 // tunReadLoop — цикл чтения пакетов из TUN-интерфейса.
 // Использует batch sender (sendmmsg) для пакетной отправки, если доступен.
+// При GRO: обрабатывает GRO-коалесцированные пакеты (сегментация TCP в userspace).
 // Fallback на обычный WriteToUDP если batch sender не инициализирован.
 func (s *VPNServer) tunReadLoop() {
 	defer s.wg.Done()
@@ -515,7 +523,20 @@ func (s *VPNServer) tunReadLoop() {
 
 	log.Println("[TUN] Запущен цикл чтения из TUN")
 
-	buf := make([]byte, s.cfg.MTU+100)
+	// GRO: увеличенный буфер для коалесцированных пакетов (до 64KB TCP segment)
+	useGRO := s.tunDev.GROEnabled()
+	var bufSize int
+	if useGRO {
+		bufSize = 65536 + tun.VirtioNetHdrLen // Макс. GRO-пакет + virtio заголовок
+		log.Println("[TUN] GRO активен: буфер чтения 65KB, TCP-сегментация в userspace")
+	} else {
+		bufSize = s.cfg.MTU + 100
+	}
+	buf := make([]byte, bufSize)
+
+	// Пре-аллоцированный буфер для сегментов GRO (zero-alloc при сегментации)
+	segBuf := make([]byte, s.cfg.MTU+200)
+
 	// Пре-аллоцированный буфер для fallback отправки (zero-alloc hot path)
 	sendBuf := make([]byte, s.cfg.MTU+protocol.TotalOverhead+100)
 
@@ -526,6 +547,40 @@ func (s *VPNServer) tunReadLoop() {
 
 	// LRU-1 кеш сессий по IP — устраняет RWMutex lookup при повторяющихся dst IP
 	ipCache := &ipSessionCache{}
+
+	// Обработка одного IP-пакета: lookup сессии + шифрование + отправка.
+	// Извлечена в локальную функцию для переиспользования в GRO и обычном путях.
+	processPacket := func(packet []byte) {
+		if len(packet) < 20 {
+			return
+		}
+
+		// Определяем адресата по destination IP (zero-alloc: [4]byte ключ)
+		dstKey, ok := tun.ExtractDstIPKey(packet)
+		if !ok {
+			return
+		}
+
+		// Ищем сессию по VPN IP (LRU-1 кеш, zero-alloc при cache hit)
+		session := ipCache.get(dstKey, s.sessions)
+		if session == nil {
+			if s.cfg.LogLevel == "debug" {
+				log.Printf("[TUN] Нет сессии для IP %d.%d.%d.%d", dstKey[0], dstKey[1], dstKey[2], dstKey[3])
+			}
+			return
+		}
+
+		if !session.IsActive() {
+			return
+		}
+
+		// Шифруем и отправляем: batch (sendmmsg) или fallback (WriteToUDP)
+		if useBatch {
+			s.sendToClientBatch(session, packet, s.batch)
+		} else {
+			s.sendToClient(session, packet, sendBuf)
+		}
+	}
 
 	for {
 		n, err := s.tunDev.Read(buf)
@@ -539,34 +594,26 @@ func (s *VPNServer) tunReadLoop() {
 			}
 		}
 
-		if n < 20 { // Минимальный IPv4 заголовок
-			continue
-		}
-
-		// Определяем адресата по destination IP (zero-alloc: [4]byte ключ)
-		dstKey, ok := tun.ExtractDstIPKey(buf[:n])
-		if !ok {
-			continue
-		}
-
-		// Ищем сессию по VPN IP (LRU-1 кеш, zero-alloc при cache hit)
-		session := ipCache.get(dstKey, s.sessions)
-		if session == nil {
-			if s.cfg.LogLevel == "debug" {
-				log.Printf("[TUN] Нет сессии для IP %d.%d.%d.%d", dstKey[0], dstKey[1], dstKey[2], dstKey[3])
+		if useGRO {
+			// GRO path: парсим virtio заголовок, обрабатываем коалесцированные пакеты
+			packet, gsoType, gsoSize := tun.ParseGROHeader(buf[:n])
+			if len(packet) < 20 {
+				continue
 			}
-			continue
-		}
 
-		if !session.IsActive() {
-			continue
-		}
-
-		// Шифруем и отправляем: batch (sendmmsg) или fallback (WriteToUDP)
-		if useBatch {
-			s.sendToClientBatch(session, buf[:n], s.batch)
+			if gsoType == tun.GSONone {
+				// Обычный пакет — обрабатываем напрямую
+				processPacket(packet)
+			} else {
+				// GRO-коалесцированный: TCP-сегментация в userspace
+				tun.ForEachGROSegment(packet, gsoType, gsoSize, segBuf, processPacket)
+			}
 		} else {
-			s.sendToClient(session, buf[:n], sendBuf)
+			// Обычный path без GRO
+			if n < 20 {
+				continue
+			}
+			processPacket(buf[:n])
 		}
 	}
 }

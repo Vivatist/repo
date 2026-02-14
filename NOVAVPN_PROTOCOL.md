@@ -630,6 +630,8 @@ keepalive_interval: 25
 session_timeout: 120
 enable_nat: true
 external_interface: "eth0"
+max_parallel_handshakes: 8  # 1-32, макс. параллельных Argon2id (8 × 64МБ = 512МБ)
+enable_gro_gso: "auto"      # "auto"/"true"/"false" — GRO/GSO для TUN (IFF_VNET_HDR)
 log_level: "info"           # debug, info, warn, error
 ```
 

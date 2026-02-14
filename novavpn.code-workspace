@@ -29,7 +29,8 @@
             "c:\\Users\\andre\\repo\\vpn-server\\deploy\\bench.ps1": true,
             ".\\bench.ps1": true,
             ".\\deploy.ps1": true,
-            "gopls": true
+            "gopls": true,
+            ".\\bench-gro.ps1": true
         }
     }
 }
