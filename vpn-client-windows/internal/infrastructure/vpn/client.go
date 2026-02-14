@@ -424,7 +424,13 @@ func (c *NovaVPNClient) configureNetwork() error {
 // udpReadLoop читает пакеты от сервера.
 func (c *NovaVPNClient) udpReadLoop() {
 	defer c.wg.Done()
-	buf := make([]byte, 2048)
+	// Размер буфера: MTU + DataOverhead(14) + запас для handshake/control пакетов.
+	// Вместо магической 2048 — точный расчёт от реального MTU.
+	bufSize := int(c.mtu) + protocol.DataOverhead + 100
+	if bufSize < 2048 {
+		bufSize = 2048 // минимум для handshake-ответов
+	}
+	buf := make([]byte, bufSize)
 
 	// Без SetReadDeadline — разблокировка через conn.Close() в Disconnect.
 	for {

@@ -50,6 +50,9 @@ type ServerConfig struct {
 	// Внешний сетевой интерфейс (для NAT)
 	ExternalInterface string `yaml:"external_interface"`
 
+	// Максимальное количество параллельных handshake (Argon2id, ~64МБ RAM каждый)
+	MaxParallelHandshakes int `yaml:"max_parallel_handshakes"`
+
 	// Логирование
 	LogLevel string `yaml:"log_level"` // debug, info, warn, error
 }
@@ -69,9 +72,10 @@ func DefaultConfig() *ServerConfig {
 		MaxClients:        256,
 		KeepaliveInterval: 25,
 		SessionTimeout:    120,
-		EnableNAT:         true,
-		ExternalInterface: "eth0",
-		LogLevel:          "info",
+		EnableNAT:             true,
+		ExternalInterface:     "eth0",
+		MaxParallelHandshakes: 8,
+		LogLevel:              "info",
 	}
 }
 
@@ -111,10 +115,11 @@ func (c *ServerConfig) Validate() error {
 	if c.MaxClients < 1 || c.MaxClients > 65534 {
 		return fmt.Errorf("max_clients должен быть от 1 до 65534")
 	}
+	if c.MaxParallelHandshakes < 1 || c.MaxParallelHandshakes > 32 {
+		return fmt.Errorf("max_parallel_handshakes должен быть от 1 до 32")
+	}
 	return nil
 }
-
-
 
 // SaveConfig сохраняет конфигурацию в YAML-файл.
 func SaveConfig(path string, cfg *ServerConfig) error {

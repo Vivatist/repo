@@ -185,6 +185,7 @@ users_file: "$CONFIG_DIR/users.yaml"
 max_clients: 256
 session_timeout: 120
 keepalive_interval: 25
+max_parallel_handshakes: 8
 log_level: "info"
 dns:
   - "1.1.1.1"

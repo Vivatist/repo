@@ -64,8 +64,10 @@ func (d *WinTUNDevice) Read(buf []byte) (int, error) {
 			if d.closed.Load() {
 				return 0, fmt.Errorf("device closed")
 			}
-			// Таймаут 100мс позволяет проверять closed флаг
-			windows.WaitForSingleObject(d.readWait, 100)
+			// Таймаут 1000мс — снижает CPU wakeup в idle (10 раз реже проверка closed).
+			// При Close() устройство сигнализирует через readWait, поэтому
+			// увеличенный таймаут не замедляет корректное завершение.
+			windows.WaitForSingleObject(d.readWait, 1000)
 			continue
 		}
 

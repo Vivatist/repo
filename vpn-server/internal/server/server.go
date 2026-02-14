@@ -82,7 +82,7 @@ func NewVPNServer(cfg *config.ServerConfig) (*VPNServer, error) {
 		ctx:          ctx,
 		cancel:       cancel,
 		userStore:    userStore,
-		handshakeSem: make(chan struct{}, 4), // максимум 4 параллельных Argon2id (4 × 64MB = 256MB)
+		handshakeSem: make(chan struct{}, cfg.MaxParallelHandshakes), // N параллельных Argon2id (N × 64MB RAM)
 	}
 
 	// Загружаем пользователей
@@ -272,7 +272,7 @@ func (s *VPNServer) udpReadLoop() {
 
 	if s.batchRecv != nil {
 		// Batch path: recvmmsg — до 64 пакетов за 1 syscall
-		log.Println("[UDP] Используется batch приём (recvmmsg)")
+		log.Println("[UDP] Используется batch приём (recvmmsg) с приоритизацией handshake")
 		for {
 			n, err := s.batchRecv.Recv()
 			if err != nil {
@@ -285,9 +285,26 @@ func (s *VPNServer) udpReadLoop() {
 				}
 			}
 
+			// Двухпроходная обработка: handshake-пакеты ПЕРВЫМИ.
+			// При data flood от существующих клиентов handshake новых клиентов
+			// получает приоритет — горутины стартуют раньше, попадают в очередь семафора быстрее.
+
+			// Проход 1: только handshake (редкие, но критичные для подключения)
 			for i := 0; i < n; i++ {
-				data, remoteAddr := s.batchRecv.GetPacket(i)
-				decryptBuf = s.processUDPPacket(data, remoteAddr, decryptBuf, cache)
+				data, _ := s.batchRecv.GetPacket(i)
+				if isHandshakePacket(data) {
+					data, remoteAddr := s.batchRecv.GetPacket(i)
+					decryptBuf = s.processUDPPacket(data, remoteAddr, decryptBuf, cache)
+				}
+			}
+
+			// Проход 2: data/keepalive/disconnect (основной трафик)
+			for i := 0; i < n; i++ {
+				data, _ := s.batchRecv.GetPacket(i)
+				if !isHandshakePacket(data) {
+					data, remoteAddr := s.batchRecv.GetPacket(i)
+					decryptBuf = s.processUDPPacket(data, remoteAddr, decryptBuf, cache)
+				}
 			}
 		}
 	} else {
@@ -312,6 +329,24 @@ func (s *VPNServer) udpReadLoop() {
 			decryptBuf = s.processUDPPacket(buf[:n], remoteAddr, decryptBuf, cache)
 		}
 	}
+}
+
+// isHandshakePacket быстро определяет, является ли пакет handshake-пакетом.
+// Inline-проверка без аллокаций: TLS header(5) + SessionID(4) + Type(1) = байт 9 (тип).
+// Используется для приоритизации handshake-пакетов в batch-обработке.
+func isHandshakePacket(data []byte) bool {
+	if len(data) < protocol.MinPacketSize {
+		return false
+	}
+	raw := data
+	if len(raw) >= protocol.TLSHeaderSize && raw[0] == protocol.TLSContentType {
+		raw = raw[protocol.TLSHeaderSize:]
+	}
+	if len(raw) < 5 {
+		return false
+	}
+	pktType := protocol.PacketType(raw[4])
+	return pktType == protocol.PacketHandshakeInit || pktType == protocol.PacketHandshakeComplete
 }
 
 // processUDPPacket — обработка одного UDP-пакета (inline парсинг, дешифрование, TUN запись).
@@ -555,6 +590,8 @@ func (s *VPNServer) maintenanceLoop() {
 			if removed > 0 {
 				log.Printf("[MAINTENANCE] Удалено %d истёкших сессий", removed)
 			}
+			// Очищаем устаревшие записи кеша аутентификации
+			s.userStore.CleanupAuthCache()
 
 		case <-statsTicker.C:
 			s.printStats()

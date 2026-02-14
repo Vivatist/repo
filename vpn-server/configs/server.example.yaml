@@ -30,6 +30,10 @@ max_clients: 256
 keepalive_interval: 25
 session_timeout: 120
 
+# Максимум параллельных handshake (Argon2id: ~64МБ RAM × N)
+# Рекомендуется: 4 для VPS 1ГБ, 8 для 2ГБ+, 16 для 4ГБ+
+max_parallel_handshakes: 8
+
 # NAT (masquerade) для выхода клиентов в интернет
 enable_nat: true
 external_interface: "eth0"
