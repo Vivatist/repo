@@ -60,6 +60,39 @@ type Statistics struct {
 	PacketsRecv uint64
 }
 
+// ConnectionHealth — состояние здоровья VPN-соединения (real-time мониторинг).
+type ConnectionHealth int32
+
+const (
+	// HealthUnknown — состояние неизвестно (ещё не установлено).
+	HealthUnknown ConnectionHealth = iota
+	// HealthGood — связь стабильна, пакеты от сервера поступают регулярно.
+	HealthGood
+	// HealthDegraded — задержка ответов от сервера, возможна потеря пакетов.
+	HealthDegraded
+	// HealthLost — связь потеряна, сервер не отвечает.
+	HealthLost
+)
+
+func (h ConnectionHealth) String() string {
+	switch h {
+	case HealthUnknown:
+		return "Неизвестно"
+	case HealthGood:
+		return "Стабильно"
+	case HealthDegraded:
+		return "Нестабильно"
+	case HealthLost:
+		return "Потеряно"
+	default:
+		return "Неизвестно"
+	}
+}
+
+// HealthCallback — колбэк для уведомлений об изменении здоровья соединения.
+// Вызывается при смене статуса (HealthGood → HealthDegraded → HealthLost).
+type HealthCallback func(health ConnectionHealth)
+
 // StatusCallback — колбэк для уведомлений об изменении состояния.
 type StatusCallback func(state ConnectionState, info string)
 
