@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
-	"math/big"
 	"net"
 	"strconv"
 	"strings"
@@ -354,17 +353,17 @@ func (s *VPNServer) tunReadLoop() {
 			continue
 		}
 
-		// Определяем адресата по destination IP (без копирования пакета)
-		dstIP := tun.ExtractDstIP(buf[:n])
-		if dstIP == nil {
+		// Определяем адресата по destination IP (zero-alloc: [4]byte ключ)
+		dstKey, ok := tun.ExtractDstIPKey(buf[:n])
+		if !ok {
 			continue
 		}
 
-		// Ищем сессию по VPN IP
-		session := s.sessions.GetSessionByVPNIP(dstIP)
+		// Ищем сессию по VPN IP (zero-alloc lookup)
+		session := s.sessions.GetSessionByIPKey(dstKey)
 		if session == nil {
 			if s.cfg.LogLevel == "debug" {
-				log.Printf("[TUN] Нет сессии для IP %s", dstIP)
+				log.Printf("[TUN] Нет сессии для IP %d.%d.%d.%d", dstKey[0], dstKey[1], dstKey[2], dstKey[3])
 			}
 			continue
 		}
@@ -393,9 +392,10 @@ func (s *VPNServer) maintenanceLoop() {
 	randomKeepaliveInterval := func() time.Duration {
 		baseInterval := time.Duration(s.cfg.KeepaliveInterval) * time.Second
 
-		// Генерируем случайное отклонение от -7 до +7 секунд
-		randomOffset, _ := rand.Int(rand.Reader, big.NewInt(15))      // 0-14
-		offset := time.Duration(randomOffset.Int64()-7) * time.Second // -7 to +7
+		// Генерируем случайное отклонение от -7 до +7 секунд (без big.Int аллокации)
+		var buf [1]byte
+		rand.Read(buf[:])
+		offset := time.Duration(int(buf[0]%15)-7) * time.Second // -7 to +7
 
 		interval := baseInterval + offset
 		if interval < 10*time.Second {

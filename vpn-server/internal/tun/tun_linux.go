@@ -207,6 +207,17 @@ func ExtractDstIP(packet []byte) net.IP {
 	return net.IPv4(packet[16], packet[17], packet[18], packet[19])
 }
 
+// ExtractDstIPKey извлекает IP-адрес назначения как [4]byte ключ (zero-alloc).
+// Используется на hot path вместо ExtractDstIP, чтобы избежать аллокации net.IP.
+func ExtractDstIPKey(packet []byte) ([4]byte, bool) {
+	var key [4]byte
+	if len(packet) < 20 || packet[0]>>4 != 4 {
+		return key, false
+	}
+	copy(key[:], packet[16:20])
+	return key, true
+}
+
 // ExtractSrcIP извлекает IP-адрес источника из IPv4-пакета.
 func ExtractSrcIP(packet []byte) net.IP {
 	if len(packet) < 20 {

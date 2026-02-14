@@ -16,7 +16,6 @@ package vpn
 import (
 	"crypto/rand"
 	"log"
-	"math/big"
 	"sync/atomic"
 	"time"
 
@@ -101,18 +100,18 @@ func (m *connectionMonitor) Health() domainvpn.ConnectionHealth {
 
 // monitorLoop — фоновый цикл проверки здоровья.
 // Интервал рандомизирован для единообразия с остальными таймерами.
+// Используем time.Timer вместо time.After для корректной очистки ресурсов.
 func (m *connectionMonitor) monitorLoop() {
-	for {
-		// Рандомизированный интервал проверки: 3-7 секунд.
-		// Чисто локальная операция — не влияет на сеть, но соблюдаем
-		// единый подход с рандомизацией для консистентности.
-		interval := randomCheckInterval()
+	timer := time.NewTimer(randomCheckInterval())
+	defer timer.Stop()
 
+	for {
 		select {
 		case <-m.stopCh:
 			return
-		case <-time.After(interval):
+		case <-timer.C:
 			m.check()
+			timer.Reset(randomCheckInterval())
 		}
 	}
 }
@@ -158,22 +157,22 @@ func (m *connectionMonitor) check() {
 }
 
 // randomCheckInterval возвращает случайный интервал проверки 3-7 секунд.
-// Использует crypto/rand для непредсказуемости.
+// Использует crypto/rand для непредсказуемости (без big.Int аллокаций).
 func randomCheckInterval() time.Duration {
-	n, err := rand.Int(rand.Reader, big.NewInt(5)) // 0-4
-	if err != nil {
+	var buf [1]byte
+	if _, err := rand.Read(buf[:]); err != nil {
 		return 5 * time.Second // fallback
 	}
-	return time.Duration(3+n.Int64()) * time.Second // 3-7 сек
+	return time.Duration(3+int(buf[0]%5)) * time.Second // 3-7 сек
 }
 
 // randomKeepaliveInterval возвращает случайный интервал keepalive 10-20 секунд.
 // Криптографически стойкий рандом для защиты от DPI-детектирования
-// регулярных паттернов трафика.
+// регулярных паттернов трафика (без big.Int аллокаций).
 func randomKeepaliveInterval() time.Duration {
-	n, err := rand.Int(rand.Reader, big.NewInt(11)) // 0-10
-	if err != nil {
+	var buf [1]byte
+	if _, err := rand.Read(buf[:]); err != nil {
 		return 15 * time.Second // fallback
 	}
-	return time.Duration(10+n.Int64()) * time.Second // 10-20 сек
+	return time.Duration(10+int(buf[0]%11)) * time.Second // 10-20 сек
 }

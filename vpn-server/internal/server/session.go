@@ -342,6 +342,14 @@ func (sm *SessionManager) GetSessionByVPNIP(ip net.IP) *Session {
 	return sm.ipToSession[ipToKey(ip)]
 }
 
+// GetSessionByIPKey возвращает сессию по [4]byte ключу IP (zero-alloc hot path).
+// Используется вместо GetSessionByVPNIP на hot path для избежания аллокации net.IP.
+func (sm *SessionManager) GetSessionByIPKey(key [4]byte) *Session {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.ipToSession[key]
+}
+
 // RemoveSession удаляет сессию.
 func (sm *SessionManager) RemoveSession(session *Session) {
 	sm.mu.Lock()

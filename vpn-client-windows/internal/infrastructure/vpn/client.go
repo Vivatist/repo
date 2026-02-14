@@ -598,22 +598,24 @@ func (c *NovaVPNClient) tunReadLoop() {
 func (c *NovaVPNClient) keepaliveLoop() {
 	defer c.wg.Done()
 
-	for {
-		// Рандомизированный интервал: 10-20 секунд (crypto/rand).
-		// Каждый raз новое значение — нет паттерна для DPI.
-		interval := randomKeepaliveInterval()
+	// Используем time.Timer вместо time.After для корректной очистки ресурсов
+	timer := time.NewTimer(randomKeepaliveInterval())
+	defer timer.Stop()
 
+	for {
 		select {
 		case <-c.ctx.Done():
 			return
 		case <-c.stopCh:
 			return
-		case <-time.After(interval):
+		case <-timer.C:
 			if c.reconnecting.Load() {
+				timer.Reset(randomKeepaliveInterval())
 				continue
 			}
 			conn := c.conn
 			if conn == nil {
+				timer.Reset(randomKeepaliveInterval())
 				continue
 			}
 
@@ -626,6 +628,9 @@ func (c *NovaVPNClient) keepaliveLoop() {
 			binary.BigEndian.PutUint32(kaBuf[5:9], c.sessionID)
 			kaBuf[9] = byte(protocol.PacketKeepalive)
 			conn.Write(kaBuf[:])
+
+			// Рандомизированный интервал: 10-20 секунд — нет паттерна для DPI
+			timer.Reset(randomKeepaliveInterval())
 		}
 	}
 }
