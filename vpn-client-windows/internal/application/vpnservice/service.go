@@ -75,6 +75,9 @@ func (s *Service) Connect(params domainvpn.ConnectParams) error {
 				log.Printf("[VPN] Не удалось сохранить PSK: %v", err)
 			}
 		},
+		func(health domainvpn.ConnectionHealth) {
+			log.Printf("[VPN] Здоровье соединения: %s", health)
+		},
 	)
 
 	// Подключаемся

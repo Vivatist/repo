@@ -60,6 +60,10 @@ type NovaVPNClient struct {
 	// Колбэки
 	onStatus domainvpn.StatusCallback
 	onPSK    domainvpn.PSKCallback
+	onHealth domainvpn.HealthCallback
+
+	// Монитор здоровья соединения
+	healthMonitor *connectionMonitor
 
 	// 0-RTT resume data
 	resumeSessionID   uint32
@@ -83,12 +87,14 @@ func NewNovaVPNClient(
 	netConfig domainnet.NetworkConfigurator,
 	onStatus domainvpn.StatusCallback,
 	onPSK domainvpn.PSKCallback,
+	onHealth domainvpn.HealthCallback,
 ) domainvpn.Client {
 	return &NovaVPNClient{
 		tunnelDevice: tunnelDevice,
 		netConfig:    netConfig,
 		onStatus:     onStatus,
 		onPSK:        onPSK,
+		onHealth:     onHealth,
 	}
 }
 
@@ -207,10 +213,26 @@ func (c *NovaVPNClient) Connect(params domainvpn.ConnectParams) error {
 	// Запускаем циклы обработки ДО настройки сети (UDP read/keepalive работают сразу)
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 	c.stopped.Store(false)
-	c.wg.Add(3)
+
+	// Создаём и запускаем монитор здоровья соединения
+	c.healthMonitor = newConnectionMonitor(c.onHealth, func() {
+		// При потере связи инициируем reconnect (если ещё не в процессе)
+		if !c.reconnecting.Load() && !c.stopped.Load() {
+			log.Println("[HEALTH] Связь потеряна (таймаут сервера). Инициируем reconnect...")
+			c.wg.Add(1)
+			go c.reconnect()
+		}
+	})
+	c.healthMonitor.reset()
+
+	c.wg.Add(4)
 	go c.udpReadLoop()
 	go c.tunReadLoop()
 	go c.keepaliveLoop()
+	go func() {
+		defer c.wg.Done()
+		c.healthMonitor.monitorLoop(c.stopCh)
+	}()
 
 	// Настраиваем сеть (параллельно с уже запущенными циклами)
 	if err := c.configureNetwork(); err != nil {
@@ -430,6 +452,11 @@ func (c *NovaVPNClient) handleUDPPacket(data []byte) {
 
 	pktType := protocol.PacketType(raw[4])
 
+	// Фиксируем активность сервера для монитора здоровья (lock-free, zero-alloc)
+	if c.healthMonitor != nil {
+		c.healthMonitor.RecordActivity()
+	}
+
 	switch pktType {
 	case protocol.PacketData:
 		// Data: SessionID(4) + Type(1) + Counter(4) + CT (plain ChaCha20, без auth tag)
@@ -543,10 +570,11 @@ func (c *NovaVPNClient) tunReadLoop() {
 	}
 }
 
-// keepaliveLoop отправляет keepalive пакеты.
+// keepaliveLoop отправляет keepalive пакеты с рандомизированным интервалом.
+// Интервал 10-20 секунд (аналогично серверной рандомизации) для защиты от DPI fingerprinting.
 func (c *NovaVPNClient) keepaliveLoop() {
 	defer c.wg.Done()
-	ticker := time.NewTicker(15 * time.Second)
+	ticker := time.NewTicker(randomKeepaliveInterval())
 	defer ticker.Stop()
 
 	for {
@@ -572,6 +600,9 @@ func (c *NovaVPNClient) keepaliveLoop() {
 			binary.BigEndian.PutUint32(kaBuf[5:9], c.sessionID)
 			kaBuf[9] = byte(protocol.PacketKeepalive)
 			conn.Write(kaBuf[:])
+
+			// Сбрасываем тикер с новым случайным интервалом
+			ticker.Reset(randomKeepaliveInterval())
 		}
 	}
 }
@@ -775,12 +806,19 @@ func (c *NovaVPNClient) reconnect() {
 			return
 		}
 
-		// Успех! Запускаем новые UDP + keepalive циклы
+		// Успех! Запускаем новые UDP + keepalive + health циклы
 		// (tunReadLoop продолжает работать — он не останавливался)
 		c.ctx, c.cancel = context.WithCancel(context.Background())
-		c.wg.Add(2)
+		if c.healthMonitor != nil {
+			c.healthMonitor.reset()
+		}
+		c.wg.Add(3)
 		go c.udpReadLoop()
 		go c.keepaliveLoop()
+		go func() {
+			defer c.wg.Done()
+			c.healthMonitor.monitorLoop(c.stopCh)
+		}()
 
 		// Перенастраиваем сеть если IP изменился (полный handshake)
 		if !resumed {
