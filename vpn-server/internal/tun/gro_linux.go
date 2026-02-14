@@ -27,11 +27,11 @@ const (
 	VirtioNetHdrLen = 10
 
 	// GSO типы из virtio_net_hdr.gso_type
-	GSONone   = 0 // Обычный пакет, не коалесцирован
-	GSOTCPv4  = 1 // TCP over IPv4, коалесцирован
-	GSOUDP    = 3 // UDP (deprecated UFO)
-	GSOTCPv6  = 4 // TCP over IPv6, коалесцирован
-	GSOUDPL4  = 5 // UDP L4 segmentation (Linux 6.2+)
+	GSONone  = 0 // Обычный пакет, не коалесцирован
+	GSOTCPv4 = 1 // TCP over IPv4, коалесцирован
+	GSOUDP   = 3 // UDP (deprecated UFO)
+	GSOTCPv6 = 4 // TCP over IPv6, коалесцирован
+	GSOUDPL4 = 5 // UDP L4 segmentation (Linux 6.2+)
 
 	// Флаги virtio_net_hdr.flags
 	virtioFlagNeedsCsum = 1
