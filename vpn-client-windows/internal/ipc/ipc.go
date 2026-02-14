@@ -61,6 +61,11 @@ func (c *Client) Disconnect() error {
 	return c.inner.Disconnect()
 }
 
+// StopService отправляет запрос на остановку Windows-сервиса.
+func (c *Client) StopService() error {
+	return c.inner.StopService()
+}
+
 // GetStatus запрашивает текущий статус.
 func (c *Client) GetStatus() (*StatusResponse, error) {
 	resp, err := c.inner.GetStatus()

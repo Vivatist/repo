@@ -106,7 +106,6 @@ if exist "wintun\wintun\bin\amd64\wintun.dll" (
 )
 
 echo.
-pause
 
 :: ═══════════════════════════════════════════════════════════════
 ::   ШАГ 2: Загрузка зависимостей Go
@@ -296,23 +295,23 @@ if %CREATE_INSTALLER%==1 (
 
 echo.
 echo ┌───────────────────────────────────────────────────────────────┐
-echo │ Следующие шаги:                                              │
-echo │                                                              │
+echo │ Следующие шаги:                                               │
+echo │                                                               │
 if %HAS_WINTUN%==0 (
-    echo │ 1. Скачайте wintun.dll с https://www.wintun.net/         │
-    echo │    и положите в dist\NovaVPN\                            │
-    echo │                                                              │
+    echo │ 1. Скачайте wintun.dll с https://www.wintun.net/                │
+    echo │    и положите в dist\NovaVPN\                                   │
+    echo │                                                                 │
 )
 if %CREATE_INSTALLER%==1 (
-    echo │ 2. Запустите инсталлятор:                                │
-    echo │    dist\NovaVPN-Setup-%VERSION%.exe                       │
+    echo │ 2. Запустите инсталлятор:                                     │
+    echo │    dist\NovaVPN-Setup-%VERSION%.exe                               │
 ) else (
-    echo │ 2. Скопируйте папку dist\NovaVPN\ на целевой компьютер   │
-    echo │    и запустите NovaVPN.exe                               │
+    echo │ 2. Скопируйте папку dist\NovaVPN\ на целевой компьютер          │
+    echo │    и запустите NovaVPN.exe                                      │
 )
-echo │                                                              │
-echo │ 3. Протестируйте подключение к серверу                      │
-echo │                                                              │
+echo │                                                               │
+echo │ 3. Протестируйте подключение к серверу                        │
+echo │                                                               │
 echo └───────────────────────────────────────────────────────────────┘
 echo.
 
@@ -321,4 +320,3 @@ if %HAS_WINTUN%==0 (
     echo.
 )
 
-pause

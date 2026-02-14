@@ -36,6 +36,10 @@ type Client interface {
 	// GetStatus запрашивает текущий статус подключения.
 	GetStatus() (*StatusResponse, error)
 
+	// StopService отправляет запрос на остановку Windows-сервиса.
+	// Сервис выполнит graceful shutdown: отключит VPN, остановит IPC, завершит процесс.
+	StopService() error
+
 	// Close закрывает соединение.
 	Close() error
 }

@@ -109,6 +109,26 @@ func (c *NamedPipeClient) Disconnect() error {
 	return nil
 }
 
+// StopService отправляет запрос на остановку сервиса.
+func (c *NamedPipeClient) StopService() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if err := c.connectLocked(); err != nil {
+		return err
+	}
+
+	request := map[string]interface{}{
+		"type": "stop_service",
+	}
+
+	// Отправляем команду, но не ждём корректного ответа —
+	// сервис может закрыть pipe до отправки response.
+	_, _ = c.sendRequestLocked(request)
+	c.closeLocked()
+	return nil
+}
+
 // GetStatus запрашивает текущий статус.
 func (c *NamedPipeClient) GetStatus() (*domainipc.StatusResponse, error) {
 	c.mu.Lock()
