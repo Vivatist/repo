@@ -5,6 +5,10 @@
             "name": "VPN Client (Windows)"
         },
         {
+            "path": "vpn-client-android-tv",
+            "name": "VPN Client (Android TV)"
+        },
+        {
             "path": "vpn-server",
             "name": "VPN Server (Linux)"
         },
