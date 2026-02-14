@@ -139,7 +139,10 @@ func (m *connectionMonitor) reset() {
 // Рандомизация предотвращает создание детектируемых паттернов активности.
 func (m *connectionMonitor) randomCheckInterval() time.Duration {
 	// 3 + (0..4) = 3-7 секунд
-	n, _ := rand.Int(rand.Reader, big.NewInt(5))
+	n, err := rand.Int(rand.Reader, big.NewInt(5))
+	if err != nil {
+		return 5 * time.Second // fallback при ошибке энтропии
+	}
 	return time.Duration(3+n.Int64()) * time.Second
 }
 
@@ -147,6 +150,9 @@ func (m *connectionMonitor) randomCheckInterval() time.Duration {
 // Аналогично серверной стороне — предотвращает DPI fingerprinting по фиксированному интервалу.
 func randomKeepaliveInterval() time.Duration {
 	// 10 + (0..10) = 10-20 секунд
-	n, _ := rand.Int(rand.Reader, big.NewInt(11))
+	n, err := rand.Int(rand.Reader, big.NewInt(11))
+	if err != nil {
+		return 15 * time.Second // fallback при ошибке энтропии
+	}
 	return time.Duration(10+n.Int64()) * time.Second
 }
