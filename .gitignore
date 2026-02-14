@@ -4,8 +4,8 @@
 *.syso
 
 # Артефакты сборки
-/dist/
-/build/
+**/dist/
+**/build/
 
 # Go
 vendor/
