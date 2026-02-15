@@ -1,9 +1,9 @@
 {
   "max_clients_tested": 50,
   "mode": "full",
-  "best_rtt_p50_us": 122.0,
-  "best_throughput_mbps": 486.9,
-  "timestamp": "2026-02-15 22:03:00",
+  "best_rtt_p50_us": 120.0,
+  "best_throughput_mbps": 422.0,
+  "timestamp": "2026-02-15 22:08:34",
   "best_handshake_ms": 4.0,
   "max_clients_connected": 50,
   "overall_grade": "ОТЛИЧНО",
@@ -14,60 +14,60 @@
       "clients_connected": 1,
       "name": "Throughput 1x клиент",
       "clients": 1,
-      "throughput_mbps": 407.8,
-      "packets_per_sec": 50980.5,
+      "throughput_mbps": 422.0,
+      "packets_per_sec": 52754.2,
       "rtt_p50_ns": 0,
       "mode": "throughput",
       "packet_loss_pct": 0,
-      "handshake_avg_ns": 11967197
+      "handshake_avg_ns": 7632172
     },
     {
       "rtt_p95_ns": 0,
       "clients_connected": 10,
       "name": "Throughput 10x клиент",
       "clients": 10,
-      "throughput_mbps": 486.9,
-      "packets_per_sec": 60857.7,
+      "throughput_mbps": 401.3,
+      "packets_per_sec": 50164.6,
       "rtt_p50_ns": 0,
       "mode": "throughput",
       "packet_loss_pct": 0,
-      "handshake_avg_ns": 44430146
+      "handshake_avg_ns": 49828440
     },
     {
-      "rtt_p95_ns": 417678,
+      "rtt_p95_ns": 336337,
       "clients_connected": 1,
       "name": "RTT 1x клиент",
       "clients": 1,
       "throughput_mbps": 0.2,
-      "packets_per_sec": 20.1,
-      "rtt_p50_ns": 195253,
+      "packets_per_sec": 20.0,
+      "rtt_p50_ns": 200153,
       "mode": "rtt",
       "packet_loss_pct": 0,
-      "handshake_avg_ns": 3973614
+      "handshake_avg_ns": 3638649
     },
     {
-      "rtt_p95_ns": 393684,
+      "rtt_p95_ns": 296222,
       "clients_connected": 10,
       "name": "RTT 10x клиентов",
       "clients": 10,
       "throughput_mbps": 0.8,
-      "packets_per_sec": 100.0,
-      "rtt_p50_ns": 146212,
+      "packets_per_sec": 100.7,
+      "rtt_p50_ns": 122869,
       "mode": "rtt",
       "packet_loss_pct": 0,
-      "handshake_avg_ns": 1893888
+      "handshake_avg_ns": 2052077
     },
     {
-      "rtt_p95_ns": 335956,
+      "rtt_p95_ns": 301180,
       "clients_connected": 50,
       "name": "RTT 50x клиентов",
       "clients": 50,
       "throughput_mbps": 4.0,
-      "packets_per_sec": 500.0,
-      "rtt_p50_ns": 122198,
+      "packets_per_sec": 503.3,
+      "rtt_p50_ns": 119662,
       "mode": "rtt",
       "packet_loss_pct": 0,
-      "handshake_avg_ns": 2047052
+      "handshake_avg_ns": 1928872
     }
   ],
   "duration_per_test": "15s",

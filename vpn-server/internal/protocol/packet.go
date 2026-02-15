@@ -24,16 +24,11 @@ const (
 
 	// QUIC Short Header constants (маскировка под QUIC)
 	// Flags byte: Header Form=0 (Short), Fixed Bit=1, остальное — random
-	QUICFixedBitMask byte = 0x40 // bit 6 = 1 (QUIC Fixed Bit, обязателен)
-	QUICHeaderSize        = 5    // flags(1) + obfuscated_pad(4)
+	quicFixedBitMask = 0x40 // bit 6 = 1 (QUIC Fixed Bit, обязателен)
+	QUICHeaderSize   = 5    // flags(1) + obfuscated_pad(4)
 
 	// Обратная совместимость: TLSHeaderSize = QUICHeaderSize (5 байт, все смещения сохраняются)
 	TLSHeaderSize = QUICHeaderSize
-
-	// Устаревшие константы (для поиска в коде, значения не используются при формировании)
-	TLSContentType  byte = 0x17
-	TLSVersionMajor byte = 0x03
-	TLSVersionMinor byte = 0x03
 
 	// SessionIDSize — размер SessionID (единственное открытое поле)
 	SessionIDSize = 4
@@ -151,7 +146,7 @@ var (
 // и не делает syscall на каждый вызов (~50 000 пкт/с на hot path).
 func WriteQUICHeader(buf []byte) {
 	v := mathrand.Uint64()
-	buf[0] = QUICFixedBitMask | (byte(v) & 0x3F) // 0b01XXXXXX
+	buf[0] = quicFixedBitMask | (byte(v) & 0x3F) // 0b01XXXXXX
 	buf[1] = byte(v >> 8)
 	buf[2] = byte(v >> 16)
 	buf[3] = byte(v >> 24)
