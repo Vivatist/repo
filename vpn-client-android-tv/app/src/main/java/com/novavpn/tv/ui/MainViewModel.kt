@@ -67,9 +67,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             while (isActive) {
                 val service = NovaVpnService.instance
                 if (service != null) {
-                    service.vpnClient.stateFlow.collectLatest { state ->
-                        _uiState.update { it.copy(connectionState = state) }
+                    // Наблюдаем за состоянием подключения
+                    launch {
+                        service.vpnClient.stateFlow.collectLatest { state ->
+                            _uiState.update { it.copy(connectionState = state) }
+                        }
                     }
+                    // Наблюдаем за ошибками подключения
+                    launch {
+                        service.vpnClient.errorFlow.collectLatest { error ->
+                            if (error != null) {
+                                _uiState.update { it.copy(errorMessage = error) }
+                            }
+                        }
+                    }
+                    break // Подписались — выходим из цикла ожидания
                 }
                 delay(200) // Проверяем каждые 200мс пока сервис не появится
             }
@@ -89,7 +101,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun toggleSettings() {
-        _uiState.update { it.copy(showSettings = !it.showSettings) }
+        _uiState.update { it.copy(showSettings = !it.showSettings, errorMessage = null) }
     }
 
     fun saveSettings() {

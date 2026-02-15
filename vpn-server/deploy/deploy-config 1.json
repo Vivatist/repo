@@ -1,8 +1,8 @@
 {
-    "ssh_host": "212.118.41.227",
+    "ssh_host": "212.118.54.76",
     "ssh_port": 22,
     "ssh_user": "root",
-    "ssh_password": "A7469tT1f9T%nJ1W2bPz",
+    "ssh_password": "2w8g826:29iq56MC7vr6",
 
     "vpn_port": 443,
     "test_user_email": "test@novavpn.app",

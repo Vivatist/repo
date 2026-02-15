@@ -53,6 +53,10 @@ class NovaVpnClientImpl : VpnClient {
     private val _healthFlow = MutableStateFlow(ConnectionHealth.GOOD)
     override val healthFlow: StateFlow<ConnectionHealth> = _healthFlow.asStateFlow()
 
+    // Поток ошибок подключения (для отображения в UI)
+    private val _errorFlow = MutableStateFlow<String?>(null)
+    val errorFlow: StateFlow<String?> = _errorFlow.asStateFlow()
+
     // Соединение
     private var socket: DatagramSocket? = null
     private var tunFd: FileDescriptor? = null
@@ -104,6 +108,7 @@ class NovaVpnClientImpl : VpnClient {
         }
 
         _stateFlow.value = ConnectionState.CONNECTING
+        _errorFlow.value = null  // Очищаем предыдущую ошибку
         connectParams = params
         stopped.set(false)
 
@@ -159,10 +164,19 @@ class NovaVpnClientImpl : VpnClient {
                         setupSession(bootstrapResult)
                         return
                     } catch (e2: Exception) {
-                        throw Exception("Handshake failed: ${e2.message}")
+                        val userMsg = "Не удалось подключиться. Проверьте адрес сервера, email и пароль."
+                        _errorFlow.value = userMsg
+                        throw Exception(userMsg)
                     }
                 }
-                throw Exception("Handshake failed: ${e.message}")
+                // Без PSK — это bootstrap, таймаут = неверные данные или сервер недоступен
+                val userMsg = if (e is java.net.SocketTimeoutException) {
+                    "Не удалось подключиться. Проверьте адрес сервера, email и пароль."
+                } else {
+                    "Ошибка подключения: ${e.message}"
+                }
+                _errorFlow.value = userMsg
+                throw Exception(userMsg)
             }
 
             setupSession(result)
