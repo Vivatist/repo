@@ -291,7 +291,7 @@ private fun TvButton(
             .border(2.dp, borderColor, RoundedCornerShape(12.dp))
             .focusRequester(focusRequester)
             .onFocusChanged { isFocused = it.isFocused }
-            .focusable(enabled)
+            .focusable()
             .onKeyEvent { event ->
                 if (event.type == KeyEventType.KeyUp &&
                     (event.key == Key.Enter || event.key == Key.DirectionCenter)
