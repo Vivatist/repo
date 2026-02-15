@@ -157,8 +157,11 @@ class NovaVpnService : VpnService() {
 
     override fun onRevoke() {
         Log.e(TAG, "VPN REVOKED by system! (routing loop or another VPN took over)")
+        // BUG4 fix: сбрасываем wasConnected и корректно завершаем сервис
         scope.launch {
+            try { configRepository.setWasConnected(false) } catch (_: Exception) {}
             try { vpnClient.disconnect() } catch (_: Exception) {}
+            stopSelf()
         }
         super.onRevoke()
     }

@@ -61,29 +61,44 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      * Непрерывное наблюдение за состоянием VPN-сервиса.
      * Ждёт появления NovaVpnService.instance (сервис запускается позже ViewModel),
      * затем подписывается на stateFlow клиента.
+     *
+     * BUG3 fix: при пересоздании сервиса (stopSelf + новый connect) instance меняется.
+     * Теперь непрерывно следим за сменой instance и переподписываемся.
      */
     private fun observeVpnState() {
         viewModelScope.launch {
+            var currentService: NovaVpnService? = null
+            var stateJob: kotlinx.coroutines.Job? = null
+            var errorJob: kotlinx.coroutines.Job? = null
+
             while (isActive) {
                 val service = NovaVpnService.instance
-                if (service != null) {
-                    // Наблюдаем за состоянием подключения
-                    launch {
+                if (service != null && service !== currentService) {
+                    // Сервис появился или сменился — переподписываемся
+                    stateJob?.cancel()
+                    errorJob?.cancel()
+                    currentService = service
+
+                    stateJob = launch {
                         service.vpnClient.stateFlow.collectLatest { state ->
                             _uiState.update { it.copy(connectionState = state) }
                         }
                     }
-                    // Наблюдаем за ошибками подключения
-                    launch {
+                    errorJob = launch {
                         service.vpnClient.errorFlow.collectLatest { error ->
                             if (error != null) {
                                 _uiState.update { it.copy(errorMessage = error) }
                             }
                         }
                     }
-                    break // Подписались — выходим из цикла ожидания
+                } else if (service == null && currentService != null) {
+                    // Сервис уничтожен — сбрасываем состояние
+                    stateJob?.cancel()
+                    errorJob?.cancel()
+                    currentService = null
+                    _uiState.update { it.copy(connectionState = ConnectionState.DISCONNECTED) }
                 }
-                delay(200) // Проверяем каждые 200мс пока сервис не появится
+                delay(500)
             }
         }
     }

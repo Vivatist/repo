@@ -125,6 +125,7 @@ class NovaVpnClientImpl : VpnClient {
         _errorFlow.value = null  // Очищаем предыдущую ошибку
         connectParams = params
         stopped.set(false)
+        reconnecting.set(false) // Сброс флага reconnecting (BUG2 fix)
 
         // Декодируем PSK
         val psk = if (params.psk.isNotEmpty()) {
@@ -284,6 +285,10 @@ class NovaVpnClientImpl : VpnClient {
     private fun cleanup() {
         scope?.cancel()
         scope = null
+
+        // Сброс флагов (BUG2 + BUG5 fix)
+        reconnecting.set(false)
+        lastKeepaliveSent.set(0)
 
         try { tunIn?.close() } catch (_: Exception) {}
         try { tunOut?.close() } catch (_: Exception) {}
@@ -606,6 +611,20 @@ class NovaVpnClientImpl : VpnClient {
                     onNewPsk?.invoke(NovaKeyExchange.encodePsk(result.newPsk))
                 }
 
+                // BUG1 fix: пересоздаём TUN-интерфейс с новым IP от сервера
+                // Без этого TUN сохраняет старый IP, а сервер назначил новый → трафик не ходит
+                try { tunIn?.close() } catch (_: Exception) {}
+                try { tunOut?.close() } catch (_: Exception) {}
+                val fd = onTunRequired?.invoke(result)
+                if (fd == null) {
+                    Log.e(TAG, "Failed to recreate TUN on reconnect")
+                    throw Exception("TUN interface not available on reconnect")
+                }
+                tunFd = fd
+                tunIn = FileInputStream(fd)
+                tunOut = FileOutputStream(fd)
+                Log.i(TAG, "TUN recreated with new IP: ${ipToString(result.assignedIp)}")
+
                 _infoFlow.value = ConnectionInfo(
                     state = ConnectionState.CONNECTED,
                     serverAddr = params.serverAddr,
@@ -616,6 +635,7 @@ class NovaVpnClientImpl : VpnClient {
                 )
 
                 lastActivity.set(System.nanoTime())
+                lastKeepaliveSent.set(0) // BUG5 fix: сброс probe timer
                 _healthFlow.value = ConnectionHealth.GOOD
                 _stateFlow.value = ConnectionState.CONNECTED
 
