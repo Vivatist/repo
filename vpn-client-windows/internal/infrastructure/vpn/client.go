@@ -662,6 +662,11 @@ func (c *NovaVPNClient) keepaliveLoop() {
 			infracrypto.ObfuscateHeader(kaBuf[5:], c.headerMask, false)
 			conn.Write(kaBuf[:protocol.QUICHeaderSize+5+padLen])
 
+			// Фиксируем время отправки для active probe
+			if c.healthMonitor != nil {
+				c.healthMonitor.RecordKeepaliveSent()
+			}
+
 			// Рандомизированный интервал: 10-20 секунд — нет паттерна для DPI
 			timer.Reset(randomKeepaliveInterval())
 		}

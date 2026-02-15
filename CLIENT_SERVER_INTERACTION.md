@@ -99,8 +99,8 @@
    - Чтение из UDP → расшифровка → запись в TUN
    - Чтение из TUN → шифрование → отправка в UDP
    - Keepalive каждые 10-20 секунд (рандомизированный, crypto/rand)
-   - Мониторинг физической сети (каждые 2 сек)
-10. Запустить пассивный health monitor (проверка каждые 3-7 сек)
+   - Мониторинг физической сети (каждые 2 сек / ConnectivityManager)
+10. Запустить health monitor (active probe + wake detection + passive, проверка каждые 3-7 сек)
 11. Состояние → Connected
 ```
 
@@ -141,16 +141,29 @@ loop:
   отправить keepalive (50-160 байт, с random padding и обфускацией заголовка)
 ```
 
-**Пассивный health monitor** (отдельная горутина):
+**Health monitor** (отдельная горутина, active probe + passive + wake detection):
 ```
 loop:
   interval = randomCheckInterval()  // 3-7 сек
+  wallBefore = currentTimeMillis()
   ждать interval
+  wallAfter = currentTimeMillis()
+
+  // Wake Detection: если wall clock прыгнул (sleep/hibernate)
+  если (wallAfter - wallBefore) > interval * 3:
+      → HealthLost (устройство спало) → закрыть conn → reconnect
+
   elapsed = сейчас - lastActivity
+
+  // Active Probe: keepalive отправлен, но ответ не пришёл за 15 сек
+  если lastActivity < lastKeepaliveSent И (сейчас - lastKeepaliveSent) >= 15 сек:
+      → HealthLost (probe expired) → закрыть conn → reconnect
+
+  // Passive: пороги по lastActivity
   определить уровень:
-    < 35 сек  → HealthGood (стабильно)
-    35-60 сек → HealthDegraded (нестабильно)
-    > 60 сек  → HealthLost (потеряно)
+    < 20 сек  → HealthGood (стабильно)
+    20-30 сек → HealthDegraded (нестабильно)
+    > 30 сек  → HealthLost (потеряно)
   если уровень изменился:
     вызвать HealthCallback
     если HealthLost: закрыть conn → reconnect
@@ -336,33 +349,58 @@ udp.send(packet)
 - **Рандомизация**: анти-DPI мера, интервал пересчитывается после каждой отправки
 - **Формат**: 50-160 байт (аналогичный, с random padding)
 
-### 5.3. Пассивный мониторинг здоровья (Health Monitor)
+### 5.3. Мониторинг здоровья соединения (Health Monitor)
 
-Клиент запускает пассивный `connectionMonitor` — отдельный lock-free компонент,
-который отслеживает время последнего полученного пакета от сервера (**любого** типа — Data, Keepalive и т.д.).
-Не генерирует сетевого трафика.
+Клиент запускает `connectionMonitor` — отдельный lock-free компонент с **тремя механизмами обнаружения** мёртвого соединения:
+
+1. **Active Probe** — при отправке keepalive фиксируется `lastKeepaliveSent`. Если ответ (любой пакет) не пришёл за 15 сек — соединение мертво.
+2. **Wake Detection** — сравнение wall clock до и после `sleep/delay`. Если дельта >> ожидаемого интервала — устройство спало (Android TV sleep, ноутбук hibernate). Немедленный reconnect.
+3. **Passive Thresholds** — время с последнего полученного пакета. Три уровня:
 
 **Три уровня здоровья:**
 
 | Уровень | Условие | Действие |
 |---------|---------|----------|
-| `HealthGood` (Стабильно) | < 35 сек без пакетов | Нормальная работа |
-| `HealthDegraded` (Нестабильно) | 35-60 сек без пакетов | Уведомление UI (жёлтый) |
-| `HealthLost` (Потеряно) | > 60 сек без пакетов | Закрытие conn → reconnect |
+| `HealthGood` (Стабильно) | < 20 сек без пакетов | Нормальная работа |
+| `HealthDegraded` (Нестабильно) | 20-30 сек без пакетов | Уведомление UI (жёлтый) |
+| `HealthLost` (Потеряно) | > 30 сек без пакетов | Закрытие conn → reconnect |
 
-**Почему 35 секунд** для `Degraded`:
-Макс. серверный keepalive = 32 сек (25 + 7). Если за 35 сек не пришёл ни один пакет — что-то не так.
+**Почему 20 секунд** для `Degraded`:
+Макс. клиентский keepalive = 20 сек. Если за 20 сек не пришёл ни один пакет — что-то не так.
 
-**Почему 60 секунд** для `Lost`:
-≈ 2 пропущенных keepalive-цикла сервера. С высокой вероятностью — полная потеря связи.
+**Почему 30 секунд** для `Lost`:
+Макс. серверный keepalive = 32 сек (25 + 7). За 30 сек должен был прийти хотя бы один ответ на наш keepalive.
+
+**Active Probe (зачем нужен):**
+Пассивные пороги медленные — нужно ждать 30 сек. Active probe обнаруживает потерю за 15 сек: если мы отправили keepalive и за 15 сек не получили **ни одного** пакета — сервер не отвечает.
+
+**Wake Detection (зачем нужен):**
+После сна устройства (Android TV, ноутбук) `System.nanoTime()` / `time.Now()` могут не отразить пропущенное время. Wall clock (`currentTimeMillis`) надёжнее. Если дельта wall clock сильно превышает ожидаемый интервал проверки — устройство спало, и соединение гарантированно мертво (сервер уже удалил сессию через 120 сек).
 
 ```
 при каждом полученном пакете:
     healthMonitor.RecordActivity()  // atomic store, ~1 нс
 
+при каждой отправке keepalive:
+    healthMonitor.RecordKeepaliveSent()  // atomic store
+
 каждые 3-7 секунд (рандомизировано):
+    wallBefore = currentTimeMillis()
+    delay(interval)
+    wallAfter = currentTimeMillis()
+
+    // 1. Wake Detection
+    если (wallAfter - wallBefore) > interval * 3:
+        → HealthLost → reconnect
+
+    // 2. Active Probe
+    если lastActivity < lastKeepaliveSent И
+       (сейчас - lastKeepaliveSent) >= 15 сек:
+        → HealthLost → reconnect
+
+    // 3. Passive Thresholds
     elapsed = сейчас - lastActivity
-    newHealth = определить_уровень(elapsed)
+    newHealth = определить_уровень(elapsed)  // 20/30 сек
     если newHealth != currentHealth:
         вызвать HealthCallback(newHealth)
         если newHealth == HealthLost:
@@ -372,22 +410,28 @@ udp.send(packet)
 **Ресурсоэффективность:**
 | Аспект | Затраты |
 |--------|---------|
-| Сеть | 0 пакетов (пассивный анализ) |
-| CPU | 1 atomic store на пакет + 1 проверка каждые 3-7 сек |
-| Память | ~128 байт (2 atomic + колбэки) |
+| Сеть | 0 доп. пакетов (использует существующие keepalive) |
+| CPU | 2 atomic store на keepalive + 1 проверка каждые 3-7 сек |
+| Память | ~192 байт (3 atomic + колбэки) |
 | Аллокации | 0 (lock-free) |
 
-**Дополнительно:** клиент запускает `networkMonitorLoop` — каждые 2 секунды опрашивает состояние физических сетевых интерфейсов. При исчезновении всех физических IPv4-адресов немедленно закрывает UDP-соединение и запускает reconnect, не дожидаясь health monitor.
+**Платформо-специфичные механизмы:**
+
+| Платформа | Механизм | Описание |
+|-----------|----------|----------|
+| Windows | `networkMonitorLoop` | Каждые 2 сек опрашивает физические IPv4. При исчезновении → немедленный reconnect |
+| Android TV | `ConnectivityManager` | Системный callback `onLost()`/`onAvailable()`. При потере сети → немедленный `forceReconnect()` |
 
 **Таймауты:**
 | Параметр | Значение | Описание |
 |----------|----------|----------|
 | Keepalive интервал (клиент) | 10-20 сек | Рандомизированный (crypto/rand) |
 | Keepalive интервал (сервер) | 25±7 сек | Рандомизированный |
-| Health: Degraded порог | 35 сек | Макс. серверный keepalive + запас |
-| Health: Lost порог | 60 сек | ≈ 2 пропущенных keepalive |
+| Active Probe таймаут | 15 сек | Ожидание ответа после keepalive |
+| Health: Degraded порог | 20 сек | Макс. клиентский keepalive |
+| Health: Lost порог | 30 сек | Макс. серверный keepalive |
 | Health check интервал | 3-7 сек | Рандомизированный (локальный) |
-| Network monitor интервал | 2 сек | Проверка физических интерфейсов |
+| Network monitor интервал | 2 сек | Проверка физических интерфейсов (Windows) |
 | Таймаут сессии (сервер) | 120 сек | Без активности — удаление сессии |
 
 ### 5.4. Address Migration (смена IP клиента)

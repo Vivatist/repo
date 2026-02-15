@@ -1,14 +1,14 @@
 //go:build windows
 
-// connectionMonitor — пассивный мониторинг здоровья VPN-соединения.
+// connectionMonitor — пассивный + active probe мониторинг здоровья VPN-соединения.
 //
 // Принцип: отслеживает время последнего полученного пакета от сервера
-// (data или keepalive). Не генерирует сетевой трафик — полностью пассивный.
+// (data или keepalive). Также проверяет ответ на keepalive probe.
 //
 // Три уровня:
-//   - HealthGood:     < 35 сек (макс серверный keepalive = 32 сек + запас)
-//   - HealthDegraded: 35-60 сек (возможна потеря пакетов)
-//   - HealthLost:     > 60 сек (≈ 2 пропущенных keepalive-цикла)
+//   - HealthGood:     < 20 сек
+//   - HealthDegraded: 20-30 сек (возможна потеря пакетов)
+//   - HealthLost:     > 30 сек или keepalive probe timeout (15 сек без ответа)
 //
 // Ресурсы: 0 сетевых пакетов, 1 atomic store на приём, 1 проверка каждые 3-7 сек.
 package vpn
@@ -25,19 +25,27 @@ import (
 // Пороговые значения здоровья соединения.
 const (
 	// healthDegradedThreshold — порог для статуса "Нестабильно".
-	// Макс серверный keepalive = 32 сек (25 ± 7), берём 35 с запасом.
-	healthDegradedThreshold = 35 * time.Second
+	// Снижен для быстрой реакции на проблемы.
+	healthDegradedThreshold = 20 * time.Second
 
 	// healthLostThreshold — порог для статуса "Потеряно".
-	// ≈ 2 пропущенных keepalive-цикла сервера. При достижении — reconnect.
-	healthLostThreshold = 60 * time.Second
+	// При достижении — reconnect.
+	healthLostThreshold = 30 * time.Second
+
+	// keepaliveProbeTimeout — если после отправки keepalive нет входящих
+	// пакетов за 15 сек — соединение мёртво.
+	keepaliveProbeTimeout = 15 * time.Second
 )
 
-// connectionMonitor — lock-free пассивный монитор здоровья соединения.
+// connectionMonitor — lock-free монитор здоровья соединения с active probe.
 // Не генерирует сетевой трафик, не выделяет память на hot path.
 type connectionMonitor struct {
 	// Время последней активности (UnixNano, atomic).
 	lastActivity atomic.Int64
+
+	// Время последней отправки keepalive (UnixNano, atomic).
+	// Для active probe: если после отправки нет входящих > 15 сек — мёртво.
+	lastKeepaliveSent atomic.Int64
 
 	// Текущий статус здоровья (atomic, хранит int32 от ConnectionHealth).
 	currentHealth atomic.Int32
@@ -69,6 +77,11 @@ func newConnectionMonitor(onHealthChange domainvpn.HealthCallback, onLost func()
 // Вызывается на hot path — zero-alloc, 1 atomic store (~1 нс).
 func (m *connectionMonitor) RecordActivity() {
 	m.lastActivity.Store(time.Now().UnixNano())
+}
+
+// RecordKeepaliveSent фиксирует отправку keepalive для active probe.
+func (m *connectionMonitor) RecordKeepaliveSent() {
+	m.lastKeepaliveSent.Store(time.Now().UnixNano())
 }
 
 // Start запускает фоновый цикл проверки здоровья.

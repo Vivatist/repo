@@ -37,8 +37,12 @@ class NovaVpnClientImpl : VpnClient {
 
     companion object {
         private const val TAG = "NovaVpnClient"
-        private const val HEALTH_DEGRADED_MS = 35_000L
-        private const val HEALTH_LOST_MS = 60_000L
+        // Пороги здоровья (снижены для быстрого обнаружения проблем)
+        private const val HEALTH_DEGRADED_MS = 20_000L  // 20 сек — нестабильно
+        private const val HEALTH_LOST_MS = 30_000L       // 30 сек — потеряно
+        // Active keepalive probe: если после отправки keepalive
+        // нет входящих за PROBE_TIMEOUT — соединение мертво
+        private const val KEEPALIVE_PROBE_TIMEOUT_MS = 15_000L
         private const val MAX_RECONNECT_ATTEMPTS = 60
         private const val MAX_BACKOFF_MS = 30_000L
     }
@@ -67,6 +71,11 @@ class NovaVpnClientImpl : VpnClient {
 
     // Активность
     private val lastActivity = AtomicLong(System.nanoTime())
+    // Время последней отправки keepalive (для active probe)
+    private val lastKeepaliveSent = AtomicLong(0)
+    // Wall clock для определения пробуждения из сна
+    // (System.nanoTime() может не расти во сне, currentTimeMillis — растёт)
+    private val lastWallClockMs = AtomicLong(System.currentTimeMillis())
     private val stopped = AtomicBoolean(false)
     private val reconnecting = AtomicBoolean(false)
     private val random = SecureRandom()
@@ -379,6 +388,12 @@ class NovaVpnClientImpl : VpnClient {
         }
     }
 
+    /**
+     * Active Keepalive Probe.
+     * Отправляет keepalive и запоминает время отправки.
+     * Health monitor проверяет: если после отправки ответ не пришёл
+     * за KEEPALIVE_PROBE_TIMEOUT — соединение мертво → reconnect.
+     */
     private suspend fun keepaliveLoop() {
         while (!stopped.get()) {
             val interval = 10_000L + (random.nextInt(11) * 1000L) // 10-20 сек
@@ -393,6 +408,8 @@ class NovaVpnClientImpl : VpnClient {
                     // Обфускация заголовка (после QUIC header)
                     NovaProtocol.obfuscateHeader(packet, NovaProtocol.QUIC_HEADER_SIZE, headerMask, false)
                     socket?.send(DatagramPacket(packet, packet.size))
+                    // Запоминаем время отправки для active probe
+                    lastKeepaliveSent.set(System.nanoTime())
                 }
             } catch (e: Exception) {
                 if (!stopped.get()) Log.w(TAG, "Keepalive error: ${e.message}")
@@ -400,15 +417,61 @@ class NovaVpnClientImpl : VpnClient {
         }
     }
 
+    /**
+     * Health Monitor с тремя механизмами детекции:
+     *
+     * 1. Пассивный: нет входящих пакетов > HEALTH_DEGRADED_MS / HEALTH_LOST_MS
+     * 2. Active Probe: после отправки keepalive нет ответа > KEEPALIVE_PROBE_TIMEOUT_MS
+     * 3. Wake Detection: wall clock показывает, что устройство было в спящем режиме
+     */
     private suspend fun healthMonitorLoop() {
         while (!stopped.get()) {
             val interval = 3_000L + (random.nextInt(5) * 1000L) // 3-7 сек
+
+            // Запоминаем wall clock перед delay
+            val wallBefore = System.currentTimeMillis()
+            lastWallClockMs.set(wallBefore)
             delay(interval)
 
+            if (stopped.get() || reconnecting.get()) continue
+
+            // === Wake Detection ===
+            // Если wall clock прыгнул значительно больше чем delay(),
+            // значит устройство просыпалось из сна
+            val wallAfter = System.currentTimeMillis()
+            val wallDelta = wallAfter - wallBefore
+            val sleepDetected = wallDelta > interval + 10_000 // >10 сек сверх delay
+            if (sleepDetected) {
+                Log.w(TAG, "Wake detected! Wall clock jumped ${wallDelta}ms (expected ~${interval}ms)")
+                // После сна — обновляем lastActivity чтобы probe начал работать
+                // от текущего момента (а не от последнего пакета до сна)
+                // НО НЕ обновляем lastActivity! Пусть probe сработает быстро.
+            }
+
+            // === Passive Check ===
             val elapsed = (System.nanoTime() - lastActivity.get()) / 1_000_000 // ms
 
+            // === Active Probe ===
+            // Если keepalive был отправлен и ответ не пришёл за PROBE_TIMEOUT
+            val kaSentNano = lastKeepaliveSent.get()
+            val probeExpired = if (kaSentNano > 0) {
+                val sinceKaSent = (System.nanoTime() - kaSentNano) / 1_000_000
+                val sinceLastRecv = (System.nanoTime() - lastActivity.get()) / 1_000_000
+                // Probe считается провалившимся если:
+                // 1. Прошло > PROBE_TIMEOUT с момента отправки keepalive
+                // 2. Последний приём был ДО отправки keepalive (т.е. ответ не получен)
+                sinceKaSent >= KEEPALIVE_PROBE_TIMEOUT_MS && lastActivity.get() < kaSentNano
+            } else false
+
+            // Определяем новый уровень здоровья
             val newHealth = when {
+                // Сон + входящих нет = мёртвое соединение
+                sleepDetected && elapsed > 5_000 -> ConnectionHealth.LOST
+                // Active probe провалился
+                probeExpired -> ConnectionHealth.LOST
+                // Пассивный порог потери
                 elapsed >= HEALTH_LOST_MS -> ConnectionHealth.LOST
+                // Пассивный порог деградации
                 elapsed >= HEALTH_DEGRADED_MS -> ConnectionHealth.DEGRADED
                 else -> ConnectionHealth.GOOD
             }
@@ -416,10 +479,15 @@ class NovaVpnClientImpl : VpnClient {
             val oldHealth = _healthFlow.value
             if (oldHealth != newHealth) {
                 _healthFlow.value = newHealth
-                Log.i(TAG, "Health: $oldHealth → $newHealth (${elapsed}ms without packets)")
+                val reason = when {
+                    sleepDetected -> "wake from sleep"
+                    probeExpired -> "keepalive probe timeout"
+                    else -> "${elapsed}ms without packets"
+                }
+                Log.i(TAG, "Health: $oldHealth → $newHealth ($reason)")
 
                 if (newHealth == ConnectionHealth.LOST && !stopped.get()) {
-                    Log.w(TAG, "Connection lost, initiating reconnect...")
+                    Log.w(TAG, "Connection lost ($reason), initiating reconnect...")
                     socket?.close()
                     return
                 }
@@ -428,6 +496,16 @@ class NovaVpnClientImpl : VpnClient {
     }
 
     // ============ Автопереподключение ============
+
+    /**
+     * Принудительный reconnect (вызывается из ConnectivityManager при потере сети).
+     * Закрывает сокет — udpReadLoop поймает ошибку и запустит reconnect().
+     */
+    fun forceReconnect() {
+        if (stopped.get() || reconnecting.get()) return
+        Log.w(TAG, "forceReconnect() called (network lost)")
+        socket?.close()
+    }
 
     private suspend fun reconnect() {
         if (!reconnecting.compareAndSet(false, true)) return

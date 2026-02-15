@@ -5,6 +5,10 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -53,6 +57,12 @@ class NovaVpnService : VpnService() {
     private var vpnInterface: ParcelFileDescriptor? = null
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
+    // Мониторинг сети через ConnectivityManager
+    private var connectivityManager: ConnectivityManager? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    // Флаг: сеть доступна (атомарный для безопасного доступа из разных потоков)
+    @Volatile private var hasNetwork = true
+
     override fun onCreate() {
         super.onCreate()
         instance = this
@@ -91,6 +101,9 @@ class NovaVpnService : VpnService() {
                 }
             }
         }
+
+        // Регистрируем мониторинг сети — мгновенный callback при потере/появлении сети
+        registerNetworkMonitor()
 
         Log.i(TAG, "Service created")
     }
@@ -131,6 +144,7 @@ class NovaVpnService : VpnService() {
 
     override fun onDestroy() {
         instance = null
+        unregisterNetworkMonitor()
         scope.cancel()
         runBlocking {
             try { vpnClient.disconnect() } catch (_: Exception) {}
@@ -247,5 +261,65 @@ class NovaVpnService : VpnService() {
 
     private fun ipToString(ip: ByteArray): String {
         return ip.joinToString(".") { (it.toInt() and 0xFF).toString() }
+    }
+
+    // ============ Мониторинг сети ============
+
+    /**
+     * Регистрирует ConnectivityManager callback.
+     * Мгновенный callback при потере/появлении сети:
+     * - onLost: сеть потеряна → закрываем сокет → reconnect
+     * - onAvailable: сеть появилась → логируем (ускоряет reconnect)
+     * Не нарушает маскировку — никакого трафика не генерирует.
+     */
+    private fun registerNetworkMonitor() {
+        try {
+            val cm = getSystemService(ConnectivityManager::class.java) ?: return
+            connectivityManager = cm
+
+            val callback = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    Log.i(TAG, "Network available")
+                    hasNetwork = true
+                }
+
+                override fun onLost(network: Network) {
+                    Log.w(TAG, "Network lost!")
+                    hasNetwork = false
+
+                    // Если VPN подключён — закрываем сокет для мгновенного reconnect
+                    if (vpnClient.stateFlow.value == ConnectionState.CONNECTED) {
+                        Log.w(TAG, "Forcing reconnect due to network loss")
+                        vpnClient.forceReconnect()
+                    }
+                }
+            }
+
+            networkCallback = callback
+
+            val request = NetworkRequest.Builder()
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .build()
+            cm.registerNetworkCallback(request, callback)
+            Log.i(TAG, "Network monitor registered")
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to register network monitor: ${e.message}")
+        }
+    }
+
+    /**
+     * Отменяет мониторинг сети.
+     */
+    private fun unregisterNetworkMonitor() {
+        try {
+            networkCallback?.let { cb ->
+                connectivityManager?.unregisterNetworkCallback(cb)
+                Log.i(TAG, "Network monitor unregistered")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to unregister network monitor: ${e.message}")
+        }
+        networkCallback = null
+        connectivityManager = null
     }
 }
