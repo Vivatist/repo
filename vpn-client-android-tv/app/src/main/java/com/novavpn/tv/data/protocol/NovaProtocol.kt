@@ -1,7 +1,7 @@
 package com.novavpn.tv.data.protocol
 
 import java.nio.ByteBuffer
-import java.security.SecureRandom
+import java.util.concurrent.ThreadLocalRandom
 
 /**
  * Протокол NovaVPN v3 — маскировка под QUIC Short Header.
@@ -55,21 +55,22 @@ object NovaProtocol {
     const val PACKET_KEEPALIVE: Byte = 0x20
     const val PACKET_DISCONNECT: Byte = 0x30
 
-    private val random = SecureRandom()
-
     /**
      * Записывает QUIC Short Header (5 байт) в начало buf.
      * Flags byte: 0x40 | random_6bits.
      * Bytes 1-4: случайные (обфусцированная DCID-подобная область).
+     *
+     * ThreadLocalRandom вместо SecureRandom: QUIC-заголовок не security-critical,
+     * цель — маскировка для DPI. Без внутреннего lock на hot path.
      */
     fun writeQUICHeader(buf: ByteArray, offset: Int = 0) {
-        val rnd = ByteArray(5)
-        random.nextBytes(rnd)
-        buf[offset] = (QUIC_FIXED_BIT_MASK.toInt() or (rnd[0].toInt() and 0x3F)).toByte()
-        buf[offset + 1] = rnd[1]
-        buf[offset + 2] = rnd[2]
-        buf[offset + 3] = rnd[3]
-        buf[offset + 4] = rnd[4]
+        val rng = ThreadLocalRandom.current()
+        val v = rng.nextLong()
+        buf[offset] = (QUIC_FIXED_BIT_MASK.toInt() or (v.toInt() and 0x3F)).toByte()
+        buf[offset + 1] = (v shr 8).toByte()
+        buf[offset + 2] = (v shr 16).toByte()
+        buf[offset + 3] = (v shr 24).toByte()
+        buf[offset + 4] = (v shr 32).toByte()
     }
 
     /**
@@ -115,7 +116,7 @@ object NovaProtocol {
      */
     fun randomPadLen(min: Int, max: Int): Int {
         if (max <= min) return min
-        return min + random.nextInt(max - min + 1)
+        return min + ThreadLocalRandom.current().nextInt(max - min + 1)
     }
 
     /**
@@ -127,7 +128,7 @@ object NovaProtocol {
         val alignedTarget = ((minPadded + DATA_PAD_ALIGN - 1) / DATA_PAD_ALIGN) * DATA_PAD_ALIGN
         var padLen = alignedTarget - minPadded
 
-        padLen += random.nextInt(DATA_PAD_RANDOM_MAX + 1)
+        padLen += ThreadLocalRandom.current().nextInt(DATA_PAD_RANDOM_MAX + 1)
 
         if (padLen > 255) padLen = 255
         return padLen
@@ -164,7 +165,7 @@ object NovaProtocol {
         buf.put(packetType)
         // Заполняем padding случайными байтами
         val padding = ByteArray(padLen)
-        random.nextBytes(padding)
+        ThreadLocalRandom.current().nextBytes(padding)
         buf.put(padding)
         return addQUICHeader(raw)
     }
