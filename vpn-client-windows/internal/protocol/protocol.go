@@ -3,10 +3,10 @@
 package protocol
 
 import (
-	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	mathrand "math/rand/v2"
 	"net"
 )
 
@@ -119,14 +119,16 @@ var (
 // Flags byte: 0x40 | random_6bits (имитирует QUIC Short Header).
 // Bytes 1-4: случайные (обфусцированная «DCID-подобная» область).
 // buf должен быть >= QUICHeaderSize.
+//
+// math/rand/v2 вместо crypto/rand: QUIC-заголовок не security-critical,
+// цель — маскировка для DPI. Без syscall на hot path.
 func WriteQUICHeader(buf []byte) {
-	var rnd [5]byte
-	rand.Read(rnd[:])
-	buf[0] = QUICFixedBitMask | (rnd[0] & 0x3F) // 0b01XXXXXX
-	buf[1] = rnd[1]
-	buf[2] = rnd[2]
-	buf[3] = rnd[3]
-	buf[4] = rnd[4]
+	v := mathrand.Uint64()
+	buf[0] = QUICFixedBitMask | (byte(v) & 0x3F) // 0b01XXXXXX
+	buf[1] = byte(v >> 8)
+	buf[2] = byte(v >> 16)
+	buf[3] = byte(v >> 24)
+	buf[4] = byte(v >> 32)
 }
 
 // IsQUICShortHeader проверяет, является ли первый байт валидным QUIC Short Header.

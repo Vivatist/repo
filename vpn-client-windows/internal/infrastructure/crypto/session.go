@@ -389,13 +389,12 @@ const (
 )
 
 // RandomPadLen возвращает случайную длину padding в диапазоне [min, max].
+// math/rand/v2 — длина padding не security-critical. Без syscall на hot path.
 func RandomPadLen(min, max int) int {
 	if max <= min {
 		return min
 	}
-	var b [2]byte
-	_, _ = rand.Read(b[:])
-	return min + int(binary.BigEndian.Uint16(b[:]))%(max-min+1)
+	return min + mathrand.IntN(max-min+1)
 }
 
 // ComputeDataPadLen вычисляет длину padding для data-пакета.
