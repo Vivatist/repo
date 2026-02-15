@@ -3,7 +3,7 @@
 ## Версия 2.0.0
 
 ### ✅ Этап 1: Анализ и проектирование
-- [x] Изучение протокола NovaVPN v2 (NOVAVPN_PROTOCOL.md)
+- [x] Изучение протокола NovaVPN v3 (NOVAVPN_PROTOCOL.md)
 - [x] Изучение логики взаимодействия клиент-сервер (CLIENT_SERVER_INTERACTION.md)
 - [x] Анализ реализации Windows-клиента (Go + Walk GUI)
 - [x] Выбор технологического стека: **Kotlin + Jetpack Compose for TV**
@@ -20,13 +20,16 @@
 - [x] Интерфейс VPN-клиента (`VpnClient`)
 
 ### ✅ Этап 3: Протокол (data/protocol)
-- [x] TLS 1.2 маскировка (заголовок 5 байт: 0x17, 0x03, 0x03, len)
+- [x] QUIC Short Header маскировка (5 байт: Flags + Random×4)
+- [x] XOR-обфускация заголовков (SessionID + Type + Counter, маска из HMAC-SHA256(PSK))
 - [x] Маршалинг HandshakeInit (pubkey + timestamp + creds + HMAC)
 - [x] Маршалинг HandshakeComplete (confirmHMAC)
 - [x] Маршалинг credentials (email + password в LTV-формате)
 - [x] Маршалинг Data-пакетов (SessionID + Type + Counter + Ciphertext)
-- [x] Маршалинг Keepalive/Disconnect (10 байт)
-- [x] Парсинг входящих пакетов (Data, Keepalive, Disconnect, Error, HandshakeResp)
+- [x] Маршалинг Keepalive/Disconnect (50-160 байт с random padding)
+- [x] Парсинг входящих пакетов (Data, Keepalive, Disconnect, HandshakeResp)
+- [x] Двухфазная деобфускация входящих пакетов (SID+Type → Counter)
+- [x] Data padding (выравнивание до 64 байт + random 0-32)
 - [x] Парсинг HandshakeResp (SessionID, IP, DNS, MTU, PSK)
 
 ### ✅ Этап 4: Криптография (data/crypto)
@@ -74,6 +77,8 @@
 - [x] Foreground Service с уведомлением
 - [x] TUN-интерфейс через VpnService.Builder
 - [x] Маршрутизация всего трафика через VPN (0.0.0.0/0)
+- [x] addDisallowedApplication(packageName) — исключение приложения из VPN (предотвращение routing loop)
+- [x] protect() сокета с проверкой результата
 - [x] DNS-настройка
 - [x] Обработка ACTION_CONNECT / ACTION_DISCONNECT
 - [x] Singleton для доступа из UI
@@ -87,12 +92,14 @@
 
 ### ✅ Этап 10: Пользовательский интерфейс (ui)
 - [x] Jetpack Compose для TV
-- [x] D-pad навигация (Enter/OK для кнопок)
+- [x] D-pad навигация (Enter/OK для кнопок, два режима ввода текста)
 - [x] Лаконичный главный экран (щит + статус + кнопка)
 - [x] Анимация пульсации статуса
-- [x] Панель настроек (сервер, email, пароль)
-- [x] Цветовая индикация состояния (красный/жёлтый/зелёный)
-- [x] ViewModel + StateFlow (reactive UI)
+- [x] Панель настроек (сервер, email, пароль) с валидацией и сохранением
+- [x] Показ/скрытие пароля (toggle)
+- [x] Цветовая индикация состояния (серый/жёлтый/зелёный)
+- [x] Отображение версии приложения (BuildConfig.VERSION_NAME)
+- [x] ViewModel + StateFlow (reactive UI) + observeVpnState()
 
 ### ✅ Этап 11: Сборка и дистрибуция
 - [x] Gradle конфигурация (Kotlin 1.9 + Compose + TV)

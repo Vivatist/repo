@@ -530,41 +530,45 @@ nonce        = nonce_prefix(4) + BigEndian_uint64(wire_counter)(8)  = 12 бай�
 ### 6.3. Расшифровка Data-пакета (приём)
 
 ```
-1. Удалить TLS заголовок (5B) → raw
-2. sessionID = BigEndian_uint32(raw[0:4])
-3. type = raw[4]   // 0x10
-4. counter = BigEndian_uint32(raw[5:9])
-5. ciphertext = raw[9:]
-6. nonce = recv_nonce_prefix(4) + BE_uint64(counter)(8)
-7. plaintext = ChaCha20_XOR(recvKey, nonce, ciphertext)
-8. Записать plaintext (IP-пакет) в TUN
+1. Пропустить QUIC Short Header (5B) → raw
+2. Деобфускация заголовка: raw[0:9] XOR headerMask (SID + Type + Counter)
+3. sessionID = BigEndian_uint32(raw[0:4])
+4. type = raw[4]   // 0x10
+5. counter = BigEndian_uint32(raw[5:9])
+6. ciphertext = raw[9:]
+7. nonce = recv_nonce_prefix(4) + BE_uint64(counter)(8)
+8. paddedData = ChaCha20_XOR(recvKey, nonce, ciphertext)
+9. padLen = paddedData[len(paddedData) - 1]
+10. plaintext = paddedData[:len(paddedData) - 1 - padLen]
+11. Записать plaintext (IP-пакет) в TUN
 ```
 
 ### 6.4. Keepalive
 
-Lightweight-формат: **10 байт**, zero-alloc.
+Формат с random padding: **50-160 байт** (QUIC(5) + SID(4) + Type(1) + Padding(40-150)).
 
 ```
-┌─────────────────────────────┬───────────┬──────┐
-│ 0x17 0x03 0x03 [0x00 0x05]  │ SessionID │ 0x20 │
-│         5 байт              │    4B     │  1B  │
-└─────────────────────────────┴───────────┴──────┘
+┌─────────────────────────────────┬───────────┬──────┬──────────────────┐
+│   QUIC Short Header (5B)        │ SessionID │ 0x20 │  Random Padding  │
+│ Flags(1) + Random(4)            │    4B     │  1B  │   40-150 bytes   │
+└─────────────────────────────────┴───────────┴──────┴──────────────────┘
 ```
 
 - **Nonce/Payload**: отсутствуют
-- **Шифрование**: нет
+- **Шифрование**: нет (padding — случайные bytes из `crypto/rand`)
+- **Обфускация**: SessionID и Type обфусцированы XOR-маской из PSK
 - Сессия истекает на сервере через **120 сек** без активности
-- Сервер отвечает keepalive в том же формате (10 байт) для подтверждения живости
+- Сервер отвечает keepalive в том же формате (50-160 байт) для подтверждения живости
 - При смене IP/порта клиента (NAT rebind) сервер обновляет адрес клиента автоматически (address migration)
 
 **Интервалы:**
 
 | Сторона | Интервал | Примечание |
 |---------|----------|------------|
-| Клиент → Сервер | каждые **15 секунд** | Фиксированный интервал |
+| Клиент → Сервер | каждые **10-20 секунд** | Рандомизированный (`crypto/rand`), анти-DPI |
 | Сервер → Клиент | **25 ± 7 секунд** | Рандомизированный (18-32 сек) для снижения DPI fingerprinting |
 
-> **DPI anti-fingerprinting**: сервер намеренно рандомизирует интервал keepalive при каждой отправке, чтобы трафик не имел детерминированного паттерна.
+> **DPI anti-fingerprinting**: обе стороны намеренно рандомизируют интервал keepalive при каждой отправке, чтобы трафик не имел детерминированного паттерна.
 
 ### 6.5. Disconnect
 
@@ -602,12 +606,12 @@ Lightweight-формат с random padding, аналогичен keepalive.
 ```
 Клиент                                          Сервер
   │                                               │
-  │  Keepalive probe (10 байт)                     │
+  │  Keepalive probe (50-160 байт, с padding)      │
   │  (SessionID = сохранённый)                     │
   │  ──────────────────────────────────────────►   │
   │                                               │ Находит сессию по SessionID
   │                                               │ Обновляет адрес (address migration)
-  │  Keepalive response (10 байт)                  │
+  │  Keepalive response (50-160 байт, с padding)   │
   │  ◄──────────────────────────────────────────   │
   │                                               │
   │  Сессия восстановлена за 0-RTT!                │
@@ -786,59 +790,87 @@ novavpn-server -enable   -email user@example.com
  7. Создать TUN-адаптер (IP = AssignedIP, маска из SubnetMask)
  8. Настроить DNS
  9. Настроить маршруты (split routes)
-10. Запустить 3 горутины/потока:
-      - UDP → расшифровка (counter-nonce + ChaCha20 XOR) → TUN (входящие)
-      - TUN → шифрование (counter-nonce + ChaCha20 XOR) → UDP (исходящие)
-      - Keepalive каждые 15 сек (lightweight 10 байт)
+10. Запустить 4 горутины/потока:
+      - UDP → деобфускация → расшифровка (counter-nonce + ChaCha20 XOR) → снятие padding → TUN
+      - TUN → padding → шифрование (counter-nonce + ChaCha20 XOR) → обфускация → UDP
+      - Keepalive каждые 10-20 сек (рандомизированный, 50-160 байт с padding)
+      - Health Monitor (пассивный, 3-7 сек, dead-peer detection)
 11. При потере соединения: auto-reconnect с 0-RTT resume (см. раздел 8)
-12. При отключении: отправить Disconnect (10 байт), удалить маршруты, закрыть TUN
+12. При отключении: отправить Disconnect (50-160 байт с padding), удалить маршруты, закрыть TUN
 ```
 
 ### 12.3. Построение пакета (пошагово)
 
 ```python
+# ===== QUIC Short Header (5 байт) =====
+def write_quic_header():
+    flags = 0x40 | (os.urandom(1)[0] & 0x3F)  # Fixed Bit=1 + 6 random bits
+    return bytes([flags]) + os.urandom(4)       # итого 5 байт
+
+# ===== XOR-обфускация заголовка =====
+header_mask = hmac_sha256(PSK, b"nova-header-mask")[:9]  # вычисляется ОДИН раз
+
+def obfuscate_header(raw, is_data):
+    raw[0:4] ^= header_mask[0:4]   # SessionID
+    raw[4]   ^= header_mask[4]     # PacketType
+    if is_data:
+        raw[5:9] ^= header_mask[5:9]  # Counter (только data)
+
 # ===== Handshake-пакет (с Nonce) =====
 def build_handshake_packet(pkt_type, session_id, nonce, payload):
-    raw = b""
+    raw = bytearray()
     raw += struct.pack(">I", session_id)    # 4 байта, Big-Endian uint32
     raw += bytes([pkt_type])                # 1 байт
     raw += nonce                            # 12 байт
     raw += payload                          # переменная длина
 
-    tls_header = bytes([0x17, 0x03, 0x03]) + struct.pack(">H", len(raw))
-    return tls_header + raw
+    obfuscate_header(raw, is_data=False)    # XOR SID + Type
+    return write_quic_header() + raw
 
-# ===== Data-пакет (с Counter + plain ChaCha20) =====
+# ===== Data-пакет (с Counter + plain ChaCha20 + padding) =====
 def build_data_packet(session_id, send_key, nonce_prefix, counter, plaintext):
     wire_ctr = counter & 0xFFFFFFFF          # truncate to uint32
-    nonce = nonce_prefix + struct.pack(">Q", wire_ctr)     # 4 + 8 = 12 байт
-    ciphertext = chacha20_xor(send_key, nonce, plaintext)  # plain ChaCha20, без tag!
+    nonce = nonce_prefix + struct.pack(">Q", wire_ctr)  # 4 + 8 = 12 байт
 
-    raw = struct.pack(">I", session_id)     # 4 байта
-    raw += bytes([0x10])                    # Type = Data
-    raw += struct.pack(">I", wire_ctr)      # 4 байта Counter
+    # Padding: выравнивание до 64 + случайная добавка 0-32
+    pad_len = compute_data_pad_len(len(plaintext))
+    padded = plaintext + b'\x00' * pad_len + bytes([pad_len])
+    ciphertext = chacha20_xor(send_key, nonce, padded)  # plain ChaCha20, без tag!
+
+    raw = bytearray()
+    raw += struct.pack(">I", session_id)     # 4 байта
+    raw += bytes([0x10])                     # Type = Data
+    raw += struct.pack(">I", wire_ctr)       # 4 байта Counter
     raw += ciphertext
 
-    tls_header = bytes([0x17, 0x03, 0x03]) + struct.pack(">H", len(raw))
-    return tls_header + raw
+    obfuscate_header(raw, is_data=True)      # XOR SID + Type + Counter
+    return write_quic_header() + raw
 
-# ===== Keepalive/Disconnect (lightweight, 10 байт) =====
-def build_lightweight_packet(pkt_type, session_id):
-    raw = struct.pack(">I", session_id)     # 4 байта
-    raw += bytes([pkt_type])                # 1 байт (0x20 или 0x30)
-    tls_header = bytes([0x17, 0x03, 0x03]) + struct.pack(">H", len(raw))
-    return tls_header + raw                 # итого 10 байт
+# ===== Keepalive/Disconnect (с random padding, 50-160 байт) =====
+def build_simple_packet(pkt_type, session_id):
+    pad_len = random.randint(40, 150)
+    raw = bytearray()
+    raw += struct.pack(">I", session_id)      # 4 байта
+    raw += bytes([pkt_type])                  # 1 байт (0x20 или 0x30)
+    raw += os.urandom(pad_len)                # random padding
+
+    obfuscate_header(raw, is_data=False)      # XOR SID + Type
+    return write_quic_header() + raw          # итого 50-160 байт
 
 # ===== Приём =====
-def parse_packet(data):
-    assert data[0] == 0x17               # TLS Application Data
-    tls_len = struct.unpack(">H", data[3:5])[0]
-    raw = data[5 : 5 + tls_len]
+def parse_packet(data, header_mask):
+    quic_header = data[0:5]                   # QUIC Short Header (пропускаем)
+    raw = bytearray(data[5:])
+
+    # Деобфускация: сначала SID + Type (5 байт)
+    raw[0:4] ^= header_mask[0:4]
+    raw[4]   ^= header_mask[4]
 
     session_id = struct.unpack(">I", raw[0:4])[0]
     pkt_type   = raw[4]
 
     if pkt_type == 0x10:  # Data
+        raw[5:9] ^= header_mask[5:9]          # деобфускация Counter
         counter = struct.unpack(">I", raw[5:9])[0]
         ciphertext = raw[9:]
         return session_id, pkt_type, counter, ciphertext
@@ -846,7 +878,7 @@ def parse_packet(data):
         nonce   = raw[5:17]
         payload = raw[17:]
         return session_id, pkt_type, nonce, payload
-    else:  # Keepalive/Disconnect (нет дополнительных полей)
+    else:  # Keepalive/Disconnect (padding игнорируется)
         return session_id, pkt_type, None, None
 ```
 
@@ -1058,9 +1090,9 @@ WantedBy=multi-user.target
 
 2. **Нет QUIC Initial/Handshake**: настоящий QUIC Long Header handshake не имитируется. При глубоком анализе DPI может обнаружить отсутствие QUIC Initial packet.
 
-3. **SessionID открыт**: необходим для маршрутизации пакетов к правильной сессии на сервере до расшифровки.
+3. **SessionID и PacketType обфусцированы**: XOR-маска из `HMAC-SHA256(PSK, "nova-header-mask")[:9]` скрывает SessionID, PacketType и Counter от DPI. Сервер восстанавливает поля за O(1) — не требует перебора.
 
-4. **PacketType открыт**: вынесен из зашифрованной части для маршрутизации на уровне сервера (handshake vs data).
+4. **Counter обфусцирован**: 4-байтный Counter в data-пакетах также скрыт XOR-маской (байты 5-8 маски). Без знания PSK невозможно определить порядковый номер пакета.
 
 5. **Нет аутентификации Data-пакетов**: plain ChaCha20 XOR без Poly1305 означает отсутствие проверки целостности для Data-пакетов. Это осознанный trade-off в пользу производительности. Replay protection для Data-пакетов отсутствует (counter не проверяется на приёмной стороне).
 

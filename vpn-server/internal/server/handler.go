@@ -349,18 +349,23 @@ func (s *VPNServer) sendToClient(session *Session, plaintext []byte, buf []byte)
 }
 
 // sendKeepalives отправляет keepalive всем активным клиентам.
-// Lightweight формат: QUIC(5) + SID(4) + Type(1) = 10 bytes, zero-alloc.
+// Формат с padding: QUIC(5) + SID(4) + Type(1) + RandomPad(40-150) = 50-160 байт.
+// Аналогичен keepalive response — единообразный формат для защиты от DPI.
 func (s *VPNServer) sendKeepalives() {
 	sessions := s.sessions.GetAllSessions()
-	var kaBuf [10]byte
+	var kaBuf [protocol.QUICHeaderSize + 5 + protocol.KeepalivePadMax]byte
 	for _, session := range sessions {
 		if session.IsActive() {
+			padLen := protocol.RandomPadLen(protocol.KeepalivePadMin, protocol.KeepalivePadMax)
+			kaSize := 5 + padLen // SID(4) + Type(1) + Padding
 			protocol.WriteQUICHeader(kaBuf[:protocol.QUICHeaderSize])
 			binary.BigEndian.PutUint32(kaBuf[5:9], session.ID)
 			kaBuf[9] = byte(protocol.PacketKeepalive)
+			// Заполняем padding случайными данными
+			crand.Read(kaBuf[10 : 10+padLen])
 			// Обфускация заголовка (SID + Type)
 			protocol.ObfuscateHeader(kaBuf[5:], s.headerMask, false)
-			s.udpConn.WriteToUDP(kaBuf[:], session.ClientAddr)
+			s.udpConn.WriteToUDP(kaBuf[:protocol.QUICHeaderSize+kaSize], session.ClientAddr)
 		}
 	}
 }

@@ -92,7 +92,9 @@
    - Маска подсети: SubnetMask из HandshakeResp
    - MTU: из HandshakeResp
 7. Настроить DNS (DNS1, DNS2 из HandshakeResp)
-8. Настроить маршруты (split routes: 0/1 + 128/1)
+8. Настроить маршруты:
+   - Windows/Linux/macOS: split routes (0/1 + 128/1) + серверный маршрут через физический шлюз
+   - Android: addRoute("0.0.0.0", 0) + addDisallowedApplication + protect(socket)
 9. Запустить 4 рабочих цикла:
    - Чтение из UDP → расшифровка → запись в TUN
    - Чтение из TUN → шифрование → отправка в UDP
@@ -861,6 +863,7 @@ HKDF-SHA256(
 
 ### 14.3. Маршрутизация (full tunnel)
 
+**Windows/Linux/macOS** — split routes:
 ```
 1. route add <serverIP>/32 via <physicalGateway>      # прямой путь к серверу
 2. route add 0.0.0.0/1 via <vpnGateway>               # первая половина интернета
@@ -869,7 +872,22 @@ HKDF-SHA256(
 
 Где `vpnGateway` — первый IP подсети (напр. `10.8.0.1` для `10.8.0.0/16`).
 
-> **Важно**: UDP-сокет к VPN-серверу должен быть привязан к **физическому** интерфейсу, иначе возникнет петля маршрутизации.
+**Android** — VPN API:
+```
+VpnService.Builder()
+    .addAddress(assignedIP, subnetMask)
+    .addRoute("0.0.0.0", 0)                    // весь трафик через VPN
+    .addDisallowedApplication(packageName)      // исключить себя → предотвратить routing loop
+    .addDnsServer(dns1)
+    .addDnsServer(dns2)
+    .setMtu(mtu)
+    .establish()
+
+// UDP-сокет к серверу должен быть защищён через protect():
+protect(socket.fileDescriptor)                  // исключить из VPN-маршрутизации
+```
+
+> **Важно**: на всех платформах UDP-сокет к VPN-серверу должен быть привязан к **физическому** интерфейсу (Windows: bind к адресу шлюза; Android: `protect()` + `addDisallowedApplication()`), иначе возникнет петля маршрутизации.
 
 ### 14.4. Минимальная конфигурация от пользователя
 
