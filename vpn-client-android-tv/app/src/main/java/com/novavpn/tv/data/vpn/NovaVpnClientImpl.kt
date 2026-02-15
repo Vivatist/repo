@@ -134,7 +134,10 @@ class NovaVpnClientImpl : VpnClient {
             socket = sock
 
             // Защищаем сокет от маршрутизации через TUN
-            onProtectSocket?.invoke(sock)
+            val protected = onProtectSocket?.invoke(sock) ?: false
+            if (!protected) {
+                Log.e(TAG, "Socket protect() failed — VPN routing loop risk!")
+            }
 
             Log.i(TAG, "UDP: ${sock.localAddress}:${sock.localPort} -> ${params.serverAddr}")
 
@@ -450,7 +453,10 @@ class NovaVpnClientImpl : VpnClient {
                 socket = sock
 
                 // Защищаем сокет от маршрутизации через TUN
-                onProtectSocket?.invoke(sock)
+                val protectedOk = onProtectSocket?.invoke(sock) ?: false
+                if (!protectedOk) {
+                    Log.e(TAG, "Reconnect: socket protect() failed!")
+                }
 
                 // Пробуем 0-RTT resume
                 if (resumeSessionId != 0L && resumeKeys != null) {

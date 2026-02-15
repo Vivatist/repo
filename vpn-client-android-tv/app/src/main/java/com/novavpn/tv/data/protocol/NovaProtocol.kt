@@ -245,9 +245,10 @@ object NovaProtocol {
 
         if (rawLen < SESSION_ID_SIZE + PACKET_TYPE_SIZE) return null
 
-        // Деобфускация заголовка: XOR с маской из PSK (копия чтобы не мутировать буфер)
+        // Деобфускация заголовка: сначала только SID(4) + Type(1) = 5 байт.
+        // Counter (ещё 4 байта) деобфусцируем ТОЛЬКО для data-пакетов (как Windows-клиент).
         val deobf = raw.copyOf()
-        obfuscateHeader(deobf, 0, headerMask, true) // XOR обратим
+        obfuscateHeader(deobf, 0, headerMask, false) // только SID + Type
 
         val buf = ByteBuffer.wrap(deobf)
         val sessionId = buf.int.toLong() and 0xFFFFFFFFL
@@ -256,9 +257,14 @@ object NovaProtocol {
         return when (packetType) {
             PACKET_DATA -> {
                 if (rawLen < SESSION_ID_SIZE + PACKET_TYPE_SIZE + COUNTER_SIZE) return null
-                val counter = buf.int
-                val ciphertext = ByteArray(rawLen - SESSION_ID_SIZE - PACKET_TYPE_SIZE - COUNTER_SIZE)
-                buf.get(ciphertext)
+                // Деобфускация Counter для data-пакетов (ещё 4 байта)
+                deobf[5] = (deobf[5].toInt() xor headerMask[5].toInt()).toByte()
+                deobf[6] = (deobf[6].toInt() xor headerMask[6].toInt()).toByte()
+                deobf[7] = (deobf[7].toInt() xor headerMask[7].toInt()).toByte()
+                deobf[8] = (deobf[8].toInt() xor headerMask[8].toInt()).toByte()
+                val counter = ByteBuffer.wrap(deobf, 5, 4).int
+                val payloadOffset = SESSION_ID_SIZE + PACKET_TYPE_SIZE + COUNTER_SIZE
+                val ciphertext = deobf.copyOfRange(payloadOffset, rawLen)
                 ParsedPacket(sessionId, packetType, counter = counter, payload = ciphertext)
             }
             PACKET_HANDSHAKE_RESP -> {

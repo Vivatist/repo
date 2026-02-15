@@ -73,7 +73,13 @@ class NovaVpnService : VpnService() {
         }
 
         vpnClient.onProtectSocket = { socket ->
-            protect(socket)
+            val ok = protect(socket)
+            if (!ok) {
+                Log.e(TAG, "protect() FAILED — VPN routing loop!")
+            } else {
+                Log.i(TAG, "Socket protected from VPN routing")
+            }
+            ok
         }
 
         // Следим за состоянием для обновления уведомления
@@ -136,7 +142,7 @@ class NovaVpnService : VpnService() {
     }
 
     override fun onRevoke() {
-        Log.i(TAG, "VPN revoked by system")
+        Log.e(TAG, "VPN REVOKED by system! (routing loop or another VPN took over)")
         scope.launch {
             try { vpnClient.disconnect() } catch (_: Exception) {}
         }
@@ -165,6 +171,15 @@ class NovaVpnService : VpnService() {
                 // Маршрутизация всего трафика через VPN
                 .addRoute("0.0.0.0", 0)
                 .setBlocking(true)
+
+            // Исключаем своё приложение из VPN-туннеля (защита от routing loop
+            // на Android TV, где protect() может не работать для UDP-сокетов)
+            try {
+                builder.addDisallowedApplication(packageName)
+                Log.i(TAG, "Excluded $packageName from VPN tunnel")
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to exclude app from VPN: ${e.message}")
+            }
 
             val pfd = builder.establish()
                 ?: throw Exception("Failed to establish VPN interface")

@@ -8,7 +8,9 @@ import com.novavpn.tv.data.repository.DataStoreConfigRepository
 import com.novavpn.tv.domain.model.*
 import com.novavpn.tv.domain.repository.ConfigRepository
 import com.novavpn.tv.service.NovaVpnService
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 /**
@@ -36,7 +38,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             ?: MutableStateFlow(ConnectionHealth.GOOD)
 
     init {
-        // Загружаем конфигурацию
+        // Загружаем конфигурацию (включая PSK)
         viewModelScope.launch {
             val config = configRepository.load()
             _uiState.update {
@@ -44,16 +46,32 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     serverAddr = config.serverAddr,
                     email = config.email,
                     password = config.password,
+                    psk = config.preSharedKey,
                     configLoaded = true,
                     wasConnected = config.wasConnected
                 )
             }
         }
 
-        // Наблюдаем за состоянием VPN
+        // Наблюдаем за состоянием VPN (с ожиданием появления сервиса)
+        observeVpnState()
+    }
+
+    /**
+     * Непрерывное наблюдение за состоянием VPN-сервиса.
+     * Ждёт появления NovaVpnService.instance (сервис запускается позже ViewModel),
+     * затем подписывается на stateFlow клиента.
+     */
+    private fun observeVpnState() {
         viewModelScope.launch {
-            NovaVpnService.instance?.vpnClient?.stateFlow?.collectLatest { state ->
-                _uiState.update { it.copy(connectionState = state) }
+            while (isActive) {
+                val service = NovaVpnService.instance
+                if (service != null) {
+                    service.vpnClient.stateFlow.collectLatest { state ->
+                        _uiState.update { it.copy(connectionState = state) }
+                    }
+                }
+                delay(200) // Проверяем каждые 200мс пока сервис не появится
             }
         }
     }
@@ -76,11 +94,34 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun saveSettings() {
         val state = _uiState.value
+
+        // Валидация адреса сервера: host:port
+        val addrRegex = Regex("^[\\w.\\-]+:\\d{1,5}$")
+        if (!addrRegex.matches(state.serverAddr.trim())) {
+            _uiState.update { it.copy(validationError = "Неверный формат адреса. Укажите host:port (например, 212.118.43.43:443)") }
+            return
+        }
+
+        // Валидация email: минимальная проверка наличия @
+        if (!state.email.trim().contains("@") || state.email.trim().length < 3) {
+            _uiState.update { it.copy(validationError = "Неверный формат email") }
+            return
+        }
+
+        // Валидация пароля: не пустой
+        if (state.password.isBlank()) {
+            _uiState.update { it.copy(validationError = "Пароль не может быть пустым") }
+            return
+        }
+
+        // Валидация прошла — сохраняем и закрываем панель
+        _uiState.update { it.copy(validationError = null, showSettings = false) }
+
         viewModelScope.launch {
             configRepository.save(
                 VpnConfig(
-                    serverAddr = state.serverAddr,
-                    email = state.email,
+                    serverAddr = state.serverAddr.trim(),
+                    email = state.email.trim(),
                     password = state.password,
                     preSharedKey = state.psk,
                     wasConnected = state.wasConnected
@@ -96,18 +137,37 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
-        saveSettings()
         _uiState.update { it.copy(connectionState = ConnectionState.CONNECTING, errorMessage = null) }
 
-        val context = getApplication<Application>()
-        val intent = android.content.Intent(context, NovaVpnService::class.java).apply {
-            action = NovaVpnService.ACTION_CONNECT
-            putExtra(NovaVpnService.EXTRA_SERVER, state.serverAddr)
-            putExtra(NovaVpnService.EXTRA_EMAIL, state.email)
-            putExtra(NovaVpnService.EXTRA_PASSWORD, state.password)
-            putExtra(NovaVpnService.EXTRA_PSK, state.psk)
+        viewModelScope.launch {
+            // Загружаем актуальный PSK (мог быть обновлён через bootstrap)
+            val config = configRepository.load()
+            val psk = config.preSharedKey
+            if (psk.isNotEmpty() && state.psk != psk) {
+                _uiState.update { it.copy(psk = psk) }
+            }
+
+            // Сохраняем текущие настройки
+            configRepository.save(
+                VpnConfig(
+                    serverAddr = state.serverAddr.trim(),
+                    email = state.email.trim(),
+                    password = state.password,
+                    preSharedKey = psk,
+                    wasConnected = state.wasConnected
+                )
+            )
+
+            val context = getApplication<Application>()
+            val intent = android.content.Intent(context, NovaVpnService::class.java).apply {
+                action = NovaVpnService.ACTION_CONNECT
+                putExtra(NovaVpnService.EXTRA_SERVER, state.serverAddr.trim())
+                putExtra(NovaVpnService.EXTRA_EMAIL, state.email.trim())
+                putExtra(NovaVpnService.EXTRA_PASSWORD, state.password)
+                putExtra(NovaVpnService.EXTRA_PSK, psk)
+            }
+            context.startForegroundService(intent)
         }
-        context.startForegroundService(intent)
     }
 
     fun disconnect() {
@@ -149,5 +209,6 @@ data class MainUiState(
     val showSettings: Boolean = false,
     val configLoaded: Boolean = false,
     val wasConnected: Boolean = false,
-    val errorMessage: String? = null
+    val errorMessage: String? = null,
+    val validationError: String? = null
 )

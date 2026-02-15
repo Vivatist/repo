@@ -11,6 +11,8 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -22,13 +24,16 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.input.key.*
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.novavpn.tv.BuildConfig
 import com.novavpn.tv.domain.model.ConnectionState
 
 // Цвета NovaVPN
@@ -40,10 +45,16 @@ private val NovaError = Color(0xFFEF5350)
 private val NovaYellow = Color(0xFFFFAB40)
 private val NovaTextPrimary = Color(0xFFFFFFFF)
 private val NovaTextSecondary = Color(0xB3FFFFFF)
+private val NovaTextHint = Color(0x80FFFFFF)
 
 /**
  * Главный экран NovaVPN для Android TV.
- * Лаконичный и простой интерфейс, оптимизированный для D-pad навигации.
+ *
+ * Особенности TV-адаптации:
+ * - Текстовые поля НЕ открывают клавиатуру при фокусе D-pad
+ * - Клавиатура появляется только по нажатию Enter/Select на поле
+ * - Валидация при сохранении настроек
+ * - Показ/скрытие пароля
  */
 @Composable
 fun NovaVpnScreen(
@@ -89,13 +100,6 @@ fun NovaVpnScreen(
             // Статус подключения
             StatusDisplay(state = uiState.connectionState)
 
-            Spacer(modifier = Modifier.height(8.dp))
-
-            // Информация о подключении
-            if (uiState.connectionState == ConnectionState.CONNECTED) {
-                // Статистику можно показать позже
-            }
-
             Spacer(modifier = Modifier.height(32.dp))
 
             // Кнопка подключения/отключения
@@ -124,6 +128,7 @@ fun NovaVpnScreen(
                     serverAddr = uiState.serverAddr,
                     email = uiState.email,
                     password = uiState.password,
+                    validationError = uiState.validationError,
                     onServerAddrChange = onServerAddrChange,
                     onEmailChange = onEmailChange,
                     onPasswordChange = onPasswordChange,
@@ -131,7 +136,7 @@ fun NovaVpnScreen(
                 )
             }
 
-            // Сообщение об ошибке
+            // Сообщение об ошибке подключения
             uiState.errorMessage?.let { error ->
                 Spacer(modifier = Modifier.height(16.dp))
                 Text(
@@ -146,10 +151,10 @@ fun NovaVpnScreen(
 }
 
 /**
- * Отображение текущего статуса подключения.
+ * Отображение текущего статуса подключения с цветным индикатором.
  */
 @Composable
-fun StatusDisplay(state: ConnectionState) {
+private fun StatusDisplay(state: ConnectionState) {
     val (color, text) = when (state) {
         ConnectionState.DISCONNECTED -> Pair(NovaError, "Отключён")
         ConnectionState.CONNECTING -> Pair(NovaYellow, "Подключение…")
@@ -157,7 +162,6 @@ fun StatusDisplay(state: ConnectionState) {
         ConnectionState.DISCONNECTING -> Pair(NovaYellow, "Отключение…")
     }
 
-    // Анимация пульсации для connecting
     val animatedAlpha by rememberInfiniteTransition(label = "pulse").animateFloat(
         initialValue = 1f,
         targetValue = 0.4f,
@@ -178,7 +182,6 @@ fun StatusDisplay(state: ConnectionState) {
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.Center
     ) {
-        // Индикатор
         Box(
             modifier = Modifier
                 .size(16.dp)
@@ -196,16 +199,14 @@ fun StatusDisplay(state: ConnectionState) {
 }
 
 /**
- * Главная кнопка подключения/отключения.
- * Адаптирована для D-pad навигации на Android TV.
+ * Кнопка подключения/отключения.
  */
 @Composable
-fun ConnectButton(
+private fun ConnectButton(
     state: ConnectionState,
     onConnect: () -> Unit,
     onDisconnect: () -> Unit
 ) {
-    val isConnected = state == ConnectionState.CONNECTED
     val isTransitioning = state == ConnectionState.CONNECTING || state == ConnectionState.DISCONNECTING
 
     val buttonText = when (state) {
@@ -228,7 +229,7 @@ fun ConnectButton(
             when (state) {
                 ConnectionState.DISCONNECTED -> onConnect()
                 ConnectionState.CONNECTED -> onDisconnect()
-                else -> {} // Игнорируем во время переходных состояний
+                else -> {}
             }
         },
         backgroundColor = buttonColor,
@@ -240,10 +241,10 @@ fun ConnectButton(
 }
 
 /**
- * Кнопка, адаптированная для Android TV (D-pad навигация).
+ * Кнопка, адаптированная для D-pad навигации на Android TV.
  */
 @Composable
-fun TvButton(
+private fun TvButton(
     text: String,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
@@ -290,15 +291,18 @@ fun TvButton(
  * Панель настроек подключения.
  */
 @Composable
-fun SettingsPanel(
+private fun SettingsPanel(
     serverAddr: String,
     email: String,
     password: String,
+    validationError: String?,
     onServerAddrChange: (String) -> Unit,
     onEmailChange: (String) -> Unit,
     onPasswordChange: (String) -> Unit,
     onSave: () -> Unit
 ) {
+    var passwordVisible by remember { mutableStateOf(false) }
+
     Column(
         modifier = Modifier
             .padding(top = 16.dp)
@@ -315,7 +319,8 @@ fun SettingsPanel(
             modifier = Modifier.padding(bottom = 16.dp)
         )
 
-        TvTextField(
+        // Поле сервера
+        TvEditableField(
             value = serverAddr,
             onValueChange = onServerAddrChange,
             label = "Сервер (host:port)",
@@ -324,7 +329,8 @@ fun SettingsPanel(
 
         Spacer(modifier = Modifier.height(12.dp))
 
-        TvTextField(
+        // Поле email
+        TvEditableField(
             value = email,
             onValueChange = onEmailChange,
             label = "Email",
@@ -333,79 +339,198 @@ fun SettingsPanel(
 
         Spacer(modifier = Modifier.height(12.dp))
 
-        TvTextField(
+        // Поле пароля
+        TvEditableField(
             value = password,
             onValueChange = onPasswordChange,
             label = "Пароль",
             placeholder = "••••••••",
-            isPassword = true
+            isPassword = true,
+            passwordVisible = passwordVisible
         )
 
-        Spacer(modifier = Modifier.height(16.dp))
+        Spacer(modifier = Modifier.height(4.dp))
 
+        // Кнопка показать/скрыть пароль
         TvButton(
-            text = "Сохранить",
+            text = if (passwordVisible) "🔒 Скрыть пароль" else "👁 Показать пароль",
+            onClick = { passwordVisible = !passwordVisible },
+            backgroundColor = NovaBg,
+            modifier = Modifier.fillMaxWidth()
+        )
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        // Ошибка валидации
+        validationError?.let { error ->
+            Text(
+                text = error,
+                color = NovaError,
+                fontSize = 14.sp,
+                modifier = Modifier.padding(bottom = 8.dp)
+            )
+        }
+
+        // Кнопка сохранить
+        TvButton(
+            text = "💾 Сохранить",
             onClick = onSave,
             backgroundColor = NovaPrimary,
+            modifier = Modifier.fillMaxWidth()
+        )
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        // Версия приложения
+        Text(
+            text = "NovaVPN v${BuildConfig.VERSION_NAME}",
+            color = NovaTextSecondary.copy(alpha = 0.4f),
+            fontSize = 12.sp,
+            textAlign = TextAlign.Center,
             modifier = Modifier.fillMaxWidth()
         )
     }
 }
 
 /**
- * Текстовое поле, адаптированное для Android TV.
+ * Поле ввода для Android TV с двухрежимной логикой.
+ *
+ * Режим просмотра: D-pad фокусирует поле БЕЗ открытия клавиатуры.
+ * Режим редактирования: Enter/Select → клавиатура открывается.
+ * Back / IME Done → выход из редактирования.
  */
 @Composable
-fun TvTextField(
+private fun TvEditableField(
     value: String,
     onValueChange: (String) -> Unit,
     label: String,
     placeholder: String = "",
-    isPassword: Boolean = false
+    isPassword: Boolean = false,
+    passwordVisible: Boolean = false
 ) {
     var isFocused by remember { mutableStateOf(false) }
+    var isEditing by remember { mutableStateOf(false) }
+    val focusRequester = remember { FocusRequester() }
+    val editFocusRequester = remember { FocusRequester() }
+    val keyboardController = LocalSoftwareKeyboardController.current
+
+    val shouldHide = isPassword && !passwordVisible
 
     Column {
         Text(
             text = label,
-            color = NovaTextSecondary,
+            color = if (isFocused || isEditing) NovaPrimary else NovaTextSecondary,
             fontSize = 14.sp,
+            fontWeight = if (isFocused || isEditing) FontWeight.Medium else FontWeight.Normal,
             modifier = Modifier.padding(bottom = 4.dp)
         )
 
-        BasicTextField(
-            value = value,
-            onValueChange = onValueChange,
-            textStyle = TextStyle(
-                color = NovaTextPrimary,
-                fontSize = 18.sp
-            ),
-            cursorBrush = SolidColor(NovaPrimary),
-            visualTransformation = if (isPassword) PasswordVisualTransformation() else VisualTransformation.None,
-            singleLine = true,
-            modifier = Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(8.dp))
-                .background(NovaBg)
-                .border(
-                    width = if (isFocused) 2.dp else 1.dp,
-                    color = if (isFocused) NovaPrimary else NovaTextSecondary.copy(alpha = 0.3f),
-                    shape = RoundedCornerShape(8.dp)
-                )
-                .onFocusChanged { isFocused = it.isFocused }
-                .padding(horizontal = 16.dp, vertical = 14.dp),
-            decorationBox = { innerTextField ->
-                Box {
-                    if (value.isEmpty()) {
+        if (isEditing) {
+            // Режим редактирования — BasicTextField с клавиатурой
+            BasicTextField(
+                value = value,
+                onValueChange = onValueChange,
+                textStyle = TextStyle(
+                    color = NovaTextPrimary,
+                    fontSize = 18.sp
+                ),
+                cursorBrush = SolidColor(NovaPrimary),
+                visualTransformation = if (shouldHide) PasswordVisualTransformation() else VisualTransformation.None,
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                keyboardActions = KeyboardActions(
+                    onDone = {
+                        isEditing = false
+                        keyboardController?.hide()
+                        focusRequester.requestFocus()
+                    }
+                ),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(NovaBg)
+                    .border(2.dp, NovaPrimary, RoundedCornerShape(8.dp))
+                    .focusRequester(editFocusRequester)
+                    .onKeyEvent { event ->
+                        if (event.type == KeyEventType.KeyUp && event.key == Key.Back) {
+                            isEditing = false
+                            keyboardController?.hide()
+                            focusRequester.requestFocus()
+                            true
+                        } else false
+                    }
+                    .padding(horizontal = 16.dp, vertical = 14.dp),
+                decorationBox = { innerTextField ->
+                    Box {
+                        if (value.isEmpty()) {
+                            Text(
+                                text = placeholder,
+                                color = NovaTextHint,
+                                fontSize = 18.sp
+                            )
+                        }
+                        innerTextField()
+                    }
+                }
+            )
+
+            // Фокус и клавиатура при входе в режим редактирования
+            LaunchedEffect(Unit) {
+                editFocusRequester.requestFocus()
+                keyboardController?.show()
+            }
+        } else {
+            // Режим просмотра — focusable-контейнер, клавиатура НЕ появляется
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(NovaBg)
+                    .border(
+                        width = if (isFocused) 2.dp else 1.dp,
+                        color = if (isFocused) NovaPrimary else NovaTextSecondary.copy(alpha = 0.3f),
+                        shape = RoundedCornerShape(8.dp)
+                    )
+                    .focusRequester(focusRequester)
+                    .onFocusChanged { isFocused = it.isFocused }
+                    .focusable()
+                    .onKeyEvent { event ->
+                        if (event.type == KeyEventType.KeyUp &&
+                            (event.key == Key.Enter || event.key == Key.DirectionCenter)
+                        ) {
+                            isEditing = true
+                            true
+                        } else false
+                    }
+                    .padding(horizontal = 16.dp, vertical = 14.dp),
+                contentAlignment = Alignment.CenterStart
+            ) {
+                val displayText = when {
+                    value.isEmpty() -> placeholder
+                    shouldHide -> "•".repeat(value.length.coerceAtMost(20))
+                    else -> value
+                }
+                val textColor = if (value.isEmpty()) NovaTextHint else NovaTextPrimary
+
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = displayText,
+                        color = textColor,
+                        fontSize = 18.sp,
+                        modifier = Modifier.weight(1f)
+                    )
+                    if (isFocused) {
                         Text(
-                            text = placeholder,
-                            color = NovaTextSecondary.copy(alpha = 0.5f),
-                            fontSize = 18.sp
+                            text = "✎",
+                            color = NovaPrimary,
+                            fontSize = 16.sp
                         )
                     }
-                    innerTextField()
                 }
             }
-        )
+        }
     }
 }
