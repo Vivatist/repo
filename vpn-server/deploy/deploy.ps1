@@ -49,8 +49,17 @@ $vpnPort      = if ($cfg.vpn_port)           { [int]$cfg.vpn_port }           el
 $testEmail    = if ($cfg.test_user_email)     { $cfg.test_user_email }         else { "test@novavpn.app" }
 $testPassword = if ($cfg.test_user_password)  { $cfg.test_user_password }      else { "NovaVPN2026!" }
 
+# Читаем версию из файла VERSION
+$versionFile = Join-Path (Split-Path -Parent $projectDir) "VERSION"
+if (Test-Path $versionFile) {
+    $appVersion = (Get-Content $versionFile -Raw).Trim()
+} else {
+    $appVersion = "dev"
+    Write-Host "[ПРЕДУПРЕЖДЕНИЕ] Файл VERSION не найден, используем 'dev'" -ForegroundColor Yellow
+}
+
 Write-Host ""
-Write-Host "  NovaVPN Server Deploy" -ForegroundColor Cyan
+Write-Host "  NovaVPN Server Deploy v$appVersion" -ForegroundColor Cyan
 Write-Host "  =====================" -ForegroundColor Cyan
 Write-Host "  Сервер:    $sshUser@${sshHost}:$sshPort"
 Write-Host "  VPN порт:  $vpnPort (UDP)"
@@ -87,7 +96,7 @@ try {
     $env:GOARCH = "amd64"
     $env:CGO_ENABLED = "0"
 
-    $buildOutput = & go build -ldflags="-s -w" -o $binaryPath ./cmd/vpnserver/ 2>&1
+    $buildOutput = & go build -ldflags="-s -w -X main.appVersion=$appVersion" -o $binaryPath ./cmd/vpnserver/ 2>&1
     if ($LASTEXITCODE -ne 0) {
         Write-Host "[ОШИБКА] Сборка не удалась:" -ForegroundColor Red
         $buildOutput | ForEach-Object { Write-Host "  $_" }

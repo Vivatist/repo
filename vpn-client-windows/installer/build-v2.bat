@@ -6,10 +6,19 @@ setlocal EnableDelayedExpansion
 cd /d "%~dp0.."
 
 :: ═══════════════════════════════════════════════════════════════
-::   NovaVPN Client v2.0.0 — Полная сборка и инсталлятор
-:: ═══════════════════════════════════════════════════════════════
+::   NovaVPN Client — Полная сборка и инсталлятор
+:: ═══════════════════════════════════════════════════════════
 
-set VERSION=2.0.0
+:: Читаем версию из единого файла VERSION в корне репозитория
+set "VERSION_FILE=%~dp0..\..\VERSION"
+if not exist "%VERSION_FILE%" (
+    echo [✗] Файл VERSION не найден: %VERSION_FILE%
+    pause
+    exit /b 1
+)
+set /p VERSION=<"%VERSION_FILE%"
+:: Убираем возможные \r и пробелы
+for /f "tokens=1" %%a in ("%VERSION%") do set VERSION=%%a
 set APP_NAME=NovaVPN
 
 :: Принудительно устанавливаем целевую платформу Windows
@@ -173,7 +182,7 @@ if not exist "dist" mkdir dist
 if not exist "dist\NovaVPN" mkdir dist\NovaVPN
 
 echo   [6.1] Сборка NovaVPN.exe (GUI)...
-go build -trimpath -ldflags="-s -w -H windowsgui" -o dist\NovaVPN\NovaVPN.exe ./cmd/novavpn/
+go build -trimpath -ldflags="-s -w -H windowsgui -X main.appVersion=%VERSION%" -o dist\NovaVPN\NovaVPN.exe ./cmd/novavpn/
 if errorlevel 1 (
     echo   [✗] Ошибка сборки GUI
     pause
@@ -182,7 +191,7 @@ if errorlevel 1 (
 echo   [✓] NovaVPN.exe создан
 
 echo   [6.2] Сборка novavpn-service.exe (Service)...
-go build -trimpath -ldflags="-s -w" -o dist\NovaVPN\novavpn-service.exe ./cmd/novavpn-service/
+go build -trimpath -ldflags="-s -w -X main.appVersion=%VERSION%" -o dist\NovaVPN\novavpn-service.exe ./cmd/novavpn-service/
 if errorlevel 1 (
     echo   [✗] Ошибка сборки Service
     pause
@@ -247,7 +256,7 @@ if %CREATE_INSTALLER%==0 (
 echo [ШАГ 8/8] Создание инсталлятора...
 echo.
 echo   [→] Запуск Inno Setup Compiler...
-"%ISCC%" installer\novavpn.iss
+"%ISCC%" /DMyAppVersion=%VERSION% installer\novavpn.iss
 if errorlevel 1 (
     echo   [✗] Ошибка создания инсталлятора
     echo.

@@ -61,6 +61,9 @@ type ServerConfig struct {
 
 	// Логирование
 	LogLevel string `yaml:"log_level"` // debug, info, warn, error
+
+	// AppVersion — версия приложения (устанавливается из main, не сериализуется в YAML)
+	AppVersion string `yaml:"-"`
 }
 
 // DefaultConfig возвращает конфигурацию по умолчанию.

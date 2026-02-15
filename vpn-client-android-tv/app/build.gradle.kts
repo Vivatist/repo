@@ -1,3 +1,6 @@
+// Читаем версию из единого файла VERSION в корне репозитория
+val appVersionName: String = file("../../VERSION").readText().trim()
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -8,12 +11,22 @@ android {
     namespace = "com.novavpn.tv"
     compileSdk = 34
 
+    // Подпись release-сборки (keystore в keystore/release.jks)
+    signingConfigs {
+        create("release") {
+            storeFile = file("../keystore/release.jks")
+            storePassword = "NovaVPN2026"
+            keyAlias = "novavpn"
+            keyPassword = "NovaVPN2026"
+        }
+    }
+
     defaultConfig {
         applicationId = "com.novavpn.tv"
         minSdk = 21
         targetSdk = 34
-        versionCode = 1
-        versionName = "2.0.0"
+        versionCode = 3
+        versionName = appVersionName
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -22,6 +35,7 @@ android {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
+            signingConfig = signingConfigs.getByName("release")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -56,6 +70,7 @@ android {
 dependencies {
     // AndroidX Core
     implementation("androidx.core:core-ktx:1.12.0")
+    implementation("androidx.fragment:fragment-ktx:1.6.2")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.7.0")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.7.0")
 

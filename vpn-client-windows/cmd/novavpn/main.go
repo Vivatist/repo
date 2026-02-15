@@ -16,6 +16,9 @@ import (
 	"github.com/novavpn/vpn-client-windows/internal/gui"
 )
 
+// appVersion перезаписывается через ldflags: -X main.appVersion=...
+var appVersion = "dev"
+
 const mutexName = "Global\\NovaVPN_SingleInstance"
 
 func init() {
@@ -32,7 +35,10 @@ func main() {
 		defer logFile.Close()
 	}
 
-	log.Println("[MAIN] NovaVPN Client v1.0 запускается...")
+	log.Printf("[MAIN] NovaVPN Client v%s запускается...", appVersion)
+
+	// Передаём версию в GUI
+	gui.AppVersion = appVersion
 
 	// Проверяем, что не запущена вторая копия
 	handle, err := acquireSingleInstanceMutex()

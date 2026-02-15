@@ -10,21 +10,26 @@ import (
 	"net"
 )
 
+// ProtocolVersion — версия wire-протокола NovaVPN.
+const ProtocolVersion uint8 = 0x03
+
+// Типизированные байтовые константы (QUIC/TLS маскировка).
 const (
-	ProtocolVersion uint8 = 0x03
-
-	// QUIC Short Header constants (маскировка под QUIC)
-	// Flags byte: Header Form=0 (Short), Fixed Bit=1, остальное — random
+	// QUIC Short Header: Header Form=0 (Short), Fixed Bit=1, остальное — random
 	QUICFixedBitMask byte = 0x40 // bit 6 = 1 (QUIC Fixed Bit, обязателен)
-	QUICHeaderSize        = 5    // flags(1) + obfuscated_pad(4)
-
-	// Обратная совместимость: TLSHeaderSize = QUICHeaderSize (5 байт, все смещения сохраняются)
-	TLSHeaderSize = QUICHeaderSize
 
 	// Устаревшие константы (для поиска в коде, больше не используются при формировании)
 	TLSContentType  byte = 0x17
 	TLSVersionMajor byte = 0x03
 	TLSVersionMinor byte = 0x03
+)
+
+// Размеры полей и оверхеды протокола (нетипизированные целочисленные константы).
+const (
+	QUICHeaderSize = 5 // flags(1) + obfuscated_pad(4)
+
+	// Обратная совместимость: TLSHeaderSize = QUICHeaderSize (5 байт, все смещения сохраняются)
+	TLSHeaderSize = QUICHeaderSize
 
 	SessionIDSize          = 4
 	NonceSize              = 12

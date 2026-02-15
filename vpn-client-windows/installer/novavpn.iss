@@ -1,8 +1,11 @@
 ; NovaVPN — Inno Setup Installer Script
-; Для сборки: iscc.exe novavpn.iss
+; Для сборки: iscc.exe /DMyAppVersion=3.0.0 novavpn.iss
+; Версия передаётся из build-v2.bat через /D, ниже — fallback
 
 #define MyAppName "NovaVPN"
-#define MyAppVersion "2.0.0"
+#ifndef MyAppVersion
+  #define MyAppVersion "0.0.0"
+#endif
 #define MyAppPublisher "NovaVPN"
 #define MyAppURL "https://novavpn.app"
 #define MyAppExeName "NovaVPN.exe"

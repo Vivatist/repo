@@ -141,7 +141,7 @@ func (s *VPNServer) tuneSocketBuffers(conn *net.UDPConn) {
 // Start запускает VPN-сервер.
 func (s *VPNServer) Start() error {
 	log.Println("═══════════════════════════════════════════")
-	log.Println("  NovaVPN Server v1.0")
+	log.Printf("  NovaVPN Server v%s", s.cfg.AppVersion)
 	log.Println("  Собственный VPN-протокол")
 	log.Println("═══════════════════════════════════════════")
 

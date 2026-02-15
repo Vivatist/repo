@@ -25,6 +25,9 @@ import (
 	"github.com/novavpn/vpn-client-windows/internal/ipc"
 )
 
+// AppVersion — версия приложения (устанавливается из main через ldflags).
+var AppVersion = "dev"
+
 // App — главное GUI-приложение.
 type App struct {
 	cfg       *config.Config
@@ -113,9 +116,10 @@ func (a *App) Run(autoConnect bool) error {
 
 // createMainWindow создаёт главное окно.
 func (a *App) createMainWindow() error {
+	windowTitle := fmt.Sprintf("NovaVPN v%s", AppVersion)
 	err := MainWindow{
 		AssignTo: &a.mainWindow,
-		Title:    "NovaVPN",
+		Title:    windowTitle,
 		MinSize:  Size{Width: 400, Height: 380},
 		MaxSize:  Size{Width: 400, Height: 380},
 		Size:     Size{Width: 400, Height: 380},
@@ -290,12 +294,12 @@ func (a *App) saveSettings() {
 
 // onConnectClicked — обработчик кнопки подключения.
 func (a *App) onConnectClicked() {
-	if a.lastState == ipc.StateConnected {
+	switch {
+	case a.lastState == ipc.StateConnected:
 		go a.disconnect()
-	} else if a.lastState == ipc.StateConnecting || a.lastState == ipc.StateDisconnecting {
+	case a.lastState == ipc.StateConnecting || a.lastState == ipc.StateDisconnecting:
 		// Игнорируем нажатие во время переходных состояний
-		return
-	} else {
+	default:
 		// StateDisconnected, -1 (начальное), -2 (сервис недоступен) — всё ведёт к connect()
 		// connect() сам проверит доступность сервиса и предложит установку
 		go a.connect()
@@ -575,17 +579,6 @@ func (a *App) ensureServiceRunning() bool {
 			walk.MsgBoxIconWarning)
 	})
 	return false
-}
-
-// installAndStartService устанавливает и запускает сервис NovaVPN с UAC elevation.
-func (a *App) installAndStartService() {
-	if a.ensureServiceRunning() {
-		a.mainWindow.Synchronize(func() {
-			walk.MsgBox(a.mainWindow, "NovaVPN",
-				"Сервис NovaVPN запущен!\nТеперь вы можете подключиться.",
-				walk.MsgBoxIconInformation)
-		})
-	}
 }
 
 // serviceExePath возвращает путь к novavpn-service.exe рядом с GUI.

@@ -49,10 +49,10 @@ var (
 	maxDevices   = flag.Int("maxdevices", 0, "Макс. одновременных подключений (0 = без лимита)")
 )
 
-const (
-	appVersion = "2.0.0"
-	appName    = "NovaVPN Server"
-)
+// appVersion перезаписывается через ldflags: -X main.appVersion=...
+var appVersion = "dev"
+
+const appName = "NovaVPN Server"
 
 func main() {
 	flag.Parse()
@@ -323,6 +323,7 @@ func runServer() {
 	}
 
 	// Создаём сервер
+	cfg.AppVersion = appVersion
 	srv, err := server.NewVPNServer(cfg)
 	if err != nil {
 		log.Fatalf("Ошибка создания сервера: %v", err)

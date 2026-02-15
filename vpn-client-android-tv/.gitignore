@@ -20,3 +20,4 @@ Thumbs.db
 # Keystore
 *.jks
 *.keystore
+/keystore/

@@ -20,6 +20,9 @@ import (
 	"github.com/novavpn/vpn-client-windows/internal/service"
 )
 
+// appVersion перезаписывается через ldflags: -X main.appVersion=...
+var appVersion = "dev"
+
 func main() {
 	// Если запущены как Windows-сервис — работаем в режиме сервиса
 	if service.IsRunningAsService() {
@@ -31,7 +34,7 @@ func main() {
 
 	// Интерактивный режим — обработка команд
 	if len(os.Args) < 2 {
-		fmt.Println("NovaVPN Service")
+		fmt.Printf("NovaVPN Service v%s\n", appVersion)
 		fmt.Println()
 		fmt.Println("Использование:")
 		fmt.Println("  novavpn-service.exe install   — установить и запустить сервис")

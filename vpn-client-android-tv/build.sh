@@ -21,11 +21,20 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Читаем версию из единого файла VERSION
+VERSION_FILE="$SCRIPT_DIR/../VERSION"
+if [ -f "$VERSION_FILE" ]; then
+    APP_VERSION=$(cat "$VERSION_FILE" | tr -d '\r\n ')
+else
+    APP_VERSION="dev"
+    echo "⚠️  Файл VERSION не найден, используем 'dev'"
+fi
+
 BUILD_TYPE="${1:-debug}"
 DIST_DIR="$SCRIPT_DIR/dist"
 
 echo "============================================"
-echo "  NovaVPN Android TV — Сборка ($BUILD_TYPE)"
+echo "  NovaVPN Android TV v$APP_VERSION — Сборка ($BUILD_TYPE)"
 echo "============================================"
 
 # Проверяем наличие Android SDK
@@ -59,18 +68,19 @@ if [ ! -f "$APK_PATH" ]; then
     exit 1
 fi
 
-# Копируем в dist/
+# Копируем в dist/ с нормальным именем
 mkdir -p "$DIST_DIR"
-cp "$APK_PATH" "$DIST_DIR/novavpn.apk"
+APK_NAME="NovaVPN-AndroidTV-v${APP_VERSION}.apk"
+cp "$APK_PATH" "$DIST_DIR/$APK_NAME"
 
 echo ""
 echo "============================================"
-echo "  ✅ Сборка завершена!"
+echo "  ✅ Сборка завершена! (v$APP_VERSION)"
 echo "============================================"
 echo ""
-echo "  APK: $DIST_DIR/novavpn.apk"
-echo "  Размер: $(du -h "$DIST_DIR/novavpn.apk" | cut -f1)"
+echo "  APK: $DIST_DIR/$APK_NAME"
+echo "  Размер: $(du -h "$DIST_DIR/$APK_NAME" | cut -f1)"
 echo ""
 echo "  Установка на Android TV:"
-echo "    adb install -r $DIST_DIR/novavpn.apk"
+echo "    adb install -r $DIST_DIR/$APK_NAME"
 echo ""
