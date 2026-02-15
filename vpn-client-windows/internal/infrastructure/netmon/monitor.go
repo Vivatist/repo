@@ -85,8 +85,8 @@ type Monitor struct {
 	currentHealth     atomic.Int32 // текущий HealthLevel
 
 	// Network watch state
-	prevIPs    []string    // предыдущий набор физических IP
-	hadNetwork bool        // была ли сеть на предыдущей проверке
+	prevIPs    []string // предыдущий набор физических IP
+	hadNetwork bool     // была ли сеть на предыдущей проверке
 
 	// Остановка
 	stopCh chan struct{}
