@@ -147,7 +147,7 @@ func SkipHeader(data []byte) ([]byte, error) {
 }
 
 // Устаревшие обёртки для обратной совместимости
-func AddTLSHeader(data []byte) []byte { return AddQUICHeader(data) }
+func AddTLSHeader(data []byte) []byte            { return AddQUICHeader(data) }
 func ParseTLSHeader(data []byte) ([]byte, error) { return SkipHeader(data) }
 
 func (h *PacketHeader) MarshalEncryptedHeader() []byte {
