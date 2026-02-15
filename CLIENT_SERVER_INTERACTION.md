@@ -112,7 +112,11 @@
 **Цикл приёма (UDP → TUN)**:
 ```
 loop:
-  conn.SetReadDeadline(сейчас + 30 сек)  // failsafe: timeout = healthLostThreshold
+  // ОБЯЗАТЕЛЬНО: read timeout 30 сек (failsafe от мёртвого сокета после сна/NAT timeout).
+  // Windows: conn.SetReadDeadline(сейчас + 30 сек)
+  // Android: socket.soTimeout = 30_000
+  // Без этого receive() блокируется НАВСЕГДА, health monitor не может разбудить reconnect.
+  conn.SetReadDeadline(сейчас + 30 сек)
   data = udp.Read()
   если ошибка чтения (или timeout):
     запустить reconnect()
@@ -142,7 +146,11 @@ loop:
   если идёт reconnect: пропустить
   err = отправить keepalive (50-160 байт, с random padding и обфускацией заголовка)
   если ошибка записи: закрыть conn (маршрут мёртв) → udpReadLoop получит ошибку → reconnect
-  monitor.RecordKeepaliveSent()  // только если нет ожидающего probe
+  // Active probe: обновляем время отправки ТОЛЬКО если предыдущий probe получил ответ.
+  // Без этого таймер сбрасывается каждые 10-20 сек и 15-сек probe timeout
+  // никогда не срабатывает (keepalive interval < probe timeout).
+  если lastActivity >= lastKeepaliveSent:
+    lastKeepaliveSent = сейчас
 ```
 
 **Monitor: health probe** (горутина внутри `netmon.Monitor`, active probe + passive + wake detection):

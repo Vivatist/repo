@@ -43,6 +43,11 @@ class NovaVpnClientImpl : VpnClient {
         // Active keepalive probe: если после отправки keepalive
         // нет входящих за PROBE_TIMEOUT — соединение мертво
         private const val KEEPALIVE_PROBE_TIMEOUT_MS = 15_000L
+        // Таймаут на socket.receive() — failsafe от мёртвого сокета.
+        // Если за это время ни одного пакета не пришло, receive() вернёт
+        // SocketTimeoutException → reconnect. Главная защита при выходе из сна
+        // (NAT mapping мёртв, сокет "жив" но пакеты не приходят).
+        private const val SOCKET_READ_TIMEOUT_MS = 30_000
         private const val MAX_RECONNECT_ATTEMPTS = 60
         private const val MAX_BACKOFF_MS = 30_000L
     }
@@ -308,6 +313,10 @@ class NovaVpnClientImpl : VpnClient {
         while (!stopped.get()) {
             try {
                 val sock = socket ?: break
+                // soTimeout = SOCKET_READ_TIMEOUT_MS: если за 30 сек нет ни одного
+                // пакета, receive() бросит SocketTimeoutException → reconnect.
+                // Главная защита при выходе из сна (NAT mapping мёртв).
+                sock.soTimeout = SOCKET_READ_TIMEOUT_MS
                 sock.receive(datagram)
 
                 lastActivity.set(System.nanoTime())
@@ -408,11 +417,22 @@ class NovaVpnClientImpl : VpnClient {
                     // Обфускация заголовка (после QUIC header)
                     NovaProtocol.obfuscateHeader(packet, NovaProtocol.QUIC_HEADER_SIZE, headerMask, false)
                     socket?.send(DatagramPacket(packet, packet.size))
-                    // Запоминаем время отправки для active probe
-                    lastKeepaliveSent.set(System.nanoTime())
+
+                    // Active probe: обновляем время отправки ТОЛЬКО если предыдущий
+                    // probe получил ответ. Иначе таймер сбрасывается каждые 10-20 сек
+                    // (keepalive interval) и 15-секундный probe timeout никогда не
+                    // сработает, т.к. keepalive отправляется чаще чем probe timeout.
+                    val kaSent = lastKeepaliveSent.get()
+                    if (kaSent == 0L || lastActivity.get() >= kaSent) {
+                        lastKeepaliveSent.set(System.nanoTime())
+                    }
                 }
             } catch (e: Exception) {
-                if (!stopped.get()) Log.w(TAG, "Keepalive error: ${e.message}")
+                if (!stopped.get()) {
+                    Log.w(TAG, "Keepalive error: ${e.message}, closing socket")
+                    // Ошибка записи = маршрут/сокет мёртв → закрываем для reconnect
+                    socket?.close()
+                }
             }
         }
     }
