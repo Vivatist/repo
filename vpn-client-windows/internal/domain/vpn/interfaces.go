@@ -66,15 +66,14 @@ type Statistics struct {
 type ConnectionHealth int32
 
 const (
-	// HealthGood — связь стабильна (< 35 сек без пакетов от сервера).
+	// HealthGood — связь стабильна (< 20 сек без пакетов от сервера).
 	HealthGood ConnectionHealth = iota
 
-	// HealthDegraded — возможна потеря пакетов (35-60 сек).
-	// Макс. серверный keepalive = 32 сек, порог = 35 сек.
+	// HealthDegraded — возможна потеря пакетов (20-30 сек).
 	HealthDegraded
 
-	// HealthLost — связь потеряна (> 60 сек).
-	// ≈ 2 пропущенных keepalive-цикла сервера, инициируется reconnect.
+	// HealthLost — связь потеряна (> 30 сек или keepalive probe timeout 15 сек).
+	// Инициируется reconnect.
 	HealthLost
 )
 

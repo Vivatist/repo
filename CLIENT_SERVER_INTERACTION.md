@@ -95,12 +95,13 @@
 8. Настроить маршруты:
    - Windows/Linux/macOS: split routes (0/1 + 128/1) + серверный маршрут через физический шлюз
    - Android: addRoute("0.0.0.0", 0) + addDisallowedApplication + protect(socket)
-9. Запустить 4 рабочих цикла:
+9. Запустить монитор соединения (`netmon.Monitor`) — объединяет:
+   - Health probe: active probe + passive пороги (20/30 сек), проверка каждые 3-7 сек
+   - Network watch: мониторинг физической сети (каждые 2 сек / ConnectivityManager)
+10. Запустить 3 рабочих цикла:
    - Чтение из UDP → расшифровка → запись в TUN
    - Чтение из TUN → шифрование → отправка в UDP
    - Keepalive каждые 10-20 секунд (рандомизированный, crypto/rand)
-   - Мониторинг физической сети (каждые 2 сек / ConnectivityManager)
-10. Запустить health monitor (active probe + wake detection + passive, проверка каждые 3-7 сек)
 11. Состояние → Connected
 ```
 
@@ -116,7 +117,7 @@ loop:
   если ошибка чтения (или timeout):
     запустить reconnect()
     выйти из цикла
-  healthMonitor.RecordActivity()  // atomic store, ~1 нс
+  monitor.RecordActivity()  // atomic store, ~1 нс
   разобрать пакет:
     если Data (0x10):  расшифровать → записать в TUN
     если Keepalive (0x20): игнорировать (активность уже зафиксирована)
@@ -141,10 +142,10 @@ loop:
   если идёт reconnect: пропустить
   err = отправить keepalive (50-160 байт, с random padding и обфускацией заголовка)
   если ошибка записи: закрыть conn (маршрут мёртв) → udpReadLoop получит ошибку → reconnect
-  healthMonitor.RecordKeepaliveSent()  // только если нет ожидающего probe
+  monitor.RecordKeepaliveSent()  // только если нет ожидающего probe
 ```
 
-**Health monitor** (отдельная горутина, active probe + passive + wake detection):
+**Monitor: health probe** (горутина внутри `netmon.Monitor`, active probe + passive + wake detection):
 ```
 loop:
   interval = randomCheckInterval()  // 3-7 сек
@@ -382,10 +383,10 @@ udp.send(packet)
 
 ```
 при каждом полученном пакете:
-    healthMonitor.RecordActivity()  // atomic store, ~1 нс
+    monitor.RecordActivity()  // atomic store, ~1 нс
 
 при каждой отправке keepalive:
-    healthMonitor.RecordKeepaliveSent()  // atomic store
+    monitor.RecordKeepaliveSent()  // atomic store
 
 каждые 3-7 секунд (рандомизировано):
     wallBefore = currentTimeMillis()
@@ -422,7 +423,7 @@ udp.send(packet)
 
 | Платформа | Механизм | Описание |
 |-----------|----------|----------|
-| Windows | `networkMonitorLoop` | Каждые 2 сек опрашивает физические IPv4. Обнаруживает **пропажу** сети И **смену** сети (другой IP/шлюз → стейл маршрут). При любом изменении → немедленный reconnect |
+| Windows | `netmon.Monitor` (network watch) | Каждые 2 сек опрашивает физические IPv4. Обнаруживает **пропажу** сети И **смену** сети (другой IP/шлюз → стейл маршрут). При любом изменении → немедленный reconnect |
 | Android TV | `ConnectivityManager` | Системный callback `onLost()`/`onAvailable()`. При потере сети → немедленный `forceReconnect()` |
 
 **Таймауты:**
@@ -460,7 +461,7 @@ udp.send(packet)
 
 - Ошибка чтения UDP (`conn.Read()` → error)
 - Dead-peer detection (active probe: 15 сек, passive: 30 сек без данных — health monitor `HealthLost`)
-- Network monitor: потеря физической сети ИЛИ смена сети (другой IP/шлюз при переключении Wi-Fi)
+- Network monitor (`netmon`): потеря физической сети ИЛИ смена сети (другой IP/шлюз при переключении Wi-Fi)
 - Сервер отправил Disconnect (перезагрузка/остановка)
 
 ### 6.2. Алгоритм

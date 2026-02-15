@@ -10,8 +10,6 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -20,11 +18,15 @@ import (
 	domainnet "github.com/novavpn/vpn-client-windows/internal/domain/network"
 	domainvpn "github.com/novavpn/vpn-client-windows/internal/domain/vpn"
 	infracrypto "github.com/novavpn/vpn-client-windows/internal/infrastructure/crypto"
+	"github.com/novavpn/vpn-client-windows/internal/infrastructure/netmon"
 	"github.com/novavpn/vpn-client-windows/internal/infrastructure/vpn/handshake"
 	"github.com/novavpn/vpn-client-windows/internal/protocol"
 )
 
-// Интервалы keepalive определяются в health.go (randomKeepaliveInterval).
+// readDeadline — таймаут на conn.Read(). Если за это время нет ни одного
+// пакета от сервера, Read() вернёт timeout error → reconnect.
+// Значение совпадает с LostAfter в netmon.Config (30 сек).
+const readDeadline = 30 * time.Second
 
 // NovaVPNClient реализует интерфейс VPN-клиента.
 type NovaVPNClient struct {
@@ -67,8 +69,8 @@ type NovaVPNClient struct {
 	onPSK    domainvpn.PSKCallback
 	onHealth domainvpn.HealthCallback
 
-	// Мониторинг здоровья соединения (пассивный, lock-free)
-	healthMonitor *connectionMonitor
+	// Мониторинг соединения (health probe + network watch)
+	monitor *netmon.Monitor
 
 	// 0-RTT resume data
 	resumeSessionID   uint32
@@ -234,21 +236,15 @@ func (c *NovaVPNClient) Connect(params domainvpn.ConnectParams) error {
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 	c.stopped.Store(false)
 
-	// Создаём пассивный монитор здоровья соединения.
-	// onLost инициирует reconnect через закрытие conn (udpReadLoop → reconnect).
-	c.healthMonitor = newConnectionMonitor(c.onHealth, func() {
-		log.Println("[HEALTH] Связь потеряна, инициируем переподключение...")
-		if conn := c.conn; conn != nil {
-			conn.Close()
-		}
-	})
-	c.healthMonitor.Start()
+	// Создаём монитор соединения (health probe + network watch).
+	// onLost закрывает conn → udpReadLoop получает ошибку → reconnect.
+	c.monitor = c.newMonitor()
+	c.monitor.Start()
 
-	c.wg.Add(4)
+	c.wg.Add(3)
 	go c.udpReadLoop()
 	go c.tunReadLoop()
 	go c.keepaliveLoop()
-	go c.networkMonitorLoop()
 
 	// Настраиваем сеть (параллельно с уже запущенными циклами)
 	if err := c.configureNetwork(); err != nil {
@@ -285,9 +281,9 @@ func (c *NovaVPNClient) Disconnect() error {
 	c.stopped.Store(true)
 	log.Println("[VPN] Отключение...")
 
-	// Останавливаем health monitor
-	if c.healthMonitor != nil {
-		c.healthMonitor.Stop()
+	// Останавливаем монитор соединения
+	if c.monitor != nil {
+		c.monitor.Stop()
 	}
 
 	// Сигнализируем остановку через канал (для keepaliveLoop и reconnect)
@@ -451,7 +447,7 @@ func (c *NovaVPNClient) udpReadLoop() {
 	// Read() вернёт timeout error → reconnect. Это главная защита при смене Wi-Fi,
 	// когда сокет остаётся "открытым" но пакеты не приходят.
 	for {
-		c.conn.SetReadDeadline(time.Now().Add(healthLostThreshold))
+		c.conn.SetReadDeadline(time.Now().Add(readDeadline))
 		n, err := c.conn.Read(buf)
 		if err != nil {
 			if c.stopped.Load() {
@@ -459,7 +455,7 @@ func (c *NovaVPNClient) udpReadLoop() {
 			}
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				log.Printf("[VPN] UDP read timeout (%v без данных от сервера), инициируем переподключение...",
-					healthLostThreshold)
+					readDeadline)
 			} else {
 				log.Printf("[VPN] UDP read error: %v", err)
 			}
@@ -476,10 +472,10 @@ func (c *NovaVPNClient) udpReadLoop() {
 
 // handleUDPPacket обрабатывает входящий пакет от сервера.
 func (c *NovaVPNClient) handleUDPPacket(data []byte) {
-	// Фиксируем активность для пассивного мониторинга здоровья.
+	// Фиксируем активность для мониторинга здоровья.
 	// Atomic store — ~1 нс, zero-alloc, вызывается на каждый входящий пакет.
-	if c.healthMonitor != nil {
-		c.healthMonitor.RecordActivity()
+	if c.monitor != nil {
+		c.monitor.RecordActivity()
 	}
 
 	// Быстрый inline-парсинг без аллокаций
@@ -633,8 +629,8 @@ func (c *NovaVPNClient) tunReadLoop() {
 // Интервал 10-20 секунд (crypto/rand) — защита от DPI-детектирования
 // регулярных паттернов отправки.
 //
-// Dead-peer detection вынесен в connectionMonitor (health.go) —
-// он пассивно отслеживает lastActivity и инициирует reconnect при HealthLost.
+// Dead-peer detection вынесен в netmon.Monitor —
+// он отслеживает lastActivity и инициирует reconnect при HealthLost.
 func (c *NovaVPNClient) keepaliveLoop() {
 	defer c.wg.Done()
 
@@ -681,8 +677,8 @@ func (c *NovaVPNClient) keepaliveLoop() {
 			}
 
 			// Фиксируем время отправки для active probe
-			if c.healthMonitor != nil {
-				c.healthMonitor.RecordKeepaliveSent()
+			if c.monitor != nil {
+				c.monitor.RecordKeepaliveSent()
 			}
 
 			// Рандомизированный интервал: 10-20 секунд — нет паттерна для DPI
@@ -780,8 +776,8 @@ func (c *NovaVPNClient) reconnect() {
 	if c.cancel != nil {
 		c.cancel()
 	}
-	if c.healthMonitor != nil {
-		c.healthMonitor.Stop()
+	if c.monitor != nil {
+		c.monitor.Stop()
 	}
 
 	// Сохраняем данные для 0-RTT resume
@@ -836,7 +832,7 @@ func (c *NovaVPNClient) reconnect() {
 		}
 
 		// Проверяем наличие физической сети перед попыткой
-		if !c.hasPhysicalNetwork() {
+		if !netmon.HasPhysicalNetwork() {
 			log.Printf("[VPN] Reconnect: нет физической сети, ожидание...")
 			backoff = 2 * time.Second // не увеличиваем backoff без сети
 			continue
@@ -858,7 +854,7 @@ func (c *NovaVPNClient) reconnect() {
 		}
 
 		// Повторно проверяем сеть после ожидания
-		if !c.hasPhysicalNetwork() {
+		if !netmon.HasPhysicalNetwork() {
 			log.Printf("[VPN] Reconnect: сеть пропала во время стабилизации")
 			backoff = 2 * time.Second
 			continue
@@ -946,14 +942,9 @@ func (c *NovaVPNClient) reconnect() {
 		// (tunReadLoop продолжает работать — он не останавливался)
 		c.ctx, c.cancel = context.WithCancel(context.Background())
 
-		// Создаём новый health monitor для нового соединения
-		c.healthMonitor = newConnectionMonitor(c.onHealth, func() {
-			log.Println("[HEALTH] Связь потеряна, инициируем переподключение...")
-			if conn := c.conn; conn != nil {
-				conn.Close()
-			}
-		})
-		c.healthMonitor.Start()
+		// Создаём новый монитор для нового соединения
+		c.monitor = c.newMonitor()
+		c.monitor.Start()
 
 		c.wg.Add(2)
 		go c.udpReadLoop()
@@ -972,6 +963,34 @@ func (c *NovaVPNClient) reconnect() {
 
 	log.Println("[VPN] Все попытки переподключения исчерпаны")
 	c.setState(domainvpn.StateDisconnected)
+}
+
+// newMonitor создаёт настроенный netmon.Monitor для текущего клиента.
+// OnLost закрывает conn → udpReadLoop получает ошибку → reconnect.
+func (c *NovaVPNClient) newMonitor() *netmon.Monitor {
+	cfg := netmon.DefaultConfig(func() {
+		log.Println("[HEALTH] Связь потеряна, инициируем переподключение...")
+		if conn := c.conn; conn != nil {
+			conn.Close()
+		}
+	})
+	if c.onHealth != nil {
+		cfg.OnHealthChange = func(h netmon.HealthLevel) {
+			c.onHealth(domainvpn.ConnectionHealth(h))
+		}
+	}
+	return netmon.New(cfg)
+}
+
+// randomKeepaliveInterval возвращает случайный интервал keepalive 10-20 секунд.
+// Криптографически стойкий рандом для защиты от DPI-детектирования
+// регулярных паттернов трафика (без big.Int аллокаций).
+func randomKeepaliveInterval() time.Duration {
+	var buf [1]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return 15 * time.Second // fallback
+	}
+	return time.Duration(10+int(buf[0]%11)) * time.Second // 10-20 сек
 }
 
 // minDuration возвращает меньшую из двух длительностей.
@@ -1015,134 +1034,4 @@ func getSendCounter(session domaincrypto.Session) uint64 {
 		return sc.GetSendCounter()
 	}
 	return 0
-}
-
-// networkMonitorLoop отслеживает изменения сетевых интерфейсов Windows.
-// Обнаруживает два сценария:
-//  1. Сеть ПРОПАЛА — все физические IPv4 исчезли (Wi-Fi off, кабель выдернут)
-//  2. Сеть СМЕНИЛАСЬ — набор физических IP изменился (переключение Wi-Fi A → Wi-Fi B)
-//
-// При смене сети маршрут к серверу (<serverIP>/32 via <oldGateway>) становится
-// мёртвым → UDP-пакеты не доходят. Без этой проверки healthMonitor обнаружит
-// проблему только через 15-30 сек.
-func (c *NovaVPNClient) networkMonitorLoop() {
-	defer c.wg.Done()
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-
-	// Запоминаем начальный набор физических IP-адресов
-	prevIPs := c.getPhysicalIPs()
-	hadNetwork := len(prevIPs) > 0
-
-	for {
-		select {
-		case <-c.stopCh:
-			return
-		case <-ticker.C:
-			if c.stopped.Load() {
-				return
-			}
-
-			// Пропускаем проверку во время переподключения
-			if c.reconnecting.Load() {
-				// Обновляем prevIPs после reconnect чтобы не сработать повторно
-				prevIPs = c.getPhysicalIPs()
-				hadNetwork = len(prevIPs) > 0
-				continue
-			}
-
-			state := c.GetState()
-			if state != domainvpn.StateConnected {
-				// Обновляем начальный набор когда не подключены
-				prevIPs = c.getPhysicalIPs()
-				hadNetwork = len(prevIPs) > 0
-				continue
-			}
-
-			currentIPs := c.getPhysicalIPs()
-			hasNetwork := len(currentIPs) > 0
-
-			if hadNetwork && !hasNetwork {
-				// Сценарий 1: Сеть ПРОПАЛА полностью
-				log.Println("[NET] Физическая сеть потеряна, инициируем переподключение...")
-				hadNetwork = false
-				prevIPs = currentIPs
-				if conn := c.conn; conn != nil {
-					conn.Close()
-				}
-			} else if hasNetwork && hadNetwork && !ipsEqual(prevIPs, currentIPs) {
-				// Сценарий 2: Сеть СМЕНИЛАСЬ (другие IP — другой Wi-Fi/шлюз)
-				// Маршрут к серверу через старый шлюз мёртв → немедленный reconnect
-				log.Printf("[NET] Смена сети обнаружена (IP: %v → %v), инициируем переподключение...",
-					prevIPs, currentIPs)
-				prevIPs = currentIPs
-				if conn := c.conn; conn != nil {
-					conn.Close()
-				}
-			} else if !hadNetwork && hasNetwork {
-				log.Println("[NET] Физическая сеть восстановлена")
-				hadNetwork = true
-				prevIPs = currentIPs
-			} else {
-				prevIPs = currentIPs
-			}
-		}
-	}
-}
-
-// getPhysicalIPs возвращает отсортированный список IPv4-адресов физических интерфейсов.
-// Используется для обнаружения как пропажи сети, так и СМЕНЫ сети (переключение Wi-Fi).
-func (c *NovaVPNClient) getPhysicalIPs() []string {
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return nil
-	}
-	var ips []string
-	for _, iface := range ifaces {
-		// Пропускаем loopback и выключенные интерфейсы
-		if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
-			continue
-		}
-		// Пропускаем виртуальные интерфейсы (TUN, VPN, VM)
-		name := strings.ToLower(iface.Name)
-		if strings.Contains(name, "wintun") || strings.Contains(name, "novavpn") ||
-			strings.Contains(name, "virtual") || strings.Contains(name, "vmware") ||
-			strings.Contains(name, "virtualbox") || strings.Contains(name, "hyper-v") ||
-			strings.Contains(name, "loopback") || strings.Contains(name, "tailscale") ||
-			strings.Contains(name, "vethernet") || strings.Contains(name, "docker") {
-			continue
-		}
-		addrs, err := iface.Addrs()
-		if err != nil {
-			continue
-		}
-		for _, addr := range addrs {
-			if ipnet, ok := addr.(*net.IPNet); ok {
-				if ip4 := ipnet.IP.To4(); ip4 != nil && !ip4.IsLoopback() {
-					ips = append(ips, ip4.String())
-				}
-			}
-		}
-	}
-	// Сортируем для стабильного сравнения
-	sort.Strings(ips)
-	return ips
-}
-
-// hasPhysicalNetwork проверяет наличие активного физического сетевого интерфейса с IPv4-адресом.
-func (c *NovaVPNClient) hasPhysicalNetwork() bool {
-	return len(c.getPhysicalIPs()) > 0
-}
-
-// ipsEqual сравнивает два отсортированных списка IP-адресов.
-func ipsEqual(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
