@@ -80,8 +80,18 @@ func (m *connectionMonitor) RecordActivity() {
 }
 
 // RecordKeepaliveSent фиксирует отправку keepalive для active probe.
+// Обновляет таймер только если нет ожидающего неотвеченного probe:
+// если предыдущий keepalive ещё не получил ответа (lastKeepaliveSent > lastActivity),
+// не сбрасываем таймер — иначе probe timeout никогда не сработает,
+// т.к. keepalive отправляется каждые 10-20 сек, а timeout = 15 сек.
 func (m *connectionMonitor) RecordKeepaliveSent() {
-	m.lastKeepaliveSent.Store(time.Now().UnixNano())
+	lastAct := m.lastActivity.Load()
+	kaSent := m.lastKeepaliveSent.Load()
+	// Обновляем только если нет ожидающего probe
+	// (kaSent <= lastAct означает что предыдущий keepalive получил ответ)
+	if kaSent <= lastAct {
+		m.lastKeepaliveSent.Store(time.Now().UnixNano())
+	}
 }
 
 // Start запускает фоновый цикл проверки здоровья.
@@ -129,8 +139,8 @@ func (m *connectionMonitor) monitorLoop() {
 	}
 }
 
-// check определяет текущий уровень здоровья по времени последнего пакета.
-// Вызывает колбэк только при смене уровня.
+// check определяет текущий уровень здоровья по времени последнего пакета
+// и результатам active probe. Вызывает колбэк только при смене уровня.
 func (m *connectionMonitor) check() {
 	lastNano := m.lastActivity.Load()
 	if lastNano == 0 {
@@ -139,8 +149,23 @@ func (m *connectionMonitor) check() {
 
 	elapsed := time.Since(time.Unix(0, lastNano))
 
+	// Active Probe: если keepalive был отправлен, но ответа нет за 15 сек —
+	// соединение мёртво. Обнаруживает потерю быстрее пассивных порогов (15 vs 30 сек).
+	probeExpired := false
+	kaSentNano := m.lastKeepaliveSent.Load()
+	if kaSentNano > 0 && lastNano < kaSentNano {
+		// Последняя активность была ДО отправки keepalive → ответ не пришёл
+		sinceKaSent := time.Since(time.Unix(0, kaSentNano))
+		if sinceKaSent >= keepaliveProbeTimeout {
+			probeExpired = true
+		}
+	}
+
 	var newHealth domainvpn.ConnectionHealth
 	switch {
+	case probeExpired:
+		// Active probe: keepalive отправлен, ответ не получен за 15 сек
+		newHealth = domainvpn.HealthLost
 	case elapsed >= healthLostThreshold:
 		newHealth = domainvpn.HealthLost
 	case elapsed >= healthDegradedThreshold:
@@ -155,8 +180,13 @@ func (m *connectionMonitor) check() {
 		return
 	}
 
-	log.Printf("[HEALTH] Здоровье соединения: %s → %s (без пакетов: %v)",
-		oldHealth, newHealth, elapsed.Round(time.Second))
+	if probeExpired {
+		log.Printf("[HEALTH] Здоровье соединения: %s → %s (active probe expired: keepalive без ответа %v)",
+			oldHealth, newHealth, time.Since(time.Unix(0, kaSentNano)).Round(time.Second))
+	} else {
+		log.Printf("[HEALTH] Здоровье соединения: %s → %s (без пакетов: %v)",
+			oldHealth, newHealth, elapsed.Round(time.Second))
+	}
 
 	// Уведомляем о смене здоровья
 	if m.onHealthChange != nil {
