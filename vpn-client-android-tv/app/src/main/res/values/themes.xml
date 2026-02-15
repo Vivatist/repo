@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.NovaVPN" parent="@style/Theme.Leanback">
+        <item name="android:colorPrimary">@color/nova_primary</item>
+        <item name="android:colorPrimaryDark">@color/nova_primary_dark</item>
+        <item name="android:colorAccent">@color/nova_accent</item>
+        <item name="android:windowBackground">@color/nova_background</item>
+    </style>
+</resources>

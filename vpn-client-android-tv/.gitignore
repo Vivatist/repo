@@ -1,0 +1,22 @@
+# Build outputs
+/app/build/
+/build/
+
+# Gradle
+/.gradle/
+local.properties
+
+# IDE
+/.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Debug
+*.log
+
+# Keystore
+*.jks
+*.keystore

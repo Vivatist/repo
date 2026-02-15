@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="nova_primary">#FF1E88E5</color>
+    <color name="nova_primary_dark">#FF1565C0</color>
+    <color name="nova_accent">#FF00E676</color>
+    <color name="nova_background">#FF121212</color>
+    <color name="nova_surface">#FF1E1E1E</color>
+    <color name="nova_on_surface">#FFFFFFFF</color>
+    <color name="nova_error">#FFCF6679</color>
+    <color name="nova_connected">#FF00E676</color>
+    <color name="nova_connecting">#FFFFAB40</color>
+    <color name="nova_disconnected">#FFEF5350</color>
+    <color name="nova_text_primary">#FFFFFFFF</color>
+    <color name="nova_text_secondary">#B3FFFFFF</color>
+</resources>
