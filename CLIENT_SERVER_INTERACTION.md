@@ -136,7 +136,7 @@ loop:
   interval = randomKeepaliveInterval()  // 10-20 сек, crypto/rand
   ждать interval (с проверкой stopCh)
   если идёт reconnect: пропустить
-  отправить keepalive (10 байт)
+  отправить keepalive (50-160 байт, с random padding и обфускацией заголовка)
 ```
 
 **Пассивный health monitor** (отдельная горутина):
@@ -164,7 +164,7 @@ loop:
 5. Сохранить данные для 0-RTT resume:
    - SessionID, ключи, sendCounter
    - IP, DNS, MTU, SubnetMask
-6. Отправить Disconnect-пакет серверу (10 байт)
+6. Отправить Disconnect-пакет серверу (50-160 байт, с random padding и обфускацией заголовка)
 7. Остановить все циклы:
    - Отменить контекст (остановить keepalive)
    - Закрыть UDP conn (разблокировать UDP Read)
@@ -226,9 +226,15 @@ encCreds = credsNonce + credsCiphertext
 hmacData = clientPub + uint64_be(timestamp) + encCreds
 hmac = hmac_sha256(PSK, hmacData)
 
-# Сборка и отправка
+# Сборка payload с random padding (100-400 байт)
 payload = clientPub + uint64_be(timestamp) + uint16_be(len(encCreds)) + encCreds + hmac
-send_packet(type=0x01, sessionID=0, nonce=zeros(12), payload=payload)
+padding = random_bytes(random(100, 400))
+payload = payload + padding
+
+# Отправка с QUIC Short Header и обфускацией
+packet = marshal_handshake(type=0x01, sessionID=0, nonce=zeros(12), payload=payload)
+ObfuscateHeader(packet[5:], headerMask, isData=false)
+udp.send(packet)
 
 # Шаг 2: Приём и обработка HandshakeResp
 packet = recv_packet(timeout)
@@ -265,9 +271,15 @@ if respData[83] == 1 and len(respData) >= 116:
 # Шаг 3: HandshakeComplete (fire-and-forget)
 confirmData = f"novavpn-confirm-{sessionID}".encode()
 confirmHMAC = hmac_sha256(hmacKey, confirmData)
+
+# Random padding 100-400 байт перед шифрованием
+paddedPayload = confirmHMAC + random_bytes(random(100, 400))
 completeNonce = random(12)
-encrypted = chacha20poly1305_seal(sendKey, completeNonce, confirmHMAC)
-send_packet(type=0x03, sessionID=sessionID, nonce=completeNonce, payload=encrypted)
+encrypted = chacha20poly1305_seal(sendKey, completeNonce, paddedPayload)
+
+packet = marshal_handshake(type=0x03, sessionID=sessionID, nonce=completeNonce, payload=encrypted)
+ObfuscateHeader(packet[5:], headerMask, isData=false)
+udp.send(packet)
 # ↑ Потеря этого пакета не влияет на работу (сессия уже активна)
 ```
 
@@ -506,12 +518,12 @@ Reconnect проверяет флаг `stopped` и канал `stopCh` на ка
 ```
 Клиент                                          Сервер
   │                                               │
-  │  Keepalive probe (10 байт)                     │
+  │  Keepalive probe (50-160 байт, с padding)        │
   │  (SessionID = сохранённый)                     │
   │  ──────────────────────────────────────────►   │
   │                                               │ Находит сессию по SessionID
   │                                               │ Обновляет адрес клиента
-  │  Keepalive response (10 байт)                  │
+  │  Keepalive response (50-160 байт, с padding)   │
   │  ◄──────────────────────────────────────────   │
   │                                               │
   │  Сессия восстановлена за 0-RTT!                │
@@ -558,7 +570,7 @@ Reconnect проверяет флаг `stopped` и канал `stopCh` на ка
   │                                               │
   │  Сервер внезапно недоступен                     │ Keepalive отправляются, ответа нет
   │                                               │
-  │  ...ожидание...                                │ 45 сек без данных от сервера
+  │  ...ожидание...                                │ 60 сек без данных от сервера
   │                                               │ → Dead-peer detection
   │                                               │ → Закрыть соединение → reconnect
   │                                               │
@@ -566,7 +578,7 @@ Reconnect проверяет флаг `stopped` и канал `stopCh` на ка
   │                                               │ - Или полный handshake
 ```
 
-> **Разница**: при graceful shutdown клиент начинает переподключение мгновенно (получил Disconnect), при аварийной — через ~45 секунд (dead-peer detection).
+> **Разница**: при graceful shutdown клиент начинает переподключение мгновенно (получил Disconnect), при аварийной — через ~60 секунд (dead-peer detection, `healthLostThreshold`).
 
 ---
 
@@ -621,25 +633,66 @@ plaintext  = IP-пакет из TUN
 counter    = sendCounter.increment()
 wireCtr    = uint32(counter)
 nonce      = send_nonce_prefix + BigEndian_uint64(wireCtr)
-ciphertext = ChaCha20_XOR(sendKey, nonce, plaintext)  // plain ChaCha20, без auth tag!
-wireBytes  = TLS_Header(5) + SessionID(4) + 0x10(1) + wireCtr(4) + ciphertext
+
+# Padding: выравнивание + случайная добавка (см. 10.4)
+padLen     = computeDataPadLen(len(plaintext))
+paddedData = plaintext + zeros(padLen) + byte(padLen)
+ciphertext = ChaCha20_XOR(sendKey, nonce, paddedData)  // plain ChaCha20, без auth tag!
+
+# Сборка пакета
+wireBytes  = QUIC_Header(5) + SessionID(4) + 0x10(1) + wireCtr(4) + ciphertext
+
+# Обфускация заголовка (XOR-маска из PSK)
+ObfuscateHeader(wireBytes[5:], headerMask, isData=true)  // SID + Type + Counter
+
 udp.send(wireBytes)
 ```
 
 ### 10.3. Приём (расшифровка)
 
 ```
-удалить TLS заголовок (5 байт) → raw
+пропустить QUIC Short Header (5 байт) → raw
+
+# Деобфускация заголовка (XOR-маска из PSK)
+DeobfuscateHeader(raw, headerMask, isData=true)  // SID + Type + Counter
+
 sessionID  = BigEndian_uint32(raw[0:4])
 type       = raw[4]    // 0x10
 counter    = BigEndian_uint32(raw[5:9])
 ciphertext = raw[9:]
 nonce      = recv_nonce_prefix + BigEndian_uint64(counter)
-plaintext  = ChaCha20_XOR(recvKey, nonce, ciphertext)
+paddedData = ChaCha20_XOR(recvKey, nonce, ciphertext)
+
+# Снятие padding: последний расшифрованный байт = padLen
+padLen     = paddedData[len(paddedData) - 1]
+plaintext  = paddedData[:len(paddedData) - 1 - padLen]
 tun.write(plaintext)
 ```
 
-> **Важно**: Data-пакеты используют **plain ChaCha20 XOR** без Poly1305 и без auth tag. Размер ciphertext равен размеру plaintext.
+> **Важно**: Data-пакеты используют **plain ChaCha20 XOR** без Poly1305 и без auth tag. Padding (нули) после XOR с keystream выглядит как случайные данные.
+
+### 10.4. Data Padding
+
+Каждый data-пакет дополняется padding для маскировки размера:
+
+```
+computeDataPadLen(plaintextLen):
+    minPadded    = plaintextLen + 1           // +1 для байта padLen
+    alignedTarget = ceil(minPadded / 64) * 64  // выравнивание до 64 байт
+    padLen       = alignedTarget - minPadded
+    padLen      += random(0, 32)               // случайная добавка 0-32 байт
+    если padLen > 255: padLen = 255
+    вернуть padLen
+```
+
+**Формат padded данных:**
+```
+| plaintext | zeros(padLen) | byte(padLen) |
+```
+
+- Нули после ChaCha20 XOR становятся случайными байтами (raw keystream)
+- Последний байт plaintext = длина padding → получатель знает, сколько отрезать
+- Минимальный IP-пакет после снятия padding ≥ 20 байт (валидация)
 
 ---
 
@@ -650,28 +703,48 @@ tun.write(plaintext)
 | `0x01` | HandshakeInit | Клиент → Сервер | переменный | Начало рукопожатия |
 | `0x02` | HandshakeResp | Сервер → Клиент | переменный | Параметры сессии |
 | `0x03` | HandshakeComplete | Клиент → Сервер | переменный | Подтверждение (fire-and-forget) |
-| `0x10` | Data | Двунаправленный | 14 + payload | Зашифрованный IP-пакет |
-| `0x20` | Keepalive | Двунаправленный | 10 байт | Поддержание сессии |
-| `0x30` | Disconnect | Двунаправленный | 10 байт | Завершение/остановка |
+| `0x10` | Data | Двунаправленный | 14 + padded payload | Зашифрованный IP-пакет (с padding) |
+| `0x20` | Keepalive | Двунаправленный | 50-160 байт | Поддержание сессии (с random padding) |
+| `0x30` | Disconnect | Двунаправленный | 50-160 байт | Завершение/остановка (с random padding) |
 
 > Тип `0xF0` (Error) удалён. Сервер использует молчаливый drop при ошибках.
 
 ### Формат на wire
 
+Все пакеты обёрнуты в QUIC Short Header (5 байт). Поля SessionID, Type и Counter обфусцированы XOR-маской из PSK (см. ниже).
+
 **Handshake-пакеты** (0x01, 0x02, 0x03):
 ```
-TLS_Header(5) + SessionID(4) + Type(1) + Nonce(12) + Encrypted_Payload
+QUIC_Header(5) + [SessionID(4) + Type(1)]_obfuscated + Nonce(12) + Encrypted_Payload(+padding)
 ```
 
 **Data-пакеты** (0x10):
 ```
-TLS_Header(5) + SessionID(4) + Type(1) + Counter(4) + ChaCha20_XOR_data
+QUIC_Header(5) + [SessionID(4) + Type(1) + Counter(4)]_obfuscated + ChaCha20_XOR(padded_data)
 ```
 
 **Keepalive/Disconnect** (0x20, 0x30):
 ```
-TLS_Header(5) + SessionID(4) + Type(1)
+QUIC_Header(5) + [SessionID(4) + Type(1)]_obfuscated + RandomPadding(40-150)
 ```
+
+### Обфускация заголовков (XOR Header Mask)
+
+Для сокрытия метаданных (SessionID, PacketType, Counter) от DPI все пакеты используют XOR-обфускацию заголовка:
+
+```
+headerMask = HMAC-SHA256(PSK, "nova-header-mask")[:9]   // 9 байт, вычисляется ОДИН раз
+
+// Обфускация (отправка) и деобфускация (приём) — одинаковая операция (XOR)
+ObfuscateHeader(buf_after_quic, headerMask, isData):
+    buf[0:4] ^= headerMask[0:4]   // SessionID (4 байта) — всегда
+    buf[4]   ^= headerMask[4]     // PacketType (1 байт) — всегда
+    если isData:
+        buf[5:9] ^= headerMask[5:9]   // Counter (4 байта) — только data-пакеты
+```
+
+- При **bootstrap** (нулевой PSK) используется маска из нулевого PSK
+- Сервер пробует обе маски (PSK + нулевой PSK) для поддержки bootstrap
 
 ---
 
@@ -737,7 +810,7 @@ HKDF-SHA256(
 1. Найти сессию по SessionID
 2. Обновить lastActivity
 3. Если адрес клиента изменился → address migration
-4. Отправить keepalive-ответ (10 байт)
+4. Отправить keepalive-ответ (50-160 байт, с random padding и обфускацией)
 ```
 
 ### 13.4. Disconnect (0x30)
@@ -813,21 +886,26 @@ HKDF-SHA256(
 
 1. **UDP Reader**: `udp.Read()` → расшифровка → `tun.Write()`
 2. **TUN Reader**: `tun.Read()` → шифрование → `udp.Write()`
-3. **Keepalive**: каждые 15 сек отправка keepalive + dead-peer detection
+3. **Keepalive**: каждые 10-20 сек (рандомизированный, crypto/rand) отправка keepalive
+4. **Health Monitor**: пассивный мониторинг здоровья (3-7 сек, dead-peer detection)
 
 Дополнительно рекомендуется:
-4. **Reconnect**: автоматическое переподключение при потере связи
+5. **Reconnect**: автоматическое переподключение при потере связи
 
 ### 14.6. Чек-лист реализации
 
 - [ ] Создание UDP-сокета к серверу
+- [ ] Вычисление headerMask = `HMAC-SHA256(PSK, "nova-header-mask")[:9]`
 - [ ] Handshake с PSK bootstrap (fallback на нулевой PSK)
 - [ ] Вывод сессионных ключей (HKDF, зеркальные ключи)
 - [ ] Создание TUN-адаптера
 - [ ] Настройка IP, DNS, маршрутов
-- [ ] Цикл приёма: UDP → ChaCha20 decrypt → TUN
-- [ ] Цикл отправки: TUN → ChaCha20 encrypt → UDP
-- [ ] Keepalive каждые 15 сек (10 байт)
+- [ ] Цикл приёма: UDP → деобфускация заголовка → ChaCha20 decrypt → снятие padding → TUN
+- [ ] Цикл отправки: TUN → padding → ChaCha20 encrypt → обфускация заголовка → UDP
+- [ ] QUIC Short Header для всех исходящих пакетов
+- [ ] XOR-обфускация/деобфускация заголовков всех пакетов
+- [ ] Random padding: keepalive/disconnect (40-150 байт), handshake (100-400 байт), data (выравнивание до 64)
+- [ ] Keepalive каждые 10-20 сек (50-160 байт, рандомизированный интервал)
 - [ ] Dead-peer detection (60 сек без данных от сервера — `healthLostThreshold`)
 - [ ] Обработка Disconnect от сервера
 - [ ] Auto-reconnect с экспоненциальным backoff
@@ -839,7 +917,7 @@ HKDF-SHA256(
 
 ## 15. Известные особенности
 
-1. **SessionID и PacketType открыты** (не зашифрованы) — необходимы для маршрутизации на сервере
+1. **SessionID и PacketType обфусцированы** XOR-маской (`HMAC-SHA256(PSK, "nova-header-mask")[:9]`) — не видны DPI, но восстановимы сервером с O(1) затратами
 2. **Data-пакеты без аутентификации** — plain ChaCha20 XOR без Poly1305 (trade-off: производительность)
 3. **Сервер молчит при неверном HMAC** — не отправляет ошибку (анти-сканирование)
 4. **Counter wrap-around** — uint32 на wire (~4.3 млрд пакетов, ~11 часов при 100k pkt/s)

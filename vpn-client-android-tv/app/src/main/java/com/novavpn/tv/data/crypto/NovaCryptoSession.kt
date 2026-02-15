@@ -14,13 +14,14 @@ import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
 /**
- * Криптографическая сессия NovaVPN.
+ * Криптографическая сессия NovaVPN v3.
  *
  * Реализует:
  * - ChaCha20-Poly1305 AEAD (для handshake)
- * - Plain ChaCha20 XOR (для data-пакетов)
+ * - Plain ChaCha20 XOR (для data-пакетов) с padding
  * - HMAC-SHA256 (для аутентификации)
  * - Counter-based nonce (prefix(4) + counter(8) = 12 байт)
+ * - Header mask (обфускация SID+Type+Counter)
  */
 class NovaCryptoSession(
     val sendKey: ByteArray,
@@ -84,11 +85,14 @@ class NovaCryptoSession(
     }
 
     /**
-     * Шифрует IP-пакет plain ChaCha20 XOR (без Poly1305).
-     * Записывает: counter(4) + ciphertext.
+     * Шифрует IP-пакет plain ChaCha20 XOR (без Poly1305) с padding.
+     * Записывает: counter(4) + ciphertext (plaintext + zeros(padLen) + byte(padLen)).
+     * Padding: нули после XOR с ChaCha20 keystream выглядят как случайные данные.
      * Возвращает количество записанных байт.
      */
     fun encryptData(dst: ByteArray, plaintext: ByteArray, offset: Int, length: Int): Int {
+        val padLen = NovaProtocol.computeDataPadLen(length)
+        val paddedLen = length + padLen + 1 // +1 для байта padLen
         val counter = sendCounter.incrementAndGet()
         val wireCtr = counter.toInt()
         val nonce = buildNonce(sendNoncePrefix, wireCtr.toLong() and 0xFFFFFFFFL)
@@ -96,16 +100,26 @@ class NovaCryptoSession(
         // Записываем counter (4 байта)
         ByteBuffer.wrap(dst, 0, 4).putInt(wireCtr)
 
-        // Plain ChaCha20 XOR
+        // Plain ChaCha20 XOR: шифруем plaintext + padding + padLen единым keystream
         val engine = ChaCha7539Engine()
         engine.init(true, ParametersWithIV(KeyParameter(sendKey), nonce))
+
+        // Шифруем plaintext
         engine.processBytes(plaintext, offset, length, dst, 4)
 
-        return 4 + length
+        // Формируем padding + padLen в отдельном буфере и шифруем
+        val padBuf = ByteArray(padLen + 1)
+        // padBuf[0..padLen-1] = 0 (нули → raw keystream после XOR)
+        padBuf[padLen] = padLen.toByte()
+        engine.processBytes(padBuf, 0, padBuf.size, dst, 4 + length)
+
+        return 4 + paddedLen
     }
 
     /**
-     * Дешифрует data-пакет (plain ChaCha20 XOR).
+     * Дешифрует data-пакет (plain ChaCha20 XOR) и снимает padding.
+     * Padding формат: plaintext + zeros(padLen) + byte(padLen).
+     * Последний расшифрованный байт = padLen.
      */
     fun decryptData(counter: Int, ciphertext: ByteArray): ByteArray {
         val nonce = buildNonce(recvNoncePrefix, counter.toLong() and 0xFFFFFFFFL)
@@ -115,7 +129,14 @@ class NovaCryptoSession(
         engine.init(false, ParametersWithIV(KeyParameter(recvKey), nonce))
         engine.processBytes(ciphertext, 0, ciphertext.size, plaintext, 0)
 
-        return plaintext
+        // Снимаем padding: последний байт = padLen
+        val padLen = plaintext[plaintext.size - 1].toInt() and 0xFF
+        val actualLen = plaintext.size - 1 - padLen
+        if (actualLen < 20) { // минимальный IP-пакет
+            throw IllegalArgumentException("Invalid padding: padLen=$padLen, totalLen=${plaintext.size}, actualLen=$actualLen")
+        }
+
+        return plaintext.copyOfRange(0, actualLen)
     }
 
     /**
@@ -186,6 +207,21 @@ class NovaCryptoSession(
             val result = ByteArray(hmac.macSize)
             hmac.doFinal(result, 0)
             return result
+        }
+
+        /**
+         * Выводит 9-байтную маску для обфускации заголовков пакетов из PSK.
+         * HMAC-SHA256(PSK, "nova-header-mask")[:9]
+         * Вычисляется ОДИН раз при инициализации (не на каждый пакет).
+         */
+        fun deriveHeaderMask(psk: ByteArray): ByteArray {
+            val hmac = HMac(SHA256Digest())
+            hmac.init(KeyParameter(psk))
+            val info = "nova-header-mask".toByteArray(Charsets.UTF_8)
+            hmac.update(info, 0, info.size)
+            val result = ByteArray(hmac.macSize)
+            hmac.doFinal(result, 0)
+            return result.copyOfRange(0, NovaProtocol.HEADER_MASK_SIZE)
         }
     }
 }

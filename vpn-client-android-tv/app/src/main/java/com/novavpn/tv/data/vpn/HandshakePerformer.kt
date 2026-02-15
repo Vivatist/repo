@@ -11,15 +11,18 @@ import kotlinx.coroutines.launch
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.nio.ByteBuffer
+import java.security.SecureRandom
 
 /**
- * Выполняет рукопожатие с VPN-сервером по протоколу NovaVPN v2.
+ * Выполняет рукопожатие с VPN-сервером по протоколу NovaVPN v3.
  *
  * Этапы:
  * 1. Генерация ephemeral Curve25519 ключевой пары
- * 2. Отправка HandshakeInit (credentials + HMAC)
+ * 2. Отправка HandshakeInit (credentials + HMAC + padding)
  * 3. Получение HandshakeResp (SessionID, IP, DNS, MTU, PSK)
  * 4. Отправка HandshakeComplete (fire-and-forget, 1-RTT)
+ *
+ * Все пакеты обёрнуты в QUIC Short Header и обфусцированы XOR-маской из PSK.
  */
 class HandshakePerformer(
     private val socket: DatagramSocket,
@@ -30,6 +33,10 @@ class HandshakePerformer(
     companion object {
         private const val TAG = "NovaHandshake"
     }
+
+    // Маска обфускации заголовка, производная от PSK
+    private val headerMask: ByteArray = NovaCryptoSession.deriveHeaderMask(psk)
+    private val random = SecureRandom()
 
     /**
      * Выполняет полное рукопожатие. Возвращает HandshakeResult.
@@ -89,13 +96,24 @@ class HandshakePerformer(
                 clientPubKey, timestamp, encCreds, hmac
             )
 
+            // Добавляем random padding 100-400 байт (маскировка размера handshake)
+            val padLen = NovaProtocol.randomPadLen(NovaProtocol.HANDSHAKE_PAD_MIN, NovaProtocol.HANDSHAKE_PAD_MAX)
+            val paddedPayload = ByteArray(initPayload.size + padLen)
+            System.arraycopy(initPayload, 0, paddedPayload, 0, initPayload.size)
+            val padding = ByteArray(padLen)
+            random.nextBytes(padding)
+            System.arraycopy(padding, 0, paddedPayload, initPayload.size, padLen)
+
             val emptyNonce = ByteArray(NovaProtocol.NONCE_SIZE)
             val packet = NovaProtocol.marshalHandshakePacket(
-                NovaProtocol.PACKET_HANDSHAKE_INIT, 0, emptyNonce, initPayload
+                NovaProtocol.PACKET_HANDSHAKE_INIT, 0, emptyNonce, paddedPayload
             )
 
+            // Обфускация заголовка (после QUIC header)
+            NovaProtocol.obfuscateHeader(packet, NovaProtocol.QUIC_HEADER_SIZE, headerMask, false)
+
             socket.send(DatagramPacket(packet, packet.size))
-            Log.i(TAG, "Sent HandshakeInit")
+            Log.i(TAG, "Sent HandshakeInit (${packet.size} bytes, padding $padLen)")
         } finally {
             tempSession.close()
         }
@@ -106,12 +124,8 @@ class HandshakePerformer(
         val datagram = DatagramPacket(buf, buf.size)
         socket.receive(datagram)
 
-        val parsed = NovaProtocol.parseIncoming(buf, datagram.length)
+        val parsed = NovaProtocol.parseIncoming(buf, datagram.length, headerMask)
             ?: throw Exception("Failed to parse HandshakeResp")
-
-        if (parsed.type == NovaProtocol.PACKET_ERROR) {
-            throw Exception("Server rejected connection (invalid credentials)")
-        }
 
         if (parsed.type != NovaProtocol.PACKET_HANDSHAKE_RESP) {
             throw Exception("Expected HandshakeResp, got 0x${"%02x".format(parsed.type)}")
@@ -170,7 +184,16 @@ class HandshakePerformer(
         val confirmHmac = session.computeHmac(confirmData)
 
         val completePayload = NovaProtocol.marshalHandshakeComplete(confirmHmac)
-        val encrypted = session.encrypt(completePayload)
+
+        // Добавляем random padding 100-400 байт перед шифрованием
+        val padLen = NovaProtocol.randomPadLen(NovaProtocol.HANDSHAKE_PAD_MIN, NovaProtocol.HANDSHAKE_PAD_MAX)
+        val paddedPayload = ByteArray(completePayload.size + padLen)
+        System.arraycopy(completePayload, 0, paddedPayload, 0, completePayload.size)
+        val padding = ByteArray(padLen)
+        random.nextBytes(padding)
+        System.arraycopy(padding, 0, paddedPayload, completePayload.size, padLen)
+
+        val encrypted = session.encrypt(paddedPayload)
 
         val nonce = encrypted.copyOfRange(0, NovaProtocol.NONCE_SIZE)
         val ciphertext = encrypted.copyOfRange(NovaProtocol.NONCE_SIZE, encrypted.size)
@@ -182,8 +205,12 @@ class HandshakePerformer(
             ciphertext
         )
 
+        // Обфускация заголовка — используем маску из PSK выведенного для новой сессии
+        // Но HandshakeComplete использует ту же маску что и Init (PSK не менялся на этом этапе)
+        NovaProtocol.obfuscateHeader(packet, NovaProtocol.QUIC_HEADER_SIZE, headerMask, false)
+
         socket.send(DatagramPacket(packet, packet.size))
-        Log.i(TAG, "Sent HandshakeComplete")
+        Log.i(TAG, "Sent HandshakeComplete (${packet.size} bytes)")
     }
 
     private fun ipToString(ip: ByteArray): String {

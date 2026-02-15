@@ -22,14 +22,16 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 /**
- * Реализация VPN-клиента NovaVPN для Android.
+ * Реализация VPN-клиента NovaVPN v3 для Android.
  *
  * Управляет:
  * - Рукопожатием (Curve25519 ECDH + ChaCha20-Poly1305)
- * - Шифрованием/дешифрованием data-пакетов (plain ChaCha20 XOR)
- * - Keepalive (рандомизированный, 10-20 сек)
+ * - Шифрованием/дешифрованием data-пакетов (plain ChaCha20 XOR с padding)
+ * - Keepalive (рандомизированный, 10-20 сек, с padding)
  * - Мониторингом здоровья (пассивный, 3-7 сек)
  * - Автопереподключением (экспоненциальный backoff)
+ * - Обфускацией заголовков (XOR-маска из PSK)
+ * - QUIC Short Header (маскировка под QUIC)
  */
 class NovaVpnClientImpl : VpnClient {
 
@@ -86,6 +88,9 @@ class NovaVpnClientImpl : VpnClient {
     private var resumeMtu: Int = 0
     private var resumeSubnetMask: Int = 0
 
+    // Маска обфускации заголовка (производная от PSK)
+    private var headerMask: ByteArray = ByteArray(NovaProtocol.HEADER_MASK_SIZE)
+
     // Колбэки
     var onNewPsk: ((String) -> Unit)? = null
     var onTunRequired: ((HandshakeResult) -> FileDescriptor?)? = null
@@ -115,6 +120,7 @@ class NovaVpnClientImpl : VpnClient {
             ByteArray(32) // нулевой PSK
         }
         pskBytes = psk.copyOf()
+        headerMask = NovaCryptoSession.deriveHeaderMask(psk)
 
         try {
             // Создаём UDP-сокет
@@ -174,6 +180,8 @@ class NovaVpnClientImpl : VpnClient {
         if (result.newPsk != null) {
             val pskHex = NovaKeyExchange.encodePsk(result.newPsk)
             Log.i(TAG, "Received PSK from server (bootstrap)")
+            pskBytes = result.newPsk.copyOf()
+            headerMask = NovaCryptoSession.deriveHeaderMask(result.newPsk)
             onNewPsk?.invoke(pskHex)
         }
 
@@ -233,6 +241,8 @@ class NovaVpnClientImpl : VpnClient {
             val sid = sessionId
             if (sid != 0L) {
                 val packet = NovaProtocol.marshalSimplePacket(NovaProtocol.PACKET_DISCONNECT, sid)
+                // Обфускация заголовка (после QUIC header)
+                NovaProtocol.obfuscateHeader(packet, NovaProtocol.QUIC_HEADER_SIZE, headerMask, false)
                 socket?.send(DatagramPacket(packet, packet.size))
             }
         } catch (e: Exception) {
@@ -275,7 +285,7 @@ class NovaVpnClientImpl : VpnClient {
                 sock.receive(datagram)
 
                 lastActivity.set(System.nanoTime())
-                val parsed = NovaProtocol.parseIncoming(buf, datagram.length) ?: continue
+                val parsed = NovaProtocol.parseIncoming(buf, datagram.length, headerMask) ?: continue
 
                 when (parsed.type) {
                     NovaProtocol.PACKET_DATA -> {
@@ -291,7 +301,7 @@ class NovaVpnClientImpl : VpnClient {
                         }
                     }
                     NovaProtocol.PACKET_KEEPALIVE -> {
-                        // Активность уже записана
+                        // Активность уже записана, padding игнорируется
                     }
                     NovaProtocol.PACKET_DISCONNECT -> {
                         Log.i(TAG, "Server sent disconnect")
@@ -300,10 +310,6 @@ class NovaVpnClientImpl : VpnClient {
                             withContext(Dispatchers.Default) { reconnect() }
                         }
                         return
-                    }
-                    NovaProtocol.PACKET_ERROR -> {
-                        Log.e(TAG, "Server error received")
-                        break
                     }
                 }
             } catch (e: Exception) {
@@ -318,7 +324,8 @@ class NovaVpnClientImpl : VpnClient {
 
     private suspend fun tunReadLoop() {
         val buf = ByteArray(65536)
-        val sendBuf = ByteArray(NovaProtocol.DATA_OVERHEAD + 65536)
+        // Буфер для шифрования: counter(4) + max plaintext + max padding + padLen(1)
+        val sendBuf = ByteArray(4 + 65536 + NovaProtocol.DATA_PAD_ALIGN + NovaProtocol.DATA_PAD_RANDOM_MAX + 1)
 
         while (!stopped.get()) {
             try {
@@ -334,6 +341,9 @@ class NovaVpnClientImpl : VpnClient {
                 val counter = ByteBuffer.wrap(sendBuf, 0, 4).int
                 val ciphertext = sendBuf.copyOfRange(4, encLen)
                 val packet = NovaProtocol.marshalDataPacket(sessionId, counter, ciphertext)
+
+                // Обфускация заголовка (SID+Type+Counter)
+                NovaProtocol.obfuscateHeader(packet, NovaProtocol.QUIC_HEADER_SIZE, headerMask, true)
 
                 try {
                     socket?.send(DatagramPacket(packet, packet.size))
@@ -363,6 +373,8 @@ class NovaVpnClientImpl : VpnClient {
                 val sid = sessionId
                 if (sid != 0L) {
                     val packet = NovaProtocol.marshalSimplePacket(NovaProtocol.PACKET_KEEPALIVE, sid)
+                    // Обфускация заголовка (после QUIC header)
+                    NovaProtocol.obfuscateHeader(packet, NovaProtocol.QUIC_HEADER_SIZE, headerMask, false)
                     socket?.send(DatagramPacket(packet, packet.size))
                 }
             } catch (e: Exception) {
@@ -471,6 +483,8 @@ class NovaVpnClientImpl : VpnClient {
                 session = NovaCryptoSession(result.sendKey, result.recvKey, result.hmacKey)
 
                 if (result.newPsk != null) {
+                    pskBytes = result.newPsk.copyOf()
+                    headerMask = NovaCryptoSession.deriveHeaderMask(result.newPsk)
                     onNewPsk?.invoke(NovaKeyExchange.encodePsk(result.newPsk))
                 }
 
@@ -514,15 +528,17 @@ class NovaVpnClientImpl : VpnClient {
         try {
             val resumeSid = resumeSessionId
             val packet = NovaProtocol.marshalSimplePacket(NovaProtocol.PACKET_KEEPALIVE, resumeSid)
+            // Обфускация заголовка (после QUIC header)
+            NovaProtocol.obfuscateHeader(packet, NovaProtocol.QUIC_HEADER_SIZE, headerMask, false)
             sock.send(DatagramPacket(packet, packet.size))
 
             sock.soTimeout = 1000
-            val buf = ByteArray(64)
+            val buf = ByteArray(256) // увеличен с 64 для padding-пакетов
             val response = DatagramPacket(buf, buf.size)
             sock.receive(response)
             sock.soTimeout = 0
 
-            val parsed = NovaProtocol.parseIncoming(buf, response.length) ?: return false
+            val parsed = NovaProtocol.parseIncoming(buf, response.length, headerMask) ?: return false
             if (parsed.type != NovaProtocol.PACKET_KEEPALIVE) return false
 
             // Восстанавливаем сессию

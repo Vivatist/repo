@@ -1,25 +1,30 @@
 package com.novavpn.tv.data.protocol
 
 import java.nio.ByteBuffer
+import java.security.SecureRandom
 
 /**
- * Протокол NovaVPN v2 — маскировка под TLS 1.2.
+ * Протокол NovaVPN v3 — маскировка под QUIC Short Header.
  *
  * Формат пакетов:
- * - TLS Header (5 байт): [0x17, 0x03, 0x03, length_hi, length_lo]
- * - SessionID (4 байта, big-endian)
- * - Type (1 байт)
+ * - QUIC Short Header (5 байт): Flags(1) + Random(4)
+ * - SessionID (4 байта, big-endian) — обфусцирован XOR-маской из PSK
+ * - Type (1 байт) — обфусцирован XOR-маской из PSK
  * - Nonce/Counter + Payload (зависит от типа)
+ *
+ * Все поля после QUIC Header обфусцированы XOR-маской, производной от PSK.
  */
 object NovaProtocol {
 
-    const val PROTOCOL_VERSION: Byte = 0x02
+    const val PROTOCOL_VERSION: Byte = 0x03
 
-    // TLS Record Header
-    const val TLS_CONTENT_TYPE: Byte = 0x17
-    const val TLS_VERSION_MAJOR: Byte = 0x03
-    const val TLS_VERSION_MINOR: Byte = 0x03
-    const val TLS_HEADER_SIZE = 5
+    // QUIC Short Header constants (маскировка под QUIC)
+    // Flags byte: Header Form=0 (Short), Fixed Bit=1, остальное — random
+    const val QUIC_FIXED_BIT_MASK: Byte = 0x40 // bit 6 = 1 (QUIC Fixed Bit, обязателен)
+    const val QUIC_HEADER_SIZE = 5              // flags(1) + random_pad(4)
+
+    // Обратная совместимость имён
+    const val TLS_HEADER_SIZE = QUIC_HEADER_SIZE
 
     // Размеры полей
     const val SESSION_ID_SIZE = 4
@@ -28,10 +33,19 @@ object NovaProtocol {
     const val COUNTER_SIZE = 4
     const val PACKET_TYPE_SIZE = 1
     const val KEY_SIZE = 32
+    const val HEADER_MASK_SIZE = 9 // SID(4) + Type(1) + Counter(4)
 
     // Оверхеды
-    const val DATA_OVERHEAD = TLS_HEADER_SIZE + SESSION_ID_SIZE + PACKET_TYPE_SIZE + COUNTER_SIZE // 14
-    const val MIN_PACKET_SIZE = TLS_HEADER_SIZE + SESSION_ID_SIZE + PACKET_TYPE_SIZE // 10
+    const val DATA_OVERHEAD = QUIC_HEADER_SIZE + SESSION_ID_SIZE + PACKET_TYPE_SIZE + COUNTER_SIZE // 14
+    const val MIN_PACKET_SIZE = QUIC_HEADER_SIZE + SESSION_ID_SIZE + PACKET_TYPE_SIZE // 10
+
+    // Padding constants (Этап 2 маскировки)
+    const val KEEPALIVE_PAD_MIN = 40
+    const val KEEPALIVE_PAD_MAX = 150
+    const val DATA_PAD_ALIGN = 64
+    const val DATA_PAD_RANDOM_MAX = 32
+    const val HANDSHAKE_PAD_MIN = 100
+    const val HANDSHAKE_PAD_MAX = 400
 
     // Типы пакетов
     const val PACKET_HANDSHAKE_INIT: Byte = 0x01
@@ -40,37 +54,88 @@ object NovaProtocol {
     const val PACKET_DATA: Byte = 0x10
     const val PACKET_KEEPALIVE: Byte = 0x20
     const val PACKET_DISCONNECT: Byte = 0x30
-    @Suppress("unused")
-    const val PACKET_ERROR: Byte = 0xF0.toByte()
+
+    private val random = SecureRandom()
 
     /**
-     * Оборачивает данные в TLS 1.2 Application Data заголовок.
+     * Записывает QUIC Short Header (5 байт) в начало buf.
+     * Flags byte: 0x40 | random_6bits.
+     * Bytes 1-4: случайные (обфусцированная DCID-подобная область).
      */
-    fun addTlsHeader(data: ByteArray): ByteArray {
-        val result = ByteArray(TLS_HEADER_SIZE + data.size)
-        result[0] = TLS_CONTENT_TYPE
-        result[1] = TLS_VERSION_MAJOR
-        result[2] = TLS_VERSION_MINOR
-        val len = data.size
-        result[3] = ((len shr 8) and 0xFF).toByte()
-        result[4] = (len and 0xFF).toByte()
-        System.arraycopy(data, 0, result, TLS_HEADER_SIZE, data.size)
+    fun writeQUICHeader(buf: ByteArray, offset: Int = 0) {
+        val rnd = ByteArray(5)
+        random.nextBytes(rnd)
+        buf[offset] = (QUIC_FIXED_BIT_MASK.toInt() or (rnd[0].toInt() and 0x3F)).toByte()
+        buf[offset + 1] = rnd[1]
+        buf[offset + 2] = rnd[2]
+        buf[offset + 3] = rnd[3]
+        buf[offset + 4] = rnd[4]
+    }
+
+    /**
+     * Добавляет QUIC Short Header (5 байт) к данным.
+     */
+    fun addQUICHeader(data: ByteArray): ByteArray {
+        val result = ByteArray(QUIC_HEADER_SIZE + data.size)
+        writeQUICHeader(result)
+        System.arraycopy(data, 0, result, QUIC_HEADER_SIZE, data.size)
         return result
     }
 
     /**
-     * Извлекает payload из TLS-обёртки.
+     * Пропускает QUIC Short Header (5 байт).
+     * Не проверяет содержимое заголовка (валидация через header mask).
      */
-    fun parseTlsHeader(data: ByteArray): ByteArray? {
-        if (data.size < TLS_HEADER_SIZE) return null
-        if (data[0] != TLS_CONTENT_TYPE) return null
-        val length = ((data[3].toInt() and 0xFF) shl 8) or (data[4].toInt() and 0xFF)
-        if (data.size < TLS_HEADER_SIZE + length) return null
-        return data.copyOfRange(TLS_HEADER_SIZE, TLS_HEADER_SIZE + length)
+    fun skipHeader(data: ByteArray, length: Int): ByteArray? {
+        if (length < QUIC_HEADER_SIZE) return null
+        return data.copyOfRange(QUIC_HEADER_SIZE, length)
+    }
+
+    /**
+     * Применяет XOR-обфускацию к заголовку пакета (после QUIC header).
+     * buf начинается ПОСЛЕ QUIC header: [0:4]=SessionID, [4]=Type, [5:9]=Counter.
+     * isData=true — обфускация Counter (9 байт), иначе только SID+Type (5 байт).
+     */
+    fun obfuscateHeader(buf: ByteArray, offset: Int, mask: ByteArray, isData: Boolean) {
+        buf[offset] = (buf[offset].toInt() xor mask[0].toInt()).toByte()
+        buf[offset + 1] = (buf[offset + 1].toInt() xor mask[1].toInt()).toByte()
+        buf[offset + 2] = (buf[offset + 2].toInt() xor mask[2].toInt()).toByte()
+        buf[offset + 3] = (buf[offset + 3].toInt() xor mask[3].toInt()).toByte()
+        buf[offset + 4] = (buf[offset + 4].toInt() xor mask[4].toInt()).toByte()
+        if (isData && buf.size - offset >= 9) {
+            buf[offset + 5] = (buf[offset + 5].toInt() xor mask[5].toInt()).toByte()
+            buf[offset + 6] = (buf[offset + 6].toInt() xor mask[6].toInt()).toByte()
+            buf[offset + 7] = (buf[offset + 7].toInt() xor mask[7].toInt()).toByte()
+            buf[offset + 8] = (buf[offset + 8].toInt() xor mask[8].toInt()).toByte()
+        }
+    }
+
+    /**
+     * Возвращает случайную длину padding в диапазоне [min, max].
+     */
+    fun randomPadLen(min: Int, max: Int): Int {
+        if (max <= min) return min
+        return min + random.nextInt(max - min + 1)
+    }
+
+    /**
+     * Вычисляет длину padding для data-пакета.
+     * Выравнивает до DATA_PAD_ALIGN + random(0, DATA_PAD_RANDOM_MAX).
+     */
+    fun computeDataPadLen(plaintextLen: Int): Int {
+        val minPadded = plaintextLen + 1
+        val alignedTarget = ((minPadded + DATA_PAD_ALIGN - 1) / DATA_PAD_ALIGN) * DATA_PAD_ALIGN
+        var padLen = alignedTarget - minPadded
+
+        padLen += random.nextInt(DATA_PAD_RANDOM_MAX + 1)
+
+        if (padLen > 255) padLen = 255
+        return padLen
     }
 
     /**
      * Формирует handshake пакет: SessionID(4) + Type(1) + Nonce(12) + Payload.
+     * Обёрнут в QUIC Short Header.
      */
     fun marshalHandshakePacket(
         packetType: Byte,
@@ -84,22 +149,29 @@ object NovaProtocol {
         buf.put(packetType)
         buf.put(nonce, 0, NONCE_SIZE.coerceAtMost(nonce.size))
         buf.put(payload)
-        return addTlsHeader(raw)
+        return addQUICHeader(raw)
     }
 
     /**
-     * Формирует Keepalive/Disconnect пакет (10 байт).
+     * Формирует Keepalive/Disconnect пакет с random padding.
+     * Формат: QUIC(5) + SID(4) + Type(1) + RandomPad(40-150).
      */
     fun marshalSimplePacket(packetType: Byte, sessionId: Long): ByteArray {
-        val raw = ByteArray(SESSION_ID_SIZE + PACKET_TYPE_SIZE)
+        val padLen = randomPadLen(KEEPALIVE_PAD_MIN, KEEPALIVE_PAD_MAX)
+        val raw = ByteArray(SESSION_ID_SIZE + PACKET_TYPE_SIZE + padLen)
         val buf = ByteBuffer.wrap(raw)
         buf.putInt(sessionId.toInt())
         buf.put(packetType)
-        return addTlsHeader(raw)
+        // Заполняем padding случайными байтами
+        val padding = ByteArray(padLen)
+        random.nextBytes(padding)
+        buf.put(padding)
+        return addQUICHeader(raw)
     }
 
     /**
      * Формирует Data-пакет: SessionID(4) + Type(1) + Counter(4) + Ciphertext.
+     * Обёрнут в QUIC Short Header.
      */
     fun marshalDataPacket(
         sessionId: Long,
@@ -112,7 +184,7 @@ object NovaProtocol {
         buf.put(PACKET_DATA)
         buf.putInt(counter)
         buf.put(ciphertext)
-        return addTlsHeader(raw)
+        return addQUICHeader(raw)
     }
 
     /**
@@ -161,29 +233,23 @@ object NovaProtocol {
 
     /**
      * Парсит входящий пакет.
+     * Пропускает QUIC Short Header, деобфусцирует заголовок.
      * Возвращает ParsedPacket или null при ошибке.
      */
-    fun parseIncoming(data: ByteArray, length: Int): ParsedPacket? {
+    fun parseIncoming(data: ByteArray, length: Int, headerMask: ByteArray): ParsedPacket? {
         if (length < MIN_PACKET_SIZE) return null
 
-        val raw: ByteArray
-        val rawLen: Int
-
-        // Проверяем TLS-обёртку
-        if (data[0] == TLS_CONTENT_TYPE) {
-            if (length < TLS_HEADER_SIZE) return null
-            val payloadLen = ((data[3].toInt() and 0xFF) shl 8) or (data[4].toInt() and 0xFF)
-            if (length < TLS_HEADER_SIZE + payloadLen) return null
-            raw = data.copyOfRange(TLS_HEADER_SIZE, TLS_HEADER_SIZE + payloadLen)
-            rawLen = payloadLen
-        } else {
-            raw = data.copyOfRange(0, length)
-            rawLen = length
-        }
+        // Пропускаем QUIC Short Header (5 байт)
+        val raw = skipHeader(data, length) ?: return null
+        val rawLen = raw.size
 
         if (rawLen < SESSION_ID_SIZE + PACKET_TYPE_SIZE) return null
 
-        val buf = ByteBuffer.wrap(raw)
+        // Деобфускация заголовка: XOR с маской из PSK (копия чтобы не мутировать буфер)
+        val deobf = raw.copyOf()
+        obfuscateHeader(deobf, 0, headerMask, true) // XOR обратим
+
+        val buf = ByteBuffer.wrap(deobf)
         val sessionId = buf.int.toLong() and 0xFFFFFFFFL
         val packetType = buf.get()
 
@@ -205,13 +271,8 @@ object NovaProtocol {
                 ParsedPacket(sessionId, packetType, nonce = nonce, payload = payload)
             }
             PACKET_KEEPALIVE, PACKET_DISCONNECT -> {
+                // Padding после SID+Type игнорируется
                 ParsedPacket(sessionId, packetType)
-            }
-            PACKET_ERROR -> {
-                val payload = if (rawLen > SESSION_ID_SIZE + PACKET_TYPE_SIZE) {
-                    ByteArray(rawLen - SESSION_ID_SIZE - PACKET_TYPE_SIZE).also { buf.get(it) }
-                } else null
-                ParsedPacket(sessionId, packetType, payload = payload)
             }
             else -> null
         }
@@ -222,6 +283,7 @@ object NovaProtocol {
      *
      * ServerPublicKey(32) + SessionID(4) + IP(4) + Mask(1) +
      * DNS1(4) + DNS2(4) + MTU(2) + ServerHMAC(32) + HasPSK(1) [+ PSK(32)]
+     * + возможный padding (игнорируется — парсер читает по фиксированным смещениям)
      */
     fun parseHandshakeResp(data: ByteArray): HandshakeRespData? {
         if (data.size < 84) return null
